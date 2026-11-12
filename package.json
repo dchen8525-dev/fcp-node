@@ -1,0 +1,28 @@
+{
+  "name": "fcp-node",
+  "version": "0.0.19",
+  "description": "FCP v7 UDP tunnel (AES-128-GCM / Reed-Solomon FEC / FCP-STREAM ARQ / BBR-lite) - zero-dependency TypeScript port of the C++ implementation",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "bin": {
+    "fcp-server": "./src/app/server.ts",
+    "fcp-client": "./src/app/client.ts"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "test:unit": "node --test tests/bytes.test.ts tests/protocol.test.ts tests/golden.test.ts",
+    "test:e2e": "node --test tests/e2e.test.ts tests/self-interop.test.ts",
+    "self-check": "node scripts/self-interop.mjs",
+    "check": "node scripts/check.mjs",
+    "server": "node src/app/server.ts",
+    "client": "node src/app/client.ts",
+    "bench": "node src/app/bench.ts",
+    "replay": "node src/app/replay.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "license": "UNLICENSED",
+  "private": true
+}

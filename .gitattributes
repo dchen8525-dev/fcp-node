@@ -1,0 +1,6 @@
+# Byte-for-byte parity with the VPS deployment is a release gate:
+#   sha256(local file) == sha256(/opt/fcp-node/<same file>)
+# is how we verify that the running server matches this tree. The global
+# core.autocrlf=true would rewrite LF to CRLF on the next checkout and silently
+# break that comparison, so disable all EOL conversion for this repository.
+* -text

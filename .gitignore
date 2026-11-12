@@ -1,0 +1,15 @@
+# Runtime diagnostics. Originals stay on disk for inspection; a compressed
+# copy is kept in bench/artifacts/*.tar.gz. Never commit 100 MB of trace logs.
+logs/
+bench/artifacts/
+*.log
+
+# Local-only secrets and generated binaries.
+# NOTE: several bench/ and scripts/ files still carry a literal test PSK in
+# their command lines. If this repository is ever pushed to a remote, scrub
+# those first (see docs/移植对照与差异.md).
+deploy/psk.txt
+*.exe
+*.bin
+node_modules/
+.DS_Store
