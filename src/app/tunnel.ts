@@ -23,6 +23,8 @@ import { OpenError } from '../constants.ts';
 import { createTraceSink, type TraceSink } from '../util/trace.ts';
 
 const TICK_MS = 10;
+/** Stats line cadence: fast enough for a live graph, slow enough not to spam. */
+const STATS_PERIOD_MS = 500;
 
 export interface TunnelOptions {
   psk: Buffer;
@@ -36,6 +38,15 @@ export interface TunnelOptions {
   pinnedK?: number;
   ack_v2?: boolean; pmtud?: boolean; keyUpdate?: boolean;
   log?: (line: string) => void;
+  /**
+   * Machine-readable one-line counters, emitted every 500 ms on the wire side
+   * regardless of --log-level. The desktop shell parses these to draw the
+   * throughput graph; keeping them out of `log` is deliberate, because a
+   * `--log-level=error` tunnel must still report what it moved.
+   * Shape: `stats <uptime>s live=N up=N tunnels=N tx=NB rx=NB tx_rate=B/s
+   * rx_rate=B/s`.
+   */
+  onStats?: (line: string) => void;
   /** Verbose per-datagram / per-connection trace, enabled by --log-level=debug. */
   debugLog?: (line: string) => void;
   tracePrefix?: string;
@@ -127,10 +138,19 @@ export class TunnelClient {
   private tcp: TcpServer;
   private sessions = new Map<string, Binding>();
   private timer: NodeJS.Timeout | null = null;
+  private statsTimer: NodeJS.Timeout | null = null;
   private opts: TunnelOptions;
   private running = false;
   private log: (line: string) => void;
   private dbg: (line: string) => void;
+  // Wire-side totals for the stats line. Counted before any decrypt/parse: the
+  // graph is about what the socket carried, not what the stream accepted.
+  private bytesTx = 0;
+  private bytesRx = 0;
+  private statsPrevTx = 0;
+  private statsPrevRx = 0;
+  private statsPrevMs = 0;
+  private startedMs = 0;
 
   constructor(opts: TunnelOptions) {
     this.opts = opts;
@@ -165,12 +185,18 @@ export class TunnelClient {
     });
     this.running = true;
     this.timer = setInterval(() => this.tick(), TICK_MS);
+    this.startedMs = nowMs();
+    this.statsPrevMs = this.startedMs;
+    if (this.opts.onStats) {
+      this.statsTimer = setInterval(() => this.emitStats(), STATS_PERIOD_MS);
+    }
     this.log(`client: proxy 127.0.0.1:${this.opts.listenPort ?? 1080} -> udp ${host}:${port}`);
   }
 
   stop(): void {
     this.running = false;
     if (this.timer) clearInterval(this.timer);
+    if (this.statsTimer) { clearInterval(this.statsTimer); this.statsTimer = null; }
     for (const b of this.sessions.values()) { b.cleanup(); b.trace?.close(); }
     this.sessions.clear();
     this.tcp.close();
@@ -179,8 +205,36 @@ export class TunnelClient {
 
   get sessionCount(): number { return this.sessions.size; }
 
+  /** Wire-side byte totals since start(); the desktop shell reads these too. */
+  get counters(): { tx: number; rx: number; sessions: number; uptimeMs: number } {
+    return {
+      tx: this.bytesTx,
+      rx: this.bytesRx,
+      sessions: this.sessions.size,
+      uptimeMs: this.startedMs === 0 ? 0 : nowMs() - this.startedMs,
+    };
+  }
+
+  private emitStats(): void {
+    const now = nowMs();
+    const dt = Math.max(1, now - this.statsPrevMs) / 1000;
+    const txRate = Math.round((this.bytesTx - this.statsPrevTx) / dt);
+    const rxRate = Math.round((this.bytesRx - this.statsPrevRx) / dt);
+    let up = 0;
+    for (const b of this.sessions.values()) if (b.session.established) up += 1;
+    const uptime = ((now - this.startedMs) / 1000).toFixed(1);
+    this.opts.onStats?.(
+      `stats ${uptime}s live=${this.sessions.size} up=${up} tunnels=${this.sessions.size} ` +
+        `tx=${this.bytesTx}B rx=${this.bytesRx}B tx_rate=${txRate}B/s rx_rate=${rxRate}B/s`,
+    );
+    this.statsPrevTx = this.bytesTx;
+    this.statsPrevRx = this.bytesRx;
+    this.statsPrevMs = now;
+  }
+
   private onUdp(msg: Buffer): void {
     if (msg.length < SALT_LEN) return;
+    this.bytesRx += msg.length;
     const salt = msg.subarray(0, SALT_LEN).toString('hex');
     this.dbg(`[${salt.slice(0, 8)}] udp rx ${msg.length}B known=${this.sessions.has(salt)}`);
     const b = this.sessions.get(salt);
@@ -302,6 +356,7 @@ export class TunnelClient {
         sendWire: (wire) => {
           if (!this.running) return;
           this.dbg(`[${saltKey.slice(0, 8)}] udp tx ${wire.length}B -> ${this.opts.host ?? '127.0.0.1'}:${this.opts.port ?? 4460}`);
+          this.bytesTx += wire.length;
           this.udp.send(wire, this.opts.port ?? 4460, this.opts.host ?? '127.0.0.1');
         },
         read: (b) => streamRead(b),

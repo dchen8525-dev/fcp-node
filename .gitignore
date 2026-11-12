@@ -13,3 +13,11 @@ deploy/psk.txt
 *.bin
 node_modules/
 .DS_Store
+
+# Desktop shell build outputs. The tunnel bundle is generated from src/app by
+# scripts/build-tunnel.mjs; dist/ is the electron-builder tree.
+desktop/node_modules/
+desktop/dist/
+desktop/resources/cli.mjs
+desktop/shot*.png
+desktop/final-*.png

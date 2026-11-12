@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <title>FCP Node</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- ------------------------------------------------------- rail -->
+    <aside class="rail">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="32" height="32">
+            <defs>
+              <linearGradient id="mk" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#16b98c" />
+                <stop offset="1" stop-color="#0b8563" />
+              </linearGradient>
+            </defs>
+            <rect x="1" y="1" width="30" height="30" rx="9" fill="url(#mk)" />
+            <path d="M9.5 21.5V10.5h7.2c2.6 0 4.3 1.5 4.3 3.9 0 2.5-1.8 4-4.4 4h-3.9v3.1z"
+                  fill="#ffffff" opacity=".95" />
+            <circle cx="22.4" cy="21.3" r="1.7" fill="#f0b46a" />
+          </svg>
+        </div>
+        <div class="brand-text">
+          <div class="brand-name">FCP Node</div>
+          <div class="brand-sub">v7 UDP 隧道</div>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav">
+        <button class="nav-item is-active" data-page="connect" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7.6 12.4 12.4 7.6M6.7 9.2 5 10.9a2.9 2.9 0 0 0 4.1 4.1l1.7-1.7M13.3 10.8 15 9.1a2.9 2.9 0 0 0-4.1-4.1l-1.7 1.7"/></svg>
+          <span>连接</span>
+        </button>
+        <button class="nav-item" data-page="status" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 13.5 7 9l3 3 6.5-6.5M12.5 5.5H17v4.5"/></svg>
+          <span>运行状态</span>
+        </button>
+        <button class="nav-item" data-page="speed" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 15a7 7 0 1 1 12 0M10 12l3.2-3.2"/></svg>
+          <span>链路测速</span>
+        </button>
+        <button class="nav-item" data-page="log" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.5 5.5h11M4.5 10h11M4.5 14.5h7"/></svg>
+          <span>日志</span>
+        </button>
+      </nav>
+
+      <div class="rail-foot" id="railState">
+        <div class="state-row">
+          <span class="dot" id="stateDot"></span>
+          <span class="state-text" id="stateText">未启动</span>
+        </div>
+        <div class="state-addr" id="stateAddr">—</div>
+        <div class="state-uptime" id="stateUptime">—</div>
+      </div>
+    </aside>
+
+    <!-- ------------------------------------------------------- stage -->
+    <main class="stage">
+      <!-- connect -->
+      <section class="page is-active" data-page="connect">
+        <header class="page-head">
+          <div>
+            <h1>连接</h1>
+            <p>修改后需重新启动生效。密钥只在本机进程命令行出现，不会写入本界面配置。</p>
+          </div>
+          <span class="badge" id="engineBadge">Node · 零依赖</span>
+        </header>
+
+        <div class="card">
+          <div class="card-title">服务器与本地代理</div>
+          <div class="grid two">
+            <label class="field">
+              <span class="field-label">服务器地址</span>
+              <input id="host" type="text" placeholder="例如 144.34.186.164" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span class="field-label">UDP 端口</span>
+              <input id="port" type="number" min="1" max="65535" value="4460" />
+            </label>
+            <label class="field">
+              <span class="field-label">本地监听地址</span>
+              <input id="listenHost" type="text" value="127.0.0.1" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span class="field-label">本地代理端口</span>
+              <input id="listenPort" type="number" min="1" max="65535" value="1080" />
+            </label>
+          </div>
+          <p class="hint">本地端口同时接受 SOCKS5、HTTP CONNECT 与 absolute-form 转发。</p>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            预共享密钥
+            <span class="card-note">32 位十六进制，两端必须一致</span>
+          </div>
+          <div class="key-row">
+            <input id="key" type="password" placeholder="000102030405060708090a0b0c0d0e0f"
+                   spellcheck="false" autocomplete="off" />
+            <button class="icon-btn" id="keyToggle" type="button" title="显示/隐藏">显示</button>
+          </div>
+          <div class="key-state" id="keyState">等待输入</div>
+          <label class="check">
+            <input id="remember" type="checkbox" checked />
+            <span>记住设置（保存在用户配置目录，不含密钥）</span>
+          </label>
+        </div>
+
+        <div class="card">
+          <button class="disclosure" id="advToggle" type="button" aria-expanded="false">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 4 4 4-4 4"/></svg>
+            <span>高级设置</span>
+          </button>
+          <div class="adv" id="advBody" hidden>
+            <div class="grid two">
+              <label class="field">
+                <span class="field-label">MTU 下限（探针起点）</span>
+                <input id="mtu" type="number" min="128" max="9000" value="1040" />
+              </label>
+              <label class="field">
+                <span class="field-label">FEC 几何</span>
+                <input id="fec" type="text" value="10:6" spellcheck="false" />
+              </label>
+              <label class="field">
+                <span class="field-label">日志级别</span>
+                <select id="logLevel">
+                  <option value="info">info（默认）</option>
+                  <option value="debug">debug</option>
+                  <option value="warn">warn</option>
+                  <option value="error">error</option>
+                  <option value="off">off</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="field-label">日志文件</span>
+                <input id="logFile" type="text" placeholder="留空则不落盘" spellcheck="false" />
+              </label>
+            </div>
+            <label class="check">
+              <input id="pmtud" type="checkbox" checked />
+              <span>开启 PMTUD（路径探测，默认开）</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="primary" id="startBtn" type="button">启动代理</button>
+          <button class="ghost" id="stopBtn" type="button" disabled>停止</button>
+          <span class="action-note" id="actionNote"></span>
+        </div>
+      </section>
+
+      <!-- status -->
+      <section class="page" data-page="status">
+        <header class="page-head">
+          <div>
+            <h1>运行状态</h1>
+            <p>数据来自隧道进程的 stats 行，每 0.5 秒一行，与日志级别无关。</p>
+          </div>
+        </header>
+
+        <div class="grid two">
+          <div class="metric">
+            <div class="metric-label"><i class="swatch down"></i>下行</div>
+            <div class="metric-value" id="rxRate">0 <small>B/s</small></div>
+            <div class="metric-sub" id="rxTotal">累计 0 B</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label"><i class="swatch up"></i>上行</div>
+            <div class="metric-value" id="txRate">0 <small>B/s</small></div>
+            <div class="metric-sub" id="txTotal">累计 0 B</div>
+          </div>
+        </div>
+
+        <div class="card chart-card">
+          <div class="card-title">
+            最近 60 秒
+            <span class="card-note" id="chartPeak">峰值 —</span>
+          </div>
+          <canvas id="chart" height="150"></canvas>
+        </div>
+
+        <div class="card">
+          <div class="kv-grid">
+            <div><span>会话</span><strong id="kSessions">0</strong></div>
+            <div><span>已建立</span><strong id="kUp">0</strong></div>
+            <div><span>运行时长</span><strong id="kUptime">—</strong></div>
+            <div><span>本地代理</span><strong class="mono" id="kListen">—</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- speed -->
+      <section class="page" data-page="speed">
+        <header class="page-head">
+          <div>
+            <h1>链路测速</h1>
+            <p>经当前本地 SOCKS 代理真实下载。Node 版内置的 <code>speedtest</code> 是进程内自环，测不到真实链路，所以这里走代理。</p>
+          </div>
+        </header>
+
+        <div class="card">
+          <label class="field">
+            <span class="field-label">测速 URL</span>
+            <input id="speedUrl" type="text" spellcheck="false"
+                   value="https://downloads.claude.ai/claude-code-releases/2.1.319/win32-x64/claude.exe" />
+          </label>
+          <div class="grid two">
+            <label class="field">
+              <span class="field-label">采样时长（秒）</span>
+              <input id="speedSeconds" type="number" min="3" max="60" value="10" />
+            </label>
+            <label class="field">
+              <span class="field-label">走哪个本地端口</span>
+              <input id="speedPort" type="number" min="1" max="65535" value="1080" />
+            </label>
+          </div>
+          <div class="actions">
+            <button class="primary" id="speedBtn" type="button">开始测速</button>
+            <button class="ghost" id="speedStopBtn" type="button" disabled>停止</button>
+            <span class="action-note" id="speedNote">代理未运行时会失败</span>
+          </div>
+        </div>
+
+        <div class="card speed-result">
+          <div class="speed-big"><span id="speedMbps">—</span><small>Mbit/s</small></div>
+          <div class="speed-detail">
+            <div><span>已下载</span><strong id="speedBytes">—</strong></div>
+            <div><span>耗时</span><strong id="speedElapsed">—</strong></div>
+            <div><span>折算</span><strong id="speedMiB">—</strong></div>
+          </div>
+          <div class="meter"><div class="meter-fill" id="speedMeter"></div></div>
+        </div>
+      </section>
+
+      <!-- log -->
+      <section class="page" data-page="log">
+        <header class="page-head">
+          <div>
+            <h1>日志</h1>
+            <p>stdout 为隧道统计，stderr 为运行日志。最多保留 2000 行。</p>
+          </div>
+          <div class="log-tools">
+            <div class="seg" id="logFilter">
+              <button class="is-active" data-level="all" type="button">全部</button>
+              <button data-level="warn" type="button">警告</button>
+              <button data-level="error" type="button">错误</button>
+            </div>
+            <button class="icon-btn" id="logClear" type="button">清空</button>
+            <button class="icon-btn" id="logDir" type="button">日志目录</button>
+          </div>
+        </header>
+        <div class="log" id="logView"></div>
+      </section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

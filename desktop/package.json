@@ -1,0 +1,48 @@
+{
+  "name": "fcp-desktop",
+  "version": "0.0.19",
+  "private": true,
+  "description": "FCP v7 tunnel desktop shell (Electron) - drives the Node tunnel port",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "build:tunnel": "node scripts/build-tunnel.mjs",
+    "start": "node scripts/build-tunnel.mjs && electron .",
+    "pack": "node scripts/build-tunnel.mjs && electron-builder --win portable --x64",
+    "pack:dir": "node scripts/build-tunnel.mjs && electron-builder --win dir --x64"
+  },
+  "devDependencies": {
+    "electron": "45.3.1",
+    "electron-builder": "26.18.0",
+    "esbuild": "0.28.2"
+  },
+  "build": {
+    "appId": "com.fcp.desktop",
+    "asar": false,
+    "productName": "FCP Node",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "renderer/**/*",
+      "resources/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "FCP-Node-${version}-portable.exe"
+    },
+    "compression": "maximum"
+  }
+}

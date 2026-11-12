@@ -421,7 +421,10 @@ async function main(): Promise<void> {
   let tunnel: TunnelClient | TunnelServer;
   if (mode === 'server') {
     const bind = splitHostPort(opts.get('bind'), '0.0.0.0', 4460);
-    tunnel = new TunnelServer({ ...common, listenHost: bind.host, port: bind.port });
+    tunnel = new TunnelServer({
+      ...common, listenHost: bind.host, port: bind.port,
+      onStats: (line) => process.stdout.write(line + '\n'),
+    });
   } else if (mode === 'client') {
     const remote = splitHostPort(opts.get('peer'), '', 4460);
     if (!remote.host) throw new Error('client requires --peer=IP[:P] (the FCP server address)');
@@ -430,6 +433,9 @@ async function main(): Promise<void> {
       ...common, host: remote.host, port: remote.port,
       listenHost: listen.host,
       listenPort: listen.port,
+      // Machine channel for the desktop shell: stdout, not `log`, so
+      // --log-level=error still reports throughput.
+      onStats: (line) => process.stdout.write(line + '\n'),
     });
   } else if (mode === 'speedtest') {
     // --speedtest used to be advertised as a client flag, but the client branch
