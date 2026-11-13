@@ -42,7 +42,7 @@ cd desktop
 npm install
 npm run build:tunnel     # -> resources/cli.mjs（约 170 KiB）
 npm start                # 开发模式起窗口
-npm run pack             # -> dist/FCP-Node-<version>-portable.exe + dist/FCP-Node-Setup-<version>.exe
+npm run pack             # -> dist/fcp-node-<version>-portable.exe + dist/fcp-node-setup-<version>.exe
 npm run pack:nsis        # 只打 NSIS 安装包
 ```
 

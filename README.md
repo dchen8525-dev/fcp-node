@@ -147,14 +147,15 @@ node scripts/self-interop.mjs --log-dir=logs/smoke
 
 ## 发布产物（Release）
 
-每次发布带四个资产，全部由本仓库的 `packaging/` 脚本生成：
+每次发布带四个安装包，外加 `sha256sums.txt`，全部由本仓库的 `packaging/` 脚本生成（资产名统一小写）：
 
 | 资产 | 平台 | 说明 |
 |---|---|---|
 | `fcp-server_<ver>_amd64.deb` | Debian/Ubuntu amd64 | 服务端。内嵌 Node 22 运行时，带 systemd unit 和 `/etc/fcp-node/server.conf`；首次安装自动生成 PSK 并只打印一次 |
-| `FCP-Node-Setup-<ver>.exe` | Windows x64 | 桌面 GUI 客户端 NSIS 安装包（per-user，无需管理员） |
-| `FCP-Node-<ver>-portable.exe` | Windows x64 | 桌面 GUI 客户端免安装单文件版 |
+| `fcp-node-setup-<ver>.exe` | Windows x64 | 桌面 GUI 客户端 NSIS 安装包（per-user，无需管理员） |
+| `fcp-node-<ver>-portable.exe` | Windows x64 | 桌面 GUI 客户端免安装单文件版 |
 | `fcp-client-<ver>.exe` | Windows x64 | 纯命令行客户端（Node SEA 单文件，不需要装 Node） |
+| `sha256sums.txt` | — | 上述四个产物的 SHA-256 校验和 |
 
 构建：
 

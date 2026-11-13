@@ -56,8 +56,8 @@ Node SEA：esbuild 打成 CJS（`packaging/win/client-entry.ts` 强制 client �
 ```bash
 npm --prefix desktop install
 npm --prefix desktop run pack
-# -> desktop/dist/FCP-Node-<version>-portable.exe
-# -> desktop/dist/FCP-Node-Setup-<version>.exe
+# -> desktop/dist/fcp-node-<version>-portable.exe
+# -> desktop/dist/fcp-node-setup-<version>.exe
 ```
 
 国内下载 Electron / NSIS 工具链需要镜像：

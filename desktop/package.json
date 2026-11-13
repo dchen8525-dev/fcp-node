@@ -50,10 +50,10 @@
       ]
     },
     "portable": {
-      "artifactName": "FCP-Node-${version}-portable.exe"
+      "artifactName": "fcp-node-${version}-portable.exe"
     },
     "nsis": {
-      "artifactName": "FCP-Node-Setup-${version}.exe",
+      "artifactName": "fcp-node-setup-${version}.exe",
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
