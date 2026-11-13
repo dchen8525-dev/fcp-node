@@ -42,8 +42,12 @@ cd desktop
 npm install
 npm run build:tunnel     # -> resources/cli.mjs（约 170 KiB）
 npm start                # 开发模式起窗口
-npm run pack             # -> dist/FCP-Node-<version>-portable.exe
+npm run pack             # -> dist/FCP-Node-<version>-portable.exe + dist/FCP-Node-Setup-<version>.exe
+npm run pack:nsis        # 只打 NSIS 安装包
 ```
+
+NSIS 安装包为 per-user 安装（无需管理员），向导里可以改安装目录，创建桌面
+与开始菜单快捷方式；卸载默认保留 `%APPDATA%\fcp-desktop` 下的设置与日志。
 
 Electron 二进制与 electron-builder 的 NSIS 工具都在境外，国内首次安装需要
 镜像：

@@ -7,7 +7,9 @@
   "scripts": {
     "build:tunnel": "node scripts/build-tunnel.mjs",
     "start": "node scripts/build-tunnel.mjs && electron .",
-    "pack": "node scripts/build-tunnel.mjs && electron-builder --win portable --x64",
+    "pack": "node scripts/build-tunnel.mjs && electron-builder --win --x64 --publish never",
+    "pack:portable": "node scripts/build-tunnel.mjs && electron-builder --win portable --x64 --publish never",
+    "pack:nsis": "node scripts/build-tunnel.mjs && electron-builder --win nsis --x64 --publish never",
     "pack:dir": "node scripts/build-tunnel.mjs && electron-builder --win dir --x64"
   },
   "devDependencies": {
@@ -18,6 +20,7 @@
   "build": {
     "appId": "com.fcp.desktop",
     "asar": false,
+    "electronDist": "node_modules/electron/dist",
     "productName": "FCP Node",
     "directories": {
       "output": "dist",
@@ -37,11 +40,29 @@
           "arch": [
             "x64"
           ]
+        },
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },
     "portable": {
       "artifactName": "FCP-Node-${version}-portable.exe"
+    },
+    "nsis": {
+      "artifactName": "FCP-Node-Setup-${version}.exe",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "FCP Node",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "deleteAppDataOnUninstall": false
     },
     "compression": "maximum"
   }
