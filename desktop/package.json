@@ -62,6 +62,8 @@
       "shortcutName": "FCP Node",
       "installerIcon": "build/icon.ico",
       "uninstallerIcon": "build/icon.ico",
+      "installerSidebar": "build/installerSidebar.bmp",
+      "installerHeader": "build/installerHeader.bmp",
       "deleteAppDataOnUninstall": false
     },
     "compression": "maximum"
