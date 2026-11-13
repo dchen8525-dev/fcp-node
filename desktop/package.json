@@ -1,6 +1,6 @@
 {
   "name": "fcp-desktop",
-  "version": "0.0.19",
+  "version": "0.0.1",
   "private": true,
   "description": "FCP v7 tunnel desktop shell (Electron) - drives the Node tunnel port",
   "main": "electron/main.cjs",
