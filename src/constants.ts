@@ -194,6 +194,10 @@ export const MAX_ACTIVE_SETS = 256;
 export const MAX_GAP_PLACEHOLDERS = 64;
 export const AHEAD_CONFIRM_TIMEOUT_MS = 2000;
 export const SN_WINDOW = 4096;
+/** Byte ceiling on the symbols all active sets hold together (frame_rx.h).
+ *  Without it a peer may pin the heap by filling every set with full-size
+ *  symbols; the sender's ARQ retransmits whatever this drops. */
+export const MAX_RX_SYMBOL_BYTES = 8 * 1024 * 1024;
 
 // Session (session.cc)
 export const KEEPALIVE_MAGIC = Buffer.from('FCPKAL1\0', 'latin1');
@@ -247,6 +251,11 @@ export const RETX_RTT_FACTOR = 1.0;
 export const MIN_RTT_EXPIRY_MS = 10000;
 export const TLP_MIN_PTO_MS = 60;
 export const TLP_MAX_PROBES = 2;
+/** Receive-side chunk-count ceiling (stream.h kMinOobChunks/kMaxOobChunks).
+ *  The byte ceiling alone does not bound memory: a peer can put one byte in
+ *  each run, so 256 KiB of reorder data becomes 128 k Buffer objects. */
+export const MIN_OOB_CHUNKS = 1024;
+export const MAX_OOB_CHUNKS = 8192;
 
 // PMTUD (pmtu.h)
 export const PMTU_MAGIC = Buffer.from('FCP_PMTU', 'latin1');

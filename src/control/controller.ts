@@ -66,9 +66,6 @@ export class AdaptiveFec {
    *  fallback: it describes the *inbound* direction, and using it to size
    *  outbound parity is wrong on an asymmetric link. */
   private peerReports = false;
-  /** Previous FECSTAT counters, so loss is measured per interval. */
-  private lastGroups = 0;
-  private lastRxOrig = 0;
   private trace?: (line: string) => void;
 
   constructor(cfg: ControllerConfig = {}) {
@@ -120,15 +117,14 @@ export class AdaptiveFec {
    * Direction caveat, unchanged: this observes the *inbound* direction while
    * our k governs the outbound one, which is why it is only a fallback.
    */
-  noteLocalCounters(groups: number, rxOrig: number, nowMs: number): void {
+  noteLocalCounters(expectedShards: number, rxOrig: number, nowMs: number): void {
     if (this.pinnedK > 0 || this.peerReports) return;
     if (!this.lastLocalMs) { this.lastLocalMs = nowMs; return; }
     if (nowMs - this.lastLocalMs < FECSTAT_INTERVAL_MS) return;
     this.lastLocalMs = nowMs;
-    const expected = groups * this.d;
-    if (expected < FEC_LOSS_MIN_SHARDS) return;
-    const lost = Math.max(0, Math.min(expected, expected - rxOrig));
-    this.adjust(lost / expected, 'fec_k_local');
+    if (expectedShards < FEC_LOSS_MIN_SHARDS) return;
+    const lost = Math.max(0, Math.min(expectedShards, expectedShards - rxOrig));
+    this.adjust(lost / expectedShards, 'fec_k_local');
   }
 
   /**
@@ -149,17 +145,15 @@ export class AdaptiveFec {
    */
   onFecstat(stat: FecstatPacket): void {
     if (this.pinnedK > 0) return;
-    const groups = (stat.setsFull >>> 0) + (stat.setsPartial >>> 0);
+    // FECSTAT counters are per interval (the reporter emits deltas), exactly
+    // like the C++ settlement view. `data_expected` is Σ n_used over the sets
+    // settled in this interval, so short flush groups cannot inflate the
+    // denominator the way `groups x d` did.
+    const expected = stat.dataExpected >>> 0;
     const rxOrig = stat.dataRxOrig >>> 0;
-    const dGroups = groups - this.lastGroups;
-    const dRx = rxOrig - this.lastRxOrig;
-    this.lastGroups = groups;
-    this.lastRxOrig = rxOrig;
-    if (dGroups <= 0 || dRx < 0) return; // no new groups, or the peer restarted
-    const expected = dGroups * this.d;
     if (expected < FEC_LOSS_MIN_SHARDS) return;
     this.peerReports = true;
-    const lost = Math.max(0, Math.min(expected, expected - dRx));
+    const lost = Math.max(0, Math.min(expected, expected - rxOrig));
     this.adjust(lost / expected, 'fecstat_loss');
   }
 
@@ -237,6 +231,33 @@ export interface ReporterStats {
   repairLatencies: number[];
 }
 
+/** The settlement counters FECSTAT carries, snapshotted per interval. */
+interface CounterSnapshot {
+  setsExpected: number; dataExpected: number; dataRxOrig: number;
+  dataRecoveredDl: number; dataRecoveredLate: number; dataDelivered: number;
+  parityRx: number; parityExpected: number; setsKUnknown: number;
+  setsFull: number; lateDup: number; structFail: number;
+  setsTailDropped: number; dataLateRx: number; setsPartial: number;
+  ledgerGroups: number; ledgerFailed: number; ledgerKHist: number[];
+}
+
+function snapshotCounters(c: RxCounters): CounterSnapshot {
+  return {
+    setsExpected: c.setsExpected, dataExpected: c.dataExpected, dataRxOrig: c.dataRxOrig,
+    dataRecoveredDl: c.recovered, dataRecoveredLate: c.recoveredLate,
+    dataDelivered: c.dataDelivered, parityRx: c.parityRx, parityExpected: c.parityExpected,
+    setsKUnknown: c.setsKUnknown, setsFull: c.setsFull, lateDup: c.lateDup,
+    structFail: c.structFail, setsTailDropped: c.setsTailDropped,
+    dataLateRx: c.lateDup, setsPartial: c.setsPartial,
+    ledgerGroups: c.ledgerGroups, ledgerFailed: c.ledgerFailed,
+    ledgerKHist: [...c.ledgerKHist],
+  };
+}
+
+function counterDelta(now: number, before: number): number {
+  return (now - before) >>> 0;
+}
+
 /** Builds one 128-byte FECSTAT every 2 s from the receiver's counters. */
 export class FecstatReporter {
   private salt: Uint8Array;
@@ -245,6 +266,11 @@ export class FecstatReporter {
   private dataBytes = 0; private parityBytes = 0;
   private latencies: number[] = [];
   private direction: DirectionValue;
+  /** Cumulative settlement counters as of the previous report, so every
+   *  FECSTAT field is the interval delta the protocol specifies. Without it
+   *  the same shard stayed in `data_rx_orig` forever and the peer's
+   *  `1 - data_rx_orig/data_expected` converged on the session average. */
+  private prev: CounterSnapshot | null = null;
 
   constructor(salt: Uint8Array, direction: DirectionValue) {
     this.salt = Buffer.from(salt); this.direction = direction;
@@ -256,42 +282,65 @@ export class FecstatReporter {
   noteStructFail(): void { ++this.structFail; }
 
   onTick(nowMs: number, counters: RxCounters, accountedThroughSetId: number): Buffer | null {
-    if (!this.lastMs) { this.lastMs = nowMs; return null; }
+    if (!this.lastMs) {
+      this.lastMs = nowMs;
+      this.prev = snapshotCounters(counters);
+      return null;
+    }
     if (nowMs - this.lastMs < FECSTAT_INTERVAL_MS) return null;
     const interval = Math.min(60000, nowMs - this.lastMs);
     this.lastMs = nowMs;
+    const cur = snapshotCounters(counters);
+    const prev = this.prev ?? cur;
+    this.prev = cur;
+    const d = counterDelta;
     const p = makeFecstatPacket(this.salt);
     p.intervalMs = interval;
     p.flg = FLG_DIRECTION; // receiver reports the "you -> me" direction
     p.accountedThroughSetId = accountedThroughSetId >>> 0;
-    p.setsExpected = (counters.setsFull + counters.setsPartial + counters.setsTailDropped) >>> 0;
-    p.dataExpected = counters.dataDelivered >>> 0;
-    p.dataRxOrig = counters.dataRxOrig >>> 0;
-    p.dataRecoveredDl = counters.recovered >>> 0;
-    p.dataRecoveredLate = counters.recoveredLate >>> 0;
-    p.dataDelivered = counters.dataDelivered >>> 0;
-    p.parityRx = counters.parityRx >>> 0;
-    p.setsFull = counters.setsFull >>> 0;
-    p.setsPartial = counters.setsPartial >>> 0;
-    p.setsTailDropped = counters.setsTailDropped >>> 0;
-    p.dataLateRx = counters.lateDup >>> 0;
-    p.structFail = (counters.structFail + this.structFail) >>> 0;
+    p.setsExpected = d(cur.setsExpected, prev.setsExpected);
+    p.dataExpected = d(cur.dataExpected, prev.dataExpected);
+    p.dataRxOrig = d(cur.dataRxOrig, prev.dataRxOrig);
+    p.dataRecoveredDl = d(cur.dataRecoveredDl, prev.dataRecoveredDl);
+    p.dataRecoveredLate = d(cur.dataRecoveredLate, prev.dataRecoveredLate);
+    p.dataDelivered = d(cur.dataDelivered, prev.dataDelivered);
+    p.parityRx = d(cur.parityRx, prev.parityRx);
+    p.parityExpected = d(cur.parityExpected, prev.parityExpected);
+    p.setsKUnknown = d(cur.setsKUnknown, prev.setsKUnknown);
+    p.setsFull = d(cur.setsFull, prev.setsFull);
+    p.setsPartial = d(cur.setsPartial, prev.setsPartial);
+    p.setsTailDropped = d(cur.setsTailDropped, prev.setsTailDropped);
+    p.lateDup = d(cur.lateDup, prev.lateDup);
+    p.dataLateRx = d(cur.dataLateRx, prev.dataLateRx);
+    p.structFail = (d(cur.structFail, prev.structFail) + this.structFail) >>> 0;
     p.authFail = this.authFail >>> 0;
     p.dataBytesRx = this.dataBytes >>> 0;
     p.parityBytesRx = this.parityBytes >>> 0;
+    if (p.dataRecoveredLate > 0) p.flg |= FLG_LATE_RECOVERY;
+    if (p.setsTailDropped > 0) p.flg |= FLG_TAIL_DROPPED;
     const lats = this.latencies.slice().sort((a, b) => a - b);
     if (lats.length) {
-      p.repairLatP50Ms = lats[Math.floor(lats.length * 0.5)] & 0xffff;
-      p.repairLatP95Ms = lats[Math.min(lats.length - 1, Math.floor(lats.length * 0.95))] & 0xffff;
-      if (p.repairLatP95Ms > 0) p.flg |= FLG_LATE_RECOVERY;
+      // Nearest rank, matching reporter.cc's percentile().
+      const at = (pct: number): number => {
+        const rank = Math.min(lats.length, Math.max(1, Math.ceil(pct * lats.length / 100)));
+        return lats[rank - 1] & 0xffff;
+      };
+      p.repairLatP50Ms = at(50);
+      p.repairLatP95Ms = at(95);
     }
-    if (p.setsTailDropped > 0) p.flg |= FLG_TAIL_DROPPED;
-    const ledgerGroups = counters.setsFull;
+    const ledgerGroups = d(cur.ledgerGroups, prev.ledgerGroups);
     if (ledgerGroups > 0) {
-      p.ledgerGroups = ledgerGroups >>> 0;
-      p.ledgerFailPpm = Math.min(1000000, Math.round(1e6 * counters.setsPartial / Math.max(1, ledgerGroups)));
-      p.ledgerMeta = 0; // dominant k / burst KL left unknown
-      if (ledgerGroups >= 1) p.flg |= FLG_LEDGER;
+      const failed = d(cur.ledgerFailed, prev.ledgerFailed);
+      p.ledgerGroups = ledgerGroups;
+      p.ledgerFailPpm = Math.min(1000000, Math.round(1e6 * failed / ledgerGroups));
+      let bestK = 0;
+      let bestN = 0;
+      for (let k = 1; k <= 7; ++k) {
+        const n = d(cur.ledgerKHist[k] ?? 0, prev.ledgerKHist[k] ?? 0);
+        if (n > bestN) { bestN = n; bestK = k; }
+      }
+      p.ledgerMeta = bestK;
+      p.flg |= FLG_LEDGER;
     }
     this.authFail = 0; this.structFail = 0;
     this.dataBytes = 0; this.parityBytes = 0; this.latencies = [];

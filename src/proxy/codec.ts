@@ -206,6 +206,27 @@ export function httpParseConnect(buf: Buffer): ParseResult<ProxyTarget> {
 export interface HttpForwardValue { target: ProxyTarget; rewrittenHead: Buffer; }
 const FORWARD_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH']);
 
+// RFC 7230 tchar: everything a header field-name may contain.
+function isTchar(c: number): boolean {
+  return (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) ||
+    c === 0x21 || c === 0x23 || c === 0x24 || c === 0x25 || c === 0x26 || c === 0x27 ||
+    c === 0x2a || c === 0x2b || c === 0x2d || c === 0x2e || c === 0x5e || c === 0x5f ||
+    c === 0x60 || c === 0x7c || c === 0x7e;
+}
+function headerValueOk(v: string): boolean {
+  for (let i = 0; i < v.length; ++i) {
+    const c = v.charCodeAt(i);
+    if (c !== 0x09 && (c < 0x20 || c > 0x7e)) return false;
+  }
+  return true;
+}
+function collectHops(value: string, hops: Set<string>): void {
+  for (const raw of value.split(',')) {
+    const name = raw.trim().toLowerCase();
+    if (name) hops.add(name);
+  }
+}
+
 export function httpParseForward(buf: Buffer): ParseResult<HttpForwardValue> {
   const capped = buf.length >= HTTP_HEAD_MAX_BYTES;
   const win = capped ? HTTP_HEAD_MAX_BYTES : buf.length;
@@ -221,30 +242,87 @@ export function httpParseForward(buf: Buffer): ParseResult<HttpForwardValue> {
   const url = tok[1];
   if (!url.startsWith('http://')) return { status: 'bad_request', consumed: 0 };
   const rest = url.slice(7);
-  const slash = rest.indexOf('/');
-  const authority = slash < 0 ? rest : rest.slice(0, slash);
-  const path = slash < 0 ? '/' : rest.slice(slash);
+  // The authority ends at the first '/', '?' or '#'; a fragment is never sent
+  // to an origin server.
+  let cut = rest.length;
+  for (const ch of ['/', '?', '#']) {
+    const i = rest.indexOf(ch);
+    if (i >= 0 && i < cut) cut = i;
+  }
+  const authority = rest.slice(0, cut);
+  let path = rest.slice(cut);
+  const hash = path.indexOf('#');
+  if (hash >= 0) path = path.slice(0, hash);
+  if (!path) path = '/';
+  else if (path[0] === '?') path = '/' + path;
+  for (let i = 0; i < path.length; ++i) {
+    const c = path.charCodeAt(i);
+    if (c < 0x21 || c > 0x7e) return { status: 'bad_request', consumed: 0 };
+  }
   const auth = parseAuthority(authority, HTTP_FORWARD_DEFAULT_PORT);
   if (!auth) return { status: 'bad_request', consumed: 0 };
   const addr = Buffer.from(auth.host, 'latin1');
   if (!addr.length || addr.length > HTTP_MAX_HOST_LEN) return { status: 'bad_request', consumed: 0 };
 
-  // Rewrite to origin-form, drop hop-by-hop headers, force Connection: close.
+  // First pass: collect the header lines and the hop-by-hop names listed in
+  // Connection. The header may appear anywhere, so the drop list is only
+  // complete after every line has been seen.
   const head = buf.subarray(0, headLen).toString('latin1');
   const lines = head.split('\r\n');
-  const out: string[] = [`${tok[0]} ${path} ${tok[2]}`];
+  const hops = new Set<string>();
+  interface HLine { name: string; text: string; }
+  const kept: HLine[] = [];
+  let hostValue: string | null = null;
   for (let i = 1; i < lines.length; ++i) {
     const line = lines[i];
     if (!line) continue;
+    if (line[0] === ' ' || line[0] === '\t') return { status: 'bad_request', consumed: 0 }; // obs-fold
     const colon = line.indexOf(':');
-    const name = colon < 0 ? line : line.slice(0, colon);
-    const low = name.trim().toLowerCase();
-    if (low === 'connection' || low === 'proxy-connection' || low === 'keep-alive' ||
-        low === 'proxy-authenticate' || low === 'proxy-authorization' ||
-        low === 'te' || low === 'trailer' || low === 'transfer-encoding' || low === 'upgrade') continue;
-    out.push(line);
+    if (colon <= 0) return { status: 'bad_request', consumed: 0 };
+    const name = line.slice(0, colon);
+    for (let k = 0; k < name.length; ++k) {
+      if (!isTchar(name.charCodeAt(k))) return { status: 'bad_request', consumed: 0 };
+    }
+    const value = line.slice(colon + 1).trim();
+    if (!headerValueOk(value)) return { status: 'bad_request', consumed: 0 };
+    const low = name.toLowerCase();
+    if (low === 'host') {
+      if (hostValue !== null) return { status: 'bad_request', consumed: 0 }; // ambiguous Host
+      hostValue = value;
+    } else if (low === 'connection') {
+      collectHops(value, hops);
+    }
+    kept.push({ name: low, text: line });
   }
-  out.push('Connection: close', '', '');
+
+  // A Host that disagrees with the absolute-form authority would let a local
+  // application address one server through another one's connection (request
+  // smuggling). A missing Host (HTTP/1.0) is filled from the URL.
+  if (hostValue !== null) {
+    // The name must agree with the URL's authority. A missing port is accepted
+    // (many clients omit it even for a non-default target); an explicit one
+    // has to match. The Host sent to the origin is always rebuilt from the URL,
+    // so a disagreeing original can never reach the server.
+    const h = parseAuthority(hostValue, 0);
+    if (!h || h.host.toLowerCase() !== auth.host.toLowerCase() ||
+        (h.port !== 0 && h.port !== auth.port)) {
+      return { status: 'bad_request', consumed: 0 };
+    }
+  }
+
+  // Second pass: rewrite to origin-form and drop hop-by-hop headers.
+  // Transfer-Encoding/Content-Length are deliberately kept even when a
+  // Connection token names them: this proxy never decodes a body, so dropping
+  // either corrupts a chunked upload.
+  const out: string[] = [`${tok[0]} ${path} ${tok[2]}`];
+  for (const l of kept) {
+    if (l.name === 'connection' || l.name === 'host' || l.name === 'upgrade' ||
+        l.name === 'keep-alive' || l.name === 'te' || l.name === 'trailer' ||
+        l.name.startsWith('proxy-')) continue;
+    if (l.name !== 'transfer-encoding' && l.name !== 'content-length' && hops.has(l.name)) continue;
+    out.push(l.text);
+  }
+  out.push(`Host: ${authority}`, 'Connection: close', '', '');
   return {
     status: 'ok', consumed: headLen,
     value: {

@@ -38,8 +38,10 @@ if (!importOk) { console.error(imp.stderr); ++failed; }
 const testArgs = ['--test', ...tests.map((p) => relative(root, p).replace(/\\/g, '/'))];
 const t = spawnSync(process.execPath, testArgs, { cwd: root, encoding: 'utf8', timeout: 180000 });
 const out = (t.stdout ?? '') + (t.stderr ?? '');
-const m = /# pass (\d+)/.exec(out);
-const f = /# fail (\d+)/.exec(out);
+// Node's default reporter changed its summary prefix from "# pass" (TAP-ish)
+// to "ℹ pass" (spec); accept both so the gate does not fail on a formatter.
+const m = /(?:#|ℹ)\s*pass (\d+)/.exec(out);
+const f = /(?:#|ℹ)\s*fail (\d+)/.exec(out);
 const pass = m ? Number(m[1]) : 0;
 const fail = f ? Number(f[1]) : 1;
 const testOk = t.status === 0 && fail === 0;

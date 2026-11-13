@@ -3,7 +3,7 @@
 // way the Qt shell spawns fcp-client, so a tunnel crash cannot take the UI down.
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -11,10 +11,14 @@ const net = require('node:net');
 const tls = require('node:tls');
 
 const CLI_PATH = path.join(__dirname, '..', 'resources', 'cli.mjs');
+const ICON_PATH = path.join(__dirname, '..', 'resources', 'icon.png');
 const IS_PACKAGED = app.isPackaged;
 const SETTINGS_PATH = () => path.join(app.getPath('userData'), 'settings.json');
 
 let win = null;
+let tray = null;
+let isQuitting = false;
+let trayHintShown = false;
 let child = null;
 let childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
 let speedJob = null;
@@ -43,6 +47,105 @@ function writeSettings(patch) {
 
 function send(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+}
+
+// ---------------------------------------------------------------- tray
+
+function showWindow() {
+  if (!win || win.isDestroyed()) { createWindow(); return; }
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+
+function quitApp() {
+  isQuitting = true;
+  stopTunnel();
+  app.quit();
+}
+
+function openLogDir() {
+  const dir = path.join(app.getPath('userData'), 'log');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+async function revealLogDir() {
+  const dir = openLogDir();
+  await shell.openPath(dir);
+  return dir;
+}
+
+/**
+ * Tray icon + menu. The window close button hides instead of quitting while
+ * the tray exists, so the tunnel is no longer tied to the window's lifetime;
+ * "退出" is the only path that really terminates the process.
+ */
+function createTray() {
+  if (tray) return;
+  try {
+    const source = nativeImage.createFromPath(ICON_PATH);
+    if (source.isEmpty()) throw new Error(`tray icon not found: ${ICON_PATH}`);
+    // Windows renders the notification area at 16 px (scale factor applies on
+    // top); resizing here keeps the tray crisp instead of downscaling a large
+    // window icon on every paint.
+    const image = source.resize({ width: 16, height: 16, quality: 'best' });
+    tray = new Tray(image);
+    tray.setToolTip('FCP Node · 未启动');
+    tray.on('click', showWindow);
+    tray.on('double-click', showWindow);
+    rebuildTrayMenu();
+  } catch (e) {
+    tray = null;
+    send('fcp:log', { level: 'warn', line: `tray unavailable: ${e.message}` });
+  }
+}
+
+function rebuildTrayMenu() {
+  if (!tray) return;
+  const running = childState.running;
+  const status = running ? `运行中 · ${childState.peer || '已连接'}` : '未启动';
+  const listen = childState.listen || '—';
+  const template = [
+    { label: '显示主窗口', click: showWindow },
+    { type: 'separator' },
+    { label: `状态：${status}`, enabled: false },
+    { label: `本地代理：${listen}`, enabled: false },
+    { type: 'separator' },
+  ];
+  if (running) {
+    template.push({ label: '停止隧道', click: () => { stopTunnel(); } });
+  } else {
+    template.push({
+      label: '启动隧道…',
+      click: () => {
+        showWindow();
+        send('fcp:log', { level: 'info', line: '请在主窗口填写密钥后点击“启动”' });
+      },
+    });
+  }
+  template.push(
+    { label: '打开日志目录', click: () => { void revealLogDir(); } },
+    { type: 'separator' },
+    { label: '退出 FCP Node', click: quitApp },
+  );
+  tray.setContextMenu(Menu.buildFromTemplate(template));
+  tray.setToolTip(running ? `FCP Node · 运行中 · ${childState.peer || ''}`.trim() : 'FCP Node · 未启动');
+}
+
+/** One-time hint when the window is first hidden; Windows-only and silent
+ *  where the platform has no balloon support. */
+function notifyMinimizedToTray() {
+  if (trayHintShown || !tray) return;
+  trayHintShown = true;
+  if (process.platform === 'win32' && typeof tray.displayBalloon === 'function') {
+    try {
+      tray.displayBalloon({
+        title: 'FCP Node 仍在运行',
+        content: '窗口已隐藏到托盘；右键托盘图标可停止隧道或退出。',
+      });
+    } catch { /* balloon is decorative */ }
+  }
 }
 
 // ---------------------------------------------------------------- tunnel
@@ -87,6 +190,7 @@ function startTunnel(cfg) {
   childState = { running: true, pid: child.pid || 0, startedAt: Date.now(),
     peer: `${cfg.host}:${cfg.port}`, listen: `${cfg.listenHost}:${cfg.listenPort}` };
   send('fcp:state', childState);
+  rebuildTrayMenu();
 
   let buf = '';
   child.stdout.setEncoding('utf8');
@@ -122,6 +226,7 @@ function startTunnel(cfg) {
     child = null;
     childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
     send('fcp:state', childState);
+    rebuildTrayMenu();
     if (wasRunning) {
       send('fcp:log', { level: code === 0 ? 'info' : 'error',
         line: `tunnel exited: code=${code} signal=${signal || 'none'}` });
@@ -132,6 +237,7 @@ function startTunnel(cfg) {
     child = null;
     childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
     send('fcp:state', childState);
+    rebuildTrayMenu();
   });
   return { ok: true, pid: child.pid };
 }
@@ -151,6 +257,7 @@ function stopTunnel() {
   }
   childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
   send('fcp:state', childState);
+  rebuildTrayMenu();
   return { ok: true };
 }
 
@@ -267,7 +374,7 @@ function createWindow() {
     width: 980, height: 700, minWidth: 820, minHeight: 600,
     backgroundColor: '#f4f7f5',
     title: 'FCP Node',
-    icon: path.join(__dirname, '..', 'resources', 'icon.png'),
+    icon: ICON_PATH,
     show: false,
     autoHideMenuBar: true,
     webPreferences: {
@@ -280,13 +387,14 @@ function createWindow() {
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   win.once('ready-to-show', () => win.show());
   win.on('close', (e) => {
-    // Closing the window keeps the tunnel alive when it runs; the tray is out of
-    // scope, so this only hides the window and the app quits from the menu.
-    if (child) {
-      e.preventDefault();
-      win.hide();
-      send('fcp:log', { level: 'info', line: 'window hidden; tunnel still running' });
-    }
+    // With a tray the close button only hides the window; quitting is the
+    // tray's "退出" entry (or the menu's Quit), which sets isQuitting first.
+    // Without a tray there would be no way back, so a close really exits.
+    if (isQuitting || !tray) return;
+    e.preventDefault();
+    win.hide();
+    send('fcp:log', { level: 'info', line: '窗口已隐藏到托盘；隧道继续运行' });
+    notifyMinimizedToTray();
   });
   win.on('closed', () => { win = null; });
 }
@@ -307,12 +415,7 @@ ipcMain.handle('fcp:speed:stop', () => {
   if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
   return { ok: true };
 });
-ipcMain.handle('fcp:open-log-dir', async () => {
-  const dir = path.join(app.getPath('userData'), 'log');
-  fs.mkdirSync(dir, { recursive: true });
-  await shell.openPath(dir);
-  return dir;
-});
+ipcMain.handle('fcp:open-log-dir', async () => revealLogDir());
 ipcMain.handle('fcp:pick-url', async () => {
   const r = await dialog.showMessageBox(win, {
     type: 'question',
@@ -323,18 +426,26 @@ ipcMain.handle('fcp:pick-url', async () => {
   return r.response === 1 ? 'https://downloads.claude.ai/claude-code-releases/2.1.319/win32-x64/claude.exe' : '';
 });
 
-app.on('second-instance', () => {
-  if (win) { win.show(); win.focus(); }
-});
+app.on('second-instance', () => { showWindow(); });
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.whenReady().then(createWindow);
-  app.on('window-all-closed', () => {
-    if (child) return;  // tunnel keeps the app alive; quit from the menu
-    app.quit();
+  app.whenReady().then(() => {
+    createWindow();
+    createTray();
   });
-  app.on('before-quit', () => { stopTunnel(); });
+  // With a tray, closing the last window is only "hide"; without one there is
+  // no way to bring the app back, so let it quit (before-quit stops the tunnel).
+  app.on('window-all-closed', () => {
+    if (!tray) app.quit();
+  });
+  app.on('before-quit', () => {
+    isQuitting = true;
+    stopTunnel();
+  });
+  app.on('will-quit', () => {
+    if (tray) { tray.destroy(); tray = null; }
+  });
 }

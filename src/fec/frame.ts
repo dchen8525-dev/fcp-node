@@ -11,7 +11,7 @@ import {
   FEC_HDR_LEN, SymbolType, MAX_S, MAX_ACTIVE_SETS, MAX_GAP_PLACEHOLDERS,
   AHEAD_CONFIRM_TIMEOUT_MS, FRAME_ENVELOPE_OVERHEAD, DATA_WIRE_OVERHEAD,
   PARITY_WIRE_OVERHEAD, KCP_HEADER_RESERVE, MIN_FLUSH_MS, MAX_FLUSH_MS,
-  DEFAULT_FLUSH_MS, DEFAULT_MTU, DEFAULT_IP_HEADER_LEN,
+  DEFAULT_FLUSH_MS, DEFAULT_MTU, DEFAULT_IP_HEADER_LEN, MAX_RX_SYMBOL_BYTES,
 } from '../constants.ts';
 import {
   getLe16, putLe16, getLe32, putLe32, bytesEqual, seqAfter,
@@ -150,7 +150,13 @@ export interface RxCounters {
   recoveredLate: number; dataRxOrig: number; parityRx: number;
   dataDelivered: number; retiredDropped: number; aheadDropped: number;
   setsPartial: number; setsFull: number; setsTailDropped: number;
-  decodeAttempts: number; badRecon: number;
+  decodeAttempts: number; badRecon: number; symbolBudgetDrops: number;
+  /** Settlement view, reported in FECSTAT: accounted sets with symbols and
+   *  the number of data shards those sets were expected to carry (Σ n_used). */
+  setsExpected: number; dataExpected: number; parityExpected: number;
+  setsKUnknown: number;
+  /** M3 R(k) ledger: full-size groups with known k, of which this many failed. */
+  ledgerGroups: number; ledgerFailed: number; ledgerKHist: number[];
 }
 
 export interface FrameRxOptions {
@@ -173,11 +179,20 @@ export class FrameRx {
   private accountBoundary = new Map<number, number>();
   private anchor = 0; private anchorValid = false;
   private pendingAhead = 0; private pendingAheadValid = false; private pendingAheadMs = 0;
+  /** Session-level monotonic FECSTAT key. It must not be derived from the live
+   *  set map: retired sets are deleted 2 s after arrival, so a quiet interval
+   *  would otherwise report key 0 and the peer's validator would mark every
+   *  later report stale. */
+  private accountedThrough = 0;
+  private haveAccounted = false;
+  private symbolBytes = 0;
   readonly counters: RxCounters = {
     structFail: 0, stale: 0, lateDup: 0, recovered: 0, recoveredLate: 0,
     dataRxOrig: 0, parityRx: 0, dataDelivered: 0, retiredDropped: 0,
     aheadDropped: 0, setsPartial: 0, setsFull: 0, setsTailDropped: 0,
-    decodeAttempts: 0, badRecon: 0,
+    decodeAttempts: 0, badRecon: 0, symbolBudgetDrops: 0,
+    setsExpected: 0, dataExpected: 0, parityExpected: 0, setsKUnknown: 0,
+    ledgerGroups: 0, ledgerFailed: 0, ledgerKHist: new Array(8).fill(0),
   };
   readonly repairLatencies: number[] = [];
 
@@ -264,7 +279,9 @@ export class FrameRx {
       const late = set.accounted;
       const boundary = this.accountBoundary.get(hdr.setId);
       const lateUnexpected = late && (boundary === undefined || idx >= boundary);
-      ++this.counters.dataRxOrig;
+      // Shard counters are settlement-based (see accountSet): counting an
+      // arrival here would put shards from still-active sets into the period's
+      // numerator while their sets have not entered the denominator yet.
       ++this.counters.dataDelivered;
       this.deliverFn(symbol.subarray(2), { recovered: false, late: late || lateUnexpected });
       this.tryDecode(set, nowMs);
@@ -277,14 +294,28 @@ export class FrameRx {
     set.n = nNew; set.nKnown = true;
     set.parity.set(hdr.index, symbol);
     this.store(set, hdr.index, symbol);
-    ++this.counters.parityRx;
     this.tryDecode(set, nowMs);
   }
 
   private store(set: RxSet, idx: number, symbol: Buffer): void {
     set.hasAnySymbol = true;
     set.symbolMax = Math.max(set.symbolMax, symbol.length);
+    const old = set.data.get(idx);
+    const oldLen = old ? old.length : 0;
+    if (this.symbolBytes - oldLen + symbol.length > MAX_RX_SYMBOL_BYTES) {
+      // Same policy as frame_rx.cc: dropping is recovered by the peer's ARQ,
+      // growing the heap is not. Index masks stay set, exactly as in C++.
+      ++this.counters.symbolBudgetDrops;
+      return;
+    }
+    this.symbolBytes += symbol.length - oldLen;
     set.data.set(idx, symbol);
+  }
+
+  private setBytes(set: RxSet): number {
+    let n = 0;
+    for (const b of set.data.values()) n += b.length;
+    return n;
   }
 
   private tryDecode(set: RxSet, nowMs: number): void {
@@ -341,6 +372,11 @@ export class FrameRx {
       for (const [id, st] of this.sets) if (!st.accounted) { victim = id; break; }
       if (victim === undefined) for (const id of this.sets.keys()) { victim = id; break; }
       if (victim === undefined) return null;
+      const victimSet = this.sets.get(victim);
+      if (victimSet) {
+        this.symbolBytes -= this.setBytes(victimSet);
+        if (!victimSet.accounted) ++this.counters.setsTailDropped;
+      }
       this.sets.delete(victim);
       this.accountBoundary.delete(victim);
     }
@@ -383,12 +419,11 @@ export class FrameRx {
       if (!set.accounted && nowMs - set.tFirstMs >= 1000) {
         set.accounted = true;
         this.accountBoundary.set(id, boundary);
-        if (set.nKnown && set.orig.size + set.recov.size >= set.n) ++this.counters.setsFull;
-        else if (set.hasAnySymbol) ++this.counters.setsPartial;
-        if (!set.nKnown && set.hasAnySymbol) ++this.counters.setsTailDropped;
+        this.accountSet(set);
         this.emit('accounted', id);
       }
       if (nowMs - set.tFirstMs >= 2000) {
+        this.symbolBytes -= this.setBytes(set);
         if (set.accounted) { this.retired.add(id); this.pruneRetired(); }
         this.sets.delete(id);
         this.accountBoundary.delete(id);
@@ -396,11 +431,48 @@ export class FrameRx {
     }
   }
 
+  /**
+   * Account one settled set into the cumulative counters. Mirrors
+   * FcpSettle::account(): data_rx_orig/parity_rx are counted over the settled
+   * code length, not at arrival, so the period's numerator and denominator
+   * describe the same groups.
+   */
+  private accountSet(set: RxSet): void {
+    if (!set.hasAnySymbol) {
+      // A gap placeholder: the whole set never produced a symbol.
+      ++this.counters.setsTailDropped;
+      return;
+    }
+    const nUsed = set.nKnown ? set.n : set.maxDataIndex + 1;
+    let orig = 0;
+    let recov = 0;
+    for (let i = 0; i < nUsed; ++i) {
+      if (set.orig.has(i)) ++orig;
+      if (set.recov.has(i)) ++recov;
+    }
+    ++this.counters.setsExpected;
+    this.counters.dataExpected += nUsed;
+    this.counters.dataRxOrig += orig;
+    this.counters.parityRx += set.parity.size;
+    if (set.kKnown && set.k > 0) this.counters.parityExpected += set.k;
+    if (orig + recov >= nUsed) ++this.counters.setsFull;
+    // C++ semantics: "partial" is a short code (a flush before D symbols), not
+    // an unrepaired group. setsFull/setsPartial therefore overlap.
+    if (nUsed < this.d) ++this.counters.setsPartial;
+    if (set.kKnown && set.k > 0 && set.k <= 7 && nUsed === this.d) {
+      ++this.counters.ledgerGroups;
+      this.counters.ledgerKHist[set.k] = (this.counters.ledgerKHist[set.k] ?? 0) + 1;
+      if (orig + recov < nUsed) ++this.counters.ledgerFailed;
+    }
+    if (!this.haveAccounted || seqAfter(set.setId, this.accountedThrough)) {
+      this.accountedThrough = set.setId;
+      this.haveAccounted = true;
+    }
+  }
+
   /** Highest set id that has been accounted for (FECSTAT monotonic key). */
   accountedThroughSetId(): number {
-    let max = 0; let any = false;
-    for (const [id, set] of this.sets) if (set.accounted && (!any || seqAfter(id, max))) { max = id; any = true; }
-    return max;
+    return this.accountedThrough;
   }
 }
 

@@ -119,6 +119,18 @@ export class Session {
   private pinnedK: number;
   private dbg: (line: string) => void;
   private tag: () => string;
+  /** cb.closed is emitted at most once, and hosts can query it: a session that
+   *  failed its handshake or got a stateless reset never closes its Stream, so
+   *  "streamRef.isClosed" is not a sufficient liveness test. */
+  private closeNotified = false;
+
+  get isClosed(): boolean { return this.closeNotified; }
+
+  private notifyClosed(reason: string): void {
+    if (this.closeNotified) return;
+    this.closeNotified = true;
+    this.cb.closed(reason);
+  }
 
   constructor(cfg: SessionConfig, cb: SessionCallbacks) {
     this.cfg = cfg;
@@ -173,7 +185,7 @@ export class Session {
       {
         send: (seg) => this.onStreamSegment(seg),
         read: (bytes) => { this.bbr.onDelivery(bytes.length, this.nowMs); this.cb.read(bytes); },
-        closed: (reason) => this.cb.closed(reason),
+        closed: (reason) => this.notifyClosed(reason),
         eof: () => this.cb.eof?.(),
         rtt: (ms) => {
           this.bbr.onRtt(ms); this.sndBbr.onRtt(ms); this.tx?.setSrttMs(ms);
@@ -206,7 +218,9 @@ export class Session {
     this.nowMs = nowMs;
     this.dbg(`[${this.tag()}] session start role=${this.cfg.role === HandshakeRole.Client ? 'client' : 'server'} d=${this.cfg.d ?? DEFAULT_D} p=${this.cfg.p ?? DEFAULT_P} mtu=${this.pmtuStartMtu}${this.cfg.pmtud ? `..${this.pmtuMaxMtu} (pmtud)` : ' (fixed)'} payloadMax=${this.limits.payloadMax} pinnedK=${this.pinnedK}`);
     if (!this.limits.valid) { this.cb.log?.('FCP config invalid: MTU leaves no room for a data symbol'); return false; }
-    if ((this.cfg.d ?? DEFAULT_D) < 1 || (this.cfg.p ?? DEFAULT_P) > 7) return false;
+    const d = this.cfg.d ?? DEFAULT_D;
+    const p = this.cfg.p ?? DEFAULT_P;
+    if (d < 1 || d > 256 || p < 0 || p > 7 || d + p > 256) return false;
     if (this.hs.failed) { this.cb.log?.(`FCP handshake refused: ${HandshakeError[this.hs.error] ?? this.hs.error}`); return false; }
     const tlvs: HandshakeTlv[] = [];
     if (this.cfg.ack_v2) tlvs.push({ type: TLV_TYPE_ACK_V2, value: Buffer.alloc(0) });
@@ -225,14 +239,12 @@ export class Session {
   /** Feed one UDP datagram. Returns false when authentication failed. */
   onWire(wire: Uint8Array, nowMs: number): boolean {
     this.nowMs = nowMs;
-    let plain = this.env.open(wire);
-    let bootstrap = false;
     // Stateless reset first, by shape. A reset is sealed under the *bootstrap*
-    // key, so it is also a perfectly valid bootstrap envelope: probing with
-    // hsEnv.open() below would decrypt it, find no HELLO inside and count it as
-    // a structure failure, and the session would never learn the peer is gone.
-    if (plain === null && !this.resetByPeer && this.hs.established &&
-        wire.length === ENVELOPE_OVERHEAD + RESET_MAGIC_LEN && this.hsEnv.openReset(wire)) {
+    // key, so it is also a valid bootstrap envelope. Detecting it only after
+    // env.open() misses the case where the envelope layer can still decrypt it
+    // (before rekey) and the 8-byte plaintext then looks like a bad FEC header.
+    if (!this.resetByPeer && wire.length === ENVELOPE_OVERHEAD + RESET_MAGIC_LEN &&
+        this.hsEnv.openReset(wire)) {
       // Both roles must honour this, not just the client: a server whose peer
       // walked away (browser tab closed, curl --max-time, process restart) kept
       // pushing a full window into a void — 544 KB queued, 1000+ RTO copies in
@@ -241,9 +253,11 @@ export class Session {
       // only other exit was peer_dead, 135 s later.
       this.resetByPeer = true;
       this.cb.log?.('FCP stateless reset: the peer has no session for this salt');
-      this.cb.closed('stateless_reset');
+      this.notifyClosed('stateless_reset');
       return true;
     }
+    let plain = this.env.open(wire);
+    let bootstrap = false;
     if (plain === null) {
       let mayProbe = true;
       if (this.hs.established) {
@@ -314,7 +328,7 @@ export class Session {
       if (!this.resetByPeer) {
         this.resetByPeer = true;
         this.cb.log?.('FCP stateless reset: the peer has no session for this salt');
-        this.cb.closed('stateless_reset');
+        this.notifyClosed('stateless_reset');
       }
       return;
     }
@@ -328,7 +342,7 @@ export class Session {
     this.dbg(`[${this.tag()}] ${isHello(payload) ? 'HELLO' : 'HELLO_ACK'} rx len=${payload.length}`);
     if (this.hs.onOob(payload) === HandshakeStatus.ProtocolFailure) {
       this.cb.log?.(`FCP handshake failed: error=${this.hs.error}`);
-      this.cb.closed('handshake_failure');
+      this.notifyClosed('handshake_failure');
     }
     if (this.hs.established && !this.configured) this.configure(nowMs);
     return true;
@@ -596,7 +610,7 @@ export class Session {
   private syncFecControl(nowMs: number): void {
     const c = this.rx?.counters;
     if (c) {
-      this.strategy.noteLocalCounters((c.setsFull >>> 0) + (c.setsPartial >>> 0), c.dataRxOrig >>> 0, nowMs);
+      this.strategy.noteLocalCounters(c.dataExpected, c.dataRxOrig, nowMs);
     }
     this.tx?.setK(this.strategy.currentK());
   }
@@ -605,7 +619,7 @@ export class Session {
     this.nowMs = nowMs;
     if (!this.hs.established) this.hs.onTick(nowMs);
     if (this.hs.established && !this.configured) this.configure(nowMs);
-    if (this.hs.failed) { this.cb.closed('handshake_failure'); return; }
+    if (this.hs.failed) { this.notifyClosed('handshake_failure'); return; }
     if (this.hs.established) {
       this.tx?.onTick(nowMs);
       this.rx?.onTick(nowMs);
@@ -613,7 +627,14 @@ export class Session {
       this.updateStreamWindows(nowMs);
       this.stream.onTick(nowMs);
       const report = this.reporter.onTick(nowMs, this.rx?.counters ?? emptyCounters(), this.rx?.accountedThroughSetId() ?? 0);
-      if (report) this.sendOob(report);
+      if (report) {
+        // FECSTAT is oob and never retransmitted; reporter.cc sends the 128-byte
+        // report twice so one lost datagram cannot blind the peer's controller
+        // for a whole period. The peer validator drops the second copy by its
+        // monotonic key.
+        this.sendOob(report);
+        this.sendOob(report);
+      }
       this.sendPmtuProbe(nowMs);
     }
     if (!this.lastWireOutMs) this.lastWireOutMs = nowMs;
@@ -624,7 +645,7 @@ export class Session {
     if (this.lastPeerInMs && nowMs - this.lastPeerInMs >= PEER_ALIVE_GRACE_MS && !this.resetByPeer) {
       this.resetByPeer = true;
       this.dbg(`[${this.tag()}] CLOSE peer_dead (silent ${nowMs - this.lastPeerInMs}ms)`);
-      this.cb.closed('peer_dead');
+      this.notifyClosed('peer_dead');
     }
   }
 }
@@ -634,6 +655,8 @@ function emptyCounters() {
     structFail: 0, stale: 0, lateDup: 0, recovered: 0, recoveredLate: 0,
     dataRxOrig: 0, parityRx: 0, dataDelivered: 0, retiredDropped: 0,
     aheadDropped: 0, setsPartial: 0, setsFull: 0, setsTailDropped: 0,
-    decodeAttempts: 0, badRecon: 0,
+    decodeAttempts: 0, badRecon: 0, symbolBudgetDrops: 0,
+    setsExpected: 0, dataExpected: 0, parityExpected: 0, setsKUnknown: 0,
+    ledgerGroups: 0, ledgerFailed: 0, ledgerKHist: new Array(8).fill(0),
   };
 }

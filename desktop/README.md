@@ -26,7 +26,7 @@ Node 版的 `speedtest` 子命令是**进程内自环**（自己起 echo server 
 ## 目录
 
 ```
-electron/main.cjs     窗口、子进程管理、stats 解析、SOCKS 测速
+electron/main.cjs     窗口、托盘、子进程管理、stats 解析、SOCKS 测速
 electron/preload.cjs  contextBridge 暴露的 IPC 面
 renderer/index.html   四页结构
 renderer/styles.css   视觉（浅色主题、卡片分层、等宽数字）
@@ -73,8 +73,11 @@ stats 12.4s live=1 up=1 tunnels=1 tx=1620549B rx=177108615B tx_rate=321448B/s rx
 `--key` 每次启动从输入框读，和 C++ 版、Node CLI 一样内联进进程命令行。
 界面里明确写了这一点。
 
-**关窗不杀隧道。** `close` 事件在隧道运行时改为 `hide()`；真正退出走
-`before-quit`，那里会先终止子进程。
+**托盘常驻。** 主进程创建系统托盘（`resources/icon.png` 缩放到 16 px）。关闭
+窗口只 `hide()`，隧道继续运行；托盘菜单提供「显示主窗口 / 停止隧道 / 打开日志
+目录 / 退出」，左键单击或双击托盘图标会恢复窗口。只有托盘的「退出」（或系统
+退出）会置 `isQuitting` 并终止子进程；托盘创建失败时关窗仍会真正退出，避免
+出现无窗口也无法找回的僵尸进程。
 
 ## 自测
 

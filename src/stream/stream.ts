@@ -16,6 +16,7 @@ import {
   DEFAULT_IDLE_TIMEOUT_MS, PUMP_BURST_BYTES, ZERO_WINDOW_PROBE_MS, ACK_EVERY_SEGMENTS,
   HOLE_DUP_ACK_MS, FAST_RETX_SEGMENTS, MIN_RETX_INTERVAL_MS,
   FAST_RETX_MIN_AGE_MS, RETX_RTT_FACTOR,
+  MIN_OOB_CHUNKS, MAX_OOB_CHUNKS,
 } from '../constants.ts';
 import {
   seqAfter, seqAtOrAfter, seqDist, getLe32, putLe32,
@@ -62,6 +63,8 @@ export class Stream {
   state: number = StreamState.Open;
   closeReason = '';
   badSegs = 0; segsSent = 0; retransmits = 0; dupBytes = 0;
+  /** Out-of-order runs dropped because the chunk ceiling was reached. */
+  oobDrops = 0;
   /** Retransmits split by trigger, so a ratio can be attributed instead of
    *  guessed at. Not used for control flow. */
   retxFast = 0; retxRto = 0; fastRounds = 0;
@@ -120,7 +123,44 @@ export class Stream {
   }
 
   setAckV2(on: boolean): void { this.cfg.ackV2 = on; }
-  setMaxSegment(n: number): void { if (n > 0) this.cfg.maxSegment = n; }
+  /**
+   * `n` is the whole stream segment size (DATA header included).
+   * Shrinking happens when PMTUD falls back after a raised size black-holed:
+   * segments already carved at the larger size can no longer be emitted
+   * (FrameTx drops them as oversize), so a retransmit of one would be lost
+   * forever. Re-cut them here; byte offsets and the queued bytes stay
+   * identical, so cumulative/SACK accounting is unaffected.
+   */
+  setMaxSegment(n: number): void {
+    if (n <= 0 || n === this.cfg.maxSegment) return;
+    if (n > this.cfg.maxSegment) { this.cfg.maxSegment = n; return; }
+    if (n <= STREAM_DATA_HDR_LEN) return; // cannot carry a payload; keep the old carving
+    this.cfg.maxSegment = n;
+    const piece = n - STREAM_DATA_HDR_LEN;
+    const recut: SndSeg[] = [];
+    for (const s of this.tx) {
+      if (s.bytes.length <= piece) { recut.push(s); continue; }
+      for (let off = 0; off < s.bytes.length; off += piece) {
+        const len = Math.min(piece, s.bytes.length - off);
+        const fin = s.fin && off + len === s.bytes.length;
+        const part: SndSeg = {
+          offset: (s.offset + off) >>> 0,
+          bytes: s.bytes.subarray(off, off + len),
+          fin,
+          end: (s.offset + off + len + (fin ? 1 : 0)) >>> 0,
+          // A SACKed piece stays delivered; everything else has never been on
+          // the wire at this size, so the RTO pass must re-emit it.
+          sentMs: s.sacked ? s.sentMs : 0,
+          acked: false,
+          sacked: s.sacked,
+          retransmits: s.sacked ? s.retransmits : Math.max(1, s.retransmits),
+        };
+        recut.push(part);
+      }
+    }
+    this.tx = recut;
+    this.dupAcks = 0;
+  }
 
   /**
    * In-flight budget. Both halves have to move together: growing only the send
@@ -143,18 +183,27 @@ export class Stream {
    *  reorder buffer means one hole is holding everything back. */
   get recvNext(): number { return this.rcvNxt; }
   get reorderBytes(): number { return this.oobBytes; }
-  get canWrite(): boolean { return this.pendingBytes < this.cfg.sendWindowBytes && !this.finPending; }
+  get canWrite(): boolean { return this.sendSpace() > 0 && !this.finPending; }
   get isClosed(): boolean { return this.state === StreamState.Closed; }
   get eofReceived(): boolean { return this.eofDelivered; }
   get cumAcked(): number { return this.sndUna; }
   get deliveryPendingBytes(): number { return this.deliveryPending; }
+
+  /** Bytes the host may still write. In-flight bytes count: the C++ send_space()
+   *  subtracts (queued - acked), and leaving them out let the host queue a full
+   *  window on top of a full window already on the wire. */
+  private sendSpace(): number {
+    if (this.state === StreamState.Closed) return 0;
+    const used = this.pendingBytes + this.inflightBytes;
+    return this.cfg.sendWindowBytes > used ? this.cfg.sendWindowBytes - used : 0;
+  }
 
   /** Host accepted `n` previously delivered bytes (backpressure release). */
   consumed(n: number): void { this.deliveryPending = Math.max(0, this.deliveryPending - n); }
 
   write(data: Uint8Array, nowMs: number): number {
     if (this.finPending || this.state === StreamState.Closed) return 0;
-    const room = this.cfg.sendWindowBytes - this.pendingBytes;
+    const room = this.sendSpace();
     const take = Math.min(data.length, room);
     if (take <= 0) return 0;
     this.pending.push(Buffer.from(data.subarray(0, take)));
@@ -276,7 +325,9 @@ export class Stream {
     if (fin) { this.peerFin = true; this.peerFinAt = dataEnd; }
     this.deliverPrefix(nowMs);
     // A gap makes the ack urgent: duplicate acks are what drive fast retransmit.
-    this.ackDue(nowMs, this.rcvNxt !== segEnd);
+    // A FIN is urgent even when it lands exactly at rcvNxt: that ACK is what
+    // lets the peer finish instead of waiting for its idle clock.
+    this.ackDue(nowMs, fin || this.rcvNxt !== segEnd);
   }
 
   /**
@@ -301,7 +352,19 @@ export class Stream {
     this.ackPending = true;
   }
 
+  private oobMaxChunks(): number {
+    return Math.min(MAX_OOB_CHUNKS, Math.max(MIN_OOB_CHUNKS, Math.floor(this.cfg.rcvBufBytes / 512)));
+  }
+
   private insertChunk(offset: number, bytes: Buffer): void {
+    // A segment landing exactly on rcvNxt fills the hole the cumulative ack is
+    // waiting on, so it must never be dropped. Anything else is bounded by the
+    // chunk ceiling: a byte ceiling alone lets a peer put one byte in each run
+    // and turn 256 KiB of reorder data into 128 k Buffer objects.
+    if (offset !== this.rcvNxt && this.oob.length >= this.oobMaxChunks()) {
+      ++this.oobDrops;
+      return;
+    }
     // Clip against already buffered ranges, then merge contiguous neighbours.
     const end = (offset + bytes.length) >>> 0;
     const kept: RcvChunk[] = [];
@@ -359,6 +422,16 @@ export class Stream {
       this.eofDelivered = true;
       this.state = StreamState.PeerClosed;
       this.cb.eof?.();
+      // The peer's FIN can arrive after its ACK of ours. handle_ack() already
+      // ran on that ACK (eof was not delivered yet), so nothing else would
+      // complete the close and the stream would sit until the idle timer.
+      if (this.finSent && seqAtOrAfter(this.sndUna, (this.finOffset + 1) >>> 0)) {
+        // ACK the peer's FIN before finish(): the close callback may tear the
+        // host's send path down, and this is the only packet that lets the
+        // peer complete its own close.
+        this.emitAck(nowMs);
+        this.finish('peer_close');
+      }
     }
     void nowMs;
   }
@@ -371,6 +444,9 @@ export class Stream {
 
   private emitAck(nowMs: number): void {
     this.ackPending = false;
+    // Any path that answers settles the coalescing debt; leaving it set made
+    // the next few segments emit an extra ACK sooner than ACK_EVERY_SEGMENTS.
+    this.ackDebt = 0;
     this.lastAckMs = nowMs;
     const cum = this.cumOut();
     const rwnd = this.rwndOut();
@@ -397,23 +473,30 @@ export class Stream {
     if (seqAfter(cum, this.sndMax)) { ++this.badSegs; return; }
     this.peerRwnd = rwnd;
     const prevUna = this.sndUna;
+    // A cumulative point that does not move forward is a duplicate or a stale
+    // ACK reordered behind a newer one. Moving sndUna backwards would inflate
+    // the in-flight count and shrink the window for good; C++ guards this in
+    // ack_advance_cum, and the SACK/dup-ack halves still run.
+    const advanced = seqAfter(cum, prevUna);
     let newlyAcked = false;
     let sampleMs = -1;
-    for (const s of this.tx) {
-      if (!s.acked && seqAtOrAfter(cum, s.end)) {
-        s.acked = true; newlyAcked = true;
-        // Karn: a retransmitted segment cannot tell us which copy the ACK
-        // refers to. Sampling it measured the retransmit interval (~15 ms)
-        // instead of the path RTT (220 ms), which shrank RTO to rtoMin, which
-        // triggered yet more retransmits — the link ended up spending ~73% of
-        // its bandwidth resending data the peer already had.
-        if (sampleMs < 0 && s.retransmits === 0) sampleMs = Math.max(0, nowMs - s.sentMs);
+    if (advanced) {
+      for (const s of this.tx) {
+        if (!s.acked && seqAtOrAfter(cum, s.end)) {
+          s.acked = true; newlyAcked = true;
+          // Karn: a retransmitted segment cannot tell us which copy the ACK
+          // refers to. Sampling it measured the retransmit interval (~15 ms)
+          // instead of the path RTT (220 ms), which shrank RTO to rtoMin, which
+          // triggered yet more retransmits — the link ended up spending ~73% of
+          // its bandwidth resending data the peer already had.
+          if (sampleMs < 0 && s.retransmits === 0) sampleMs = Math.max(0, nowMs - s.sentMs);
+        }
       }
+      this.sndUna = cum;
     }
-    this.sndUna = cum;
     // Delivery rate for window sizing. Counted here, off the ACK clock, so it
     // reflects bytes the peer actually confirmed — not bytes we queued.
-    if (newlyAcked && seqAfter(cum, prevUna)) this.cb.acked?.(seqDist(cum, prevUna), nowMs);
+    if (newlyAcked) this.cb.acked?.(seqDist(cum, prevUna), nowMs);
     if (sampleMs >= 0 && sampleMs <= 1000 &&
         (this.minRttMs === 0 || sampleMs < this.minRttMs)) this.minRttMs = sampleMs;
     // A sample far above the best RTT is not the path RTT: it is a segment
@@ -446,7 +529,7 @@ export class Stream {
         if (seqAtOrAfter(s.offset, r.start) && seqAtOrAfter(r.end, s.end)) s.sacked = true;
       }
     }
-    if (seqAfter(cum, this.sackedHigh)) this.sackedHigh = cum;
+    if (advanced && seqAfter(cum, this.sackedHigh)) this.sackedHigh = cum;
     this.tx = this.tx.filter((s) => !s.acked);
     if (this.haveAckCum && cum === this.lastAckCum && this.tx.length) {
       if (++this.dupAcks >= DUP_ACK_THRESH) {
@@ -457,6 +540,7 @@ export class Stream {
       this.dupAcks = 0;
     }
     this.lastAckCum = cum; this.haveAckCum = true;
+    if (!advanced) return;
     if (this.finSent && seqAtOrAfter(cum, (this.finOffset + 1) >>> 0) && this.eofDelivered) {
       this.finish('local_eof');
       return;

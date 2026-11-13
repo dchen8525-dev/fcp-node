@@ -3,13 +3,14 @@
 // = one target, all sessions sharing a single UDP 5-tuple and keyed by salt.
 
 import { createSocket, type Socket as UdpSocket, type RemoteInfo } from 'node:dgram';
-import { createServer, connect, type Socket as TcpSocket, type Server as TcpServer } from 'node:net';
+import { createServer, connect, isIP, type Socket as TcpSocket, type Server as TcpServer } from 'node:net';
 import { randomBytes } from 'node:crypto';
 import {
   SALT_LEN, Direction, HandshakeRole, DEFAULT_MTU_MIN, DEFAULT_D, DEFAULT_P,
-  OPEN_MAX_BYTES, ATYP_DOMAIN, ATYP_IPV4,
+  OPEN_MAX_BYTES, ATYP_DOMAIN, ATYP_IPV4, DATA_WIRE_OVERHEAD, NONCE_LIMIT,
 } from '../constants.ts';
 import { Session, type SessionConfig } from '../session/session.ts';
+import { sealReset } from '../crypto/envelope.ts';
 import {
   detectEntry, socks5ParseGreeting, socks5GreetingReply, socks5ParseRequest,
   socks5Reply, socks5RepForOpenError, Socks5Rep,
@@ -74,6 +75,10 @@ function nowMs(): number { return Date.now(); }
  * run from the bind callback.
  */
 const UDP_BUFFER_BYTES = 4 * 1024 * 1024;
+/** Cap on live sessions on the server. Every local TCP connection owns one and
+ *  a peer that disappears is reaped by peer_dead, but a PSK holder can still
+ *  open more than the process should carry. */
+const MAX_TUNNEL_SESSIONS = 1024;
 
 function enlargeUdpBuffers(sock: UdpSocket, dbg: (line: string) => void, log: (line: string) => void): void {
   for (const which of ['recv', 'send'] as const) {
@@ -151,6 +156,9 @@ export class TunnelClient {
   private statsPrevRx = 0;
   private statsPrevMs = 0;
   private startedMs = 0;
+  /** One reset per second for unknown salts: the reply is cheap, but an
+   *  unrelated flood must not turn the client into a packet reflector. */
+  private lastResetMs = 0;
 
   constructor(opts: TunnelOptions) {
     this.opts = opts;
@@ -158,7 +166,7 @@ export class TunnelClient {
     this.dbg = opts.debugLog ?? (() => {});
     this.udp = createSocket('udp4');
     this.tcp = createServer((sock) => this.onLocalConnection(sock));
-    this.udp.on('message', (msg) => this.onUdp(msg));
+    this.udp.on('message', (msg, rinfo) => this.onUdp(msg, rinfo));
     this.udp.on('error', (e) => this.log(`udp error: ${e.message}`));
     this.tcp.on('error', (e) => this.log(`tcp error: ${e.message}`));
   }
@@ -232,13 +240,38 @@ export class TunnelClient {
     this.statsPrevMs = now;
   }
 
-  private onUdp(msg: Buffer): void {
+  private onUdp(msg: Buffer, rinfo: RemoteInfo): void {
     if (msg.length < SALT_LEN) return;
     this.bytesRx += msg.length;
     const salt = msg.subarray(0, SALT_LEN).toString('hex');
     this.dbg(`[${salt.slice(0, 8)}] udp rx ${msg.length}B known=${this.sessions.has(salt)}`);
     const b = this.sessions.get(salt);
-    if (b) b.session.onWire(msg, nowMs());
+    if (b) { b.session.onWire(msg, nowMs()); return; }
+    this.resetUnknownSalt(msg, rinfo);
+  }
+
+  /**
+   * A peer that still holds a session we no longer have keeps sending data we
+   * cannot authenticate. Without an answer it can only notice via its 135 s
+   * peer_dead clock; a stateless reset closes it immediately. Building the
+   * reset directly (no Session) keeps this path allocation-free enough for a
+   * spoofed flood, and the source check + 1 Hz cap keep it from reflecting.
+   */
+  private resetUnknownSalt(msg: Buffer, rinfo: RemoteInfo): void {
+    if (msg.length < DATA_WIRE_OVERHEAD) return;
+    const port = this.opts.port ?? 4460;
+    if (rinfo.port !== port) return;
+    const host = this.opts.host ?? '127.0.0.1';
+    if (isIP(host) !== 0 && rinfo.address !== host) return;
+    const now = nowMs();
+    if (now - this.lastResetMs < 1000) return;
+    const salt = msg.subarray(0, SALT_LEN);
+    const counter = NONCE_LIMIT - 1n - BigInt(randomBytes(2).readUInt16LE(0));
+    const reset = sealReset(this.opts.psk, salt, Direction.C2S, Direction.S2C, counter);
+    if (!reset) return;
+    this.lastResetMs = now;
+    this.dbg(`[${salt.toString('hex').slice(0, 8)}] unknown salt -> stateless reset tx ${reset.length}B`);
+    this.udp.send(reset, rinfo.port, rinfo.address);
   }
 
   private tick(): void {
@@ -274,6 +307,9 @@ export class TunnelClient {
     let endPending = false;
     let streamRead: (b: Buffer) => void = () => {};
     const pendingLocal: Buffer[] = [];
+    let pendingLocalBytes = 0;
+    let localPaused = false;
+    let drainTimer: NodeJS.Timeout | null = null;
     const replyParser = new PrefixParser(openParseReply);
 
     const destroy = (buf?: Buffer) => {
@@ -282,17 +318,48 @@ export class TunnelClient {
       setTimeout(() => sock.destroy(), 30);
     };
 
+    // Before OPEN completes, bytes from the local app cannot enter the stream
+    // at all. Queue them, but pause the socket once the backlog is a whole
+    // window: a black-holed handshake used to accumulate this without bound.
+    const LOCAL_BACKLOG_LIMIT = 1 << 20;
+    const queueLocal = (b: Buffer) => {
+      pendingLocal.push(Buffer.from(b));
+      pendingLocalBytes += b.length;
+      if (!localPaused && pendingLocalBytes >= LOCAL_BACKLOG_LIMIT && !sock.destroyed) {
+        localPaused = true;
+        sock.pause();
+      }
+    };
+
     // Same rule as the server side: a short `Stream.write` leaves a remainder
     // behind, and the FIN must not overtake it.
     const flushPending = () => {
       while (pendingLocal.length && session) {
-        const b = pendingLocal.shift()!;
+        const b = pendingLocal[0];
         const n = session.write(b);
-        if (n < b.length) { pendingLocal.unshift(b.subarray(n)); break; }
+        if (n <= 0) break;
+        pendingLocalBytes -= n;
+        if (n < b.length) { pendingLocal[0] = b.subarray(n); break; }
+        pendingLocal.shift();
+      }
+      if (localPaused && !pendingLocal.length && !sock.destroyed) {
+        localPaused = false;
+        sock.resume();
       }
       if (session && !pendingLocal.length && endPending) {
         endPending = false;
         session.closeWrite();
+      }
+      // Whatever the write window still holds continues on the tick; without a
+      // timer it waited for another local data event, which may never come.
+      if (pendingLocal.length && !drainTimer) {
+        drainTimer = setInterval(() => {
+          flushPending();
+          if (!pendingLocal.length || dead) {
+            if (drainTimer) clearInterval(drainTimer);
+            drainTimer = null;
+          }
+        }, TICK_MS);
       }
     };
 
@@ -307,33 +374,43 @@ export class TunnelClient {
       if (!open) { destroy(); return; }
       opened = true;
       this.dbg(`[${saltKey.slice(0, 8)}] OPEN tx ${open.length}B -> ${targetText(target)}`);
-      session.write(open);
-      if (firstPayload && firstPayload.length) session.write(firstPayload);
+      // Queue rather than write: a short Stream.write must keep its remainder,
+      // and the first payload may not overtake the OPEN.
+      queueLocal(open);
+      if (firstPayload && firstPayload.length) queueLocal(firstPayload);
       flushPending();
       this.log(`open sent -> ${targetText(target)}`);
     };
 
     streamRead = (bytes: Buffer) => {
+      // Consumption is what releases the peer's send window. Doing it only
+      // after the local socket has flushed applies real backpressure; the old
+      // immediate consumed() let a slow reader grow Node's writable buffer
+      // without bound.
+      const writeAndConsume = (b: Buffer, len: number) => {
+        if (sock.destroyed || b.length === 0) { session?.consumed(len); return; }
+        sock.write(b, () => session?.consumed(len));
+      };
       if (replyParser.done) {
         this.dbg(`[${saltKey.slice(0, 8)}] tunnel->local ${bytes.length}B`);
-        if (!sock.destroyed) sock.write(bytes);
-        session?.consumed(bytes.length);
+        writeAndConsume(bytes, bytes.length);
         return;
       }
       const rest = replyParser.push(bytes);
-      session?.consumed(bytes.length);
-      if (!replyParser.done) return;
+      if (!replyParser.done) { session?.consumed(bytes.length); return; }
       const r = replyParser.result;
-      if (!r || r.status !== 'ok' || !r.value) { destroy(); return; }
+      if (!r || r.status !== 'ok' || !r.value) { session?.consumed(bytes.length); destroy(); return; }
       this.dbg(`[${saltKey.slice(0, 8)}] OPEN reply rx ok=${r.value.ok} err=${r.value.ok ? 0 : r.value.err} kind=${entryKind}`);
       if (!r.value.ok) {
         const rep = socks5RepForOpenError(r.value.err);
+        session?.consumed(bytes.length);
         destroy(entryKind === 'socks5' ? socks5Reply(rep) : HTTP_BAD_GATEWAY);
         return;
       }
       if (entryKind === 'socks5') sock.write(socks5Reply(Socks5Rep.Succeeded));
       else if (entryKind === 'connect') sock.write(HTTP_OK);
-      if (rest.length && !sock.destroyed) sock.write(rest);
+      if (rest.length) writeAndConsume(rest, bytes.length);
+      else session?.consumed(bytes.length);
       flushPending();
     };
 
@@ -433,16 +510,14 @@ export class TunnelClient {
         return;
       }
       this.dbg(`[${saltKey.slice(0, 8)}] local rx ${chunk.length}B opened=${opened}`);
-      if (!opened || !session) { pendingLocal.push(Buffer.from(chunk)); return; }
+      if (!opened || !session) { queueLocal(chunk); return; }
       const n = session.write(chunk);
       this.dbg(`[${saltKey.slice(0, 8)}] local->tunnel ${n}/${chunk.length}B`);
       if (n < chunk.length) {
-        pendingLocal.push(Buffer.from(chunk.subarray(n)));
-        sock.pause();
-        const resume = setInterval(() => {
-          flushPending();
-          if (!pendingLocal.length || dead) { clearInterval(resume); if (!dead) sock.resume(); }
-        }, TICK_MS);
+        // Keep the remainder ahead of anything that arrives next; the stream's
+        // send window releases it on later ticks/ACKs.
+        queueLocal(chunk.subarray(n));
+        flushPending();
       }
     });
     sock.on('end', () => {
@@ -453,6 +528,7 @@ export class TunnelClient {
     sock.on('close', () => {
       dead = true;
       if (handshakeWait) clearTimeout(handshakeWait);
+      if (drainTimer) { clearInterval(drainTimer); drainTimer = null; }
       if (saltKey) {
         const b = this.sessions.get(saltKey);
         if (b) {
@@ -481,6 +557,9 @@ interface ServerTunnel {
   parser: PrefixParser<ProxyTarget>;
   targetSock: TcpSocket | null;
   openDone: boolean;
+  /** OPEN_OK already crossed the tunnel: an OPEN_ERR frame would then be read
+   *  by the client as response bytes, not as a reply. */
+  openOkSent: boolean;
   pendingToTarget: Buffer[];
   /** target -> tunnel backlog: bytes the send window could not take yet. */
   pendingToTunnel: Buffer[];
@@ -539,14 +618,25 @@ export class TunnelServer {
   get sessionCount(): number { return this.sessions.size; }
 
   private onUdp(msg: Buffer, rinfo: RemoteInfo): void {
-    if (msg.length < SALT_LEN) return;
+    // Anything shorter than an empty data symbol cannot be an FCP datagram;
+    // replying to it only turned the server into a reflector for 8-byte junk.
+    if (msg.length < DATA_WIRE_OVERHEAD) return;
     const key = msg.subarray(0, SALT_LEN).toString('hex');
     this.dbg(`[${key.slice(0, 8)}] udp rx ${msg.length}B from ${rinfo.address}:${rinfo.port} known=${this.sessions.has(key)}`);
     const b = this.sessions.get(key);
     if (b) { b.rinfo = rinfo; b.session.onWire(msg, nowMs()); return; }
+    if (this.sessions.size >= MAX_TUNNEL_SESSIONS) return;
     const created = this.createSession(msg.subarray(0, SALT_LEN), rinfo);
     if (!created) return;
     const ok = created.session.onWire(msg, nowMs());
+    if (created.session.isClosed) {
+      // A reset addressed to a salt we no longer own, or a handshake that
+      // failed on its first datagram: never publish a dead session.
+      created.cleanup();
+      created.trace?.close();
+      this.tunnels.delete(key);
+      return;
+    }
     if (!ok) {
       // #86: authenticated-looking traffic for a salt we do not own. Answer
       // once with a stateless reset under the bootstrap key.
@@ -576,7 +666,7 @@ export class TunnelServer {
           `recvNext=${b.session.recvNext} ` +
           `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B`);
       }
-      if (b.session.streamRef.isClosed) {
+      if (b.session.isClosed || b.session.streamRef.isClosed) {
         this.sessions.delete(key);
         b.cleanup(); b.trace?.close();
         this.tunnels.delete(key);
@@ -650,8 +740,13 @@ export class TunnelServer {
         this.dbg(`[${key.slice(0, 8)}] udp tx ${wire.length}B -> ${rinfo.address}:${rinfo.port}`);
         this.udp.send(wire, rinfo.port, rinfo.address);
       },
-      read: (bytes) => { if (tunnel) this.onStreamBytes(tunnel, bytes); tunnel?.session.consumed(bytes.length); },
-      closed: (reason) => { this.log(`session ${key} closed: ${reason}`); cleanup(); },
+      read: (bytes) => { if (tunnel) this.onStreamBytes(tunnel, bytes); },
+      closed: (reason) => {
+        this.log(`session ${key} closed: ${reason}`);
+        cleanup();
+        this.sessions.delete(key);
+        this.tunnels.delete(key);
+      },
       eof: () => { if (tunnel?.targetSock && !tunnel.targetSock.destroyed) tunnel.targetSock.end(); },
       log: this.log,
       debug: this.dbg,
@@ -660,7 +755,7 @@ export class TunnelServer {
     this.dbg(`[${key.slice(0, 8)}] session+ from ${rinfo.address}:${rinfo.port}`);
     tunnel = {
       session, rinfo, parser: new PrefixParser(openParseRequest),
-      targetSock: null, openDone: false, pendingToTarget: [], pendingToTunnel: [],
+      targetSock: null, openDone: false, openOkSent: false, pendingToTarget: [], pendingToTunnel: [],
       endFromTarget: false, paused: false, pumping: false, cleanup, trace,
     };
     this.tunnels.set(key, tunnel);
@@ -670,18 +765,33 @@ export class TunnelServer {
 
   private onStreamBytes(t: ServerTunnel, bytes: Buffer): void {
     if (t.openDone) {
-      if (t.targetSock && !t.targetSock.destroyed) t.targetSock.write(bytes);
-      else t.pendingToTarget.push(Buffer.from(bytes));
+      const sock = t.targetSock;
+      if (sock && !sock.destroyed) {
+        // Release the receive window only once the local TCP socket flushed:
+        // otherwise a slow target lets Node's writable buffer grow without
+        // bound while the peer keeps filling a window we never close.
+        sock.write(bytes, () => t.session.consumed(bytes.length));
+      } else {
+        // Target is gone (OPEN was refused, connect failed, or the socket was
+        // destroyed). Drop rather than queue forever.
+        t.session.consumed(bytes.length);
+      }
       return;
     }
     const rest = t.parser.push(bytes);
-    if (!t.parser.done) return;
+    if (!t.parser.done) { t.session.consumed(bytes.length); return; }
     const r = t.parser.result;
     if (!r || r.status !== 'ok' || !r.value) {
+      // Refuse once and stop parsing: every later byte used to re-enter this
+      // branch and emit another OPEN_ERR, while the session stayed open.
+      t.openDone = true;
+      t.session.consumed(bytes.length);
       t.session.write(openWriteErr(OpenError.NotSupported));
+      t.session.closeWrite();
       return;
     }
     t.openDone = true;
+    t.session.consumed(bytes.length);
     if (rest.length) t.pendingToTarget.push(rest);
     const target = r.value;
     this.dbg(`[${t.session.salt.toString('hex').slice(0, 8)}] OPEN rx target=${targetText(target)}:${target.port} firstPayload=${rest.length}B`);
@@ -694,6 +804,7 @@ export class TunnelServer {
       sock.setTimeout(0);
       this.log(`target connected: ${targetText(target)}`);
       this.dbg(`[${t.session.salt.toString('hex').slice(0, 8)}] target connected -> OPEN_OK tx`);
+      t.openOkSent = true;
       t.session.write(openWriteOk());
       // OPEN is followed by the client's first application bytes (e.g. a TLS
       // ClientHello). They belong on the target socket, not back in the tunnel.
@@ -718,14 +829,19 @@ export class TunnelServer {
       this.pumpToTunnel(t); // FIN only after the backlog is written
     });
     sock.on('timeout', () => {
-      t.session.write(openWriteErr(OpenError.TargetTimeout));
+      if (!t.openOkSent) t.session.write(openWriteErr(OpenError.TargetTimeout));
       t.session.closeWrite();
       sock.destroy();
     });
     sock.on('error', (e) => {
       this.dbg(`[${t.session.salt.toString('hex').slice(0, 8)}] target error: ${e.message}`);
       this.log(`target error ${targetText(target)}: ${e.message}`);
-      t.session.write(openWriteErr(e.message.includes('ENOTFOUND') ? OpenError.Dns : OpenError.Refused));
+      // Only a pre-connect failure is still an OPEN reply. After OPEN_OK the
+      // client is parsing response bytes, so an OPEN_ERR frame there would be
+      // delivered to the local application as garbage; EOF is the signal.
+      if (!t.openOkSent) {
+        t.session.write(openWriteErr(e.message.includes('ENOTFOUND') ? OpenError.Dns : OpenError.Refused));
+      }
       // Queue the error and FIN, then let the stream flush on the next ticks.
       // Calling cleanup() here would flip `closed`, and sendWire() drops every
       // datagram once that is set: the error would never reach the client and

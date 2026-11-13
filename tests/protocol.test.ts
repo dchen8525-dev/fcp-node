@@ -234,6 +234,26 @@ test('FrameRx: oob symbols are dispatched, malformed headers rejected', () => {
   assert.equal(rx.counters.structFail, 1);
 });
 
+test('FrameRx: the FECSTAT accounted-through key stays monotonic after retirement', () => {
+  // The key used to be recomputed from the live set map. Retirement deletes a
+  // set 2 s after its first symbol, so after a quiet interval the key fell back
+  // to 0 and the peer's validator classified every later report as stale.
+  const rx = new FrameRx({ d: 10, p: 3, deliver: () => {}, oob: () => {} });
+  const dataFrame = (setId: number): Buffer => packTxFrame({
+    setId, index: 0, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
+  });
+  rx.onDatagram(dataFrame(5), 0);
+  rx.onTick(1001);
+  assert.equal(rx.accountedThroughSetId(), 5);
+  rx.onTick(2001); // set 5 retired and removed from the map
+  assert.equal(rx.accountedThroughSetId(), 5, 'retirement must not reset the key');
+  rx.onTick(4000);
+  assert.equal(rx.accountedThroughSetId(), 5);
+  rx.onDatagram(dataFrame(6), 4000);
+  rx.onTick(5001);
+  assert.equal(rx.accountedThroughSetId(), 6, 'a newer settled set advances it');
+});
+
 test('FCP-STREAM: ordered delivery across loss/reorder/duplicates + FIN', () => {
   const aToB: Buffer[] = [], bToA: Buffer[] = [];
   let aRead = Buffer.alloc(0), bRead = Buffer.alloc(0);
@@ -292,6 +312,21 @@ test('proxy codecs: SOCKS5, CONNECT, absolute-form, FCP OPEN', () => {
   assert.ok(head.includes('Connection: close'));
   assert.ok(!head.includes('keep-alive'));
   assert.equal(httpParseForward(Buffer.from('GET https://example.com/ HTTP/1.1\r\n\r\n', 'latin1')).status, 'bad_request');
+
+  const chunked = httpParseForward(Buffer.from(
+    'POST http://example.com/up HTTP/1.1\r\nHost: example.com\r\n' +
+    'Transfer-Encoding: chunked\r\nConnection: keep-alive, X-Hop\r\nX-Hop: 1\r\n\r\n', 'latin1'));
+  assert.equal(chunked.status, 'ok');
+  const ch = chunked.value!.rewrittenHead.toString('latin1');
+  assert.ok(ch.includes('Transfer-Encoding: chunked'), 'chunked framing must be preserved');
+  assert.ok(!/^X-Hop:/im.test(ch), 'headers named by Connection are hop-by-hop');
+  assert.ok(ch.includes('Host: example.com'), 'Host is rebuilt from the absolute-form URL');
+  assert.equal(httpParseForward(Buffer.from(
+    'GET http://example.com/ HTTP/1.1\r\nHost: other.example\r\n\r\n', 'latin1')).status, 'bad_request');
+  const frag = httpParseForward(Buffer.from(
+    'GET http://example.com/a#frag HTTP/1.1\r\nHost: example.com\r\n\r\n', 'latin1'));
+  assert.equal(frag.status, 'ok');
+  assert.ok(frag.value!.rewrittenHead.toString('latin1').startsWith('GET /a HTTP/1.1\r\n'));
 
   for (const t of [
     { atyp: ATYP_DOMAIN, addr: Buffer.from('example.com', 'latin1'), port: 443 },

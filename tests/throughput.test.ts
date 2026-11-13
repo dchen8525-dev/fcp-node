@@ -47,7 +47,8 @@ function feedLocal(fec: AdaptiveFec, groups: number, lossPct: number): void {
   for (let i = 0; i < groups; i += 100) {
     now += 2000;
     g += 100;
-    fec.noteLocalCounters(g, Math.round(g * 10 * (1 - lossPct / 100)), now);
+    const expected = g * 10;
+    fec.noteLocalCounters(expected, Math.round(expected * (1 - lossPct / 100)), now);
   }
 }
 
@@ -91,11 +92,11 @@ test('FEC: the local fallback samples at the FECSTAT cadence, not per tick', () 
   // previous one and read 38% on a 0-4% path. Inside one interval nothing moves.
   const fec = new AdaptiveFec({ d: 10, p: 6 });
   assert.equal(fec.currentK(), 3);
-  fec.noteLocalCounters(100, 700, 0);   // 30% missing, but first call only arms
-  fec.noteLocalCounters(100, 700, 500);
-  fec.noteLocalCounters(100, 700, 1500);
+  fec.noteLocalCounters(1000, 700, 0);   // 30% missing, but first call only arms
+  fec.noteLocalCounters(1000, 700, 500);
+  fec.noteLocalCounters(1000, 700, 1500);
   assert.equal(fec.currentK(), 3, 'no sample before FECSTAT_INTERVAL_MS');
-  fec.noteLocalCounters(200, 1400, 2600);
+  fec.noteLocalCounters(2000, 1400, 2600);
   assert.ok(fec.currentLoss() > 0.29, `sampled after the interval (${fec.currentLoss()})`);
 });
 
@@ -120,6 +121,7 @@ function feedLoss(fec: AdaptiveFec, rounds: number, lossPct: number): void {
     const expected = groups * 10;
     fec.onFecstat({
       setsFull: groups, setsPartial: 0,
+      dataExpected: expected,
       dataRxOrig: Math.round(expected * (1 - lossPct / 100)),
     } as never);
   }
@@ -158,7 +160,7 @@ test('FEC: k pins at the negotiated parity ceiling instead of overshooting it', 
 test('FEC: tiny samples are ignored so one lost group cannot spike k', () => {
   const fec = new AdaptiveFec({ d: 10, p: 7 });
   for (let i = 1; i <= 5; ++i) {
-    fec.onFecstat({ setsFull: i * 2, setsPartial: 0, dataRxOrig: 2 } as never);
+    fec.onFecstat({ setsFull: i * 2, setsPartial: 0, dataExpected: i * 20, dataRxOrig: 2 } as never);
   }
   assert.equal(fec.currentK(), 3, 'the 3-symbol start is kept');
 });
@@ -293,6 +295,31 @@ test('STREAM: the acked callback reports newly cum-acked bytes, not queued ones'
   assert.deepEqual(seen, [188], 'a duplicate ack delivers nothing new');
   s.onSegment(encodeAck(282, 65535, 0, 0), 30);
   assert.deepEqual(seen, [188, 94], 'only the increment');
+});
+
+test('STREAM: a stale ACK never moves the cumulative point backwards', () => {
+  // UDP/FEC deliver ACKs out of order. Assigning sndUna = cum unconditionally
+  // inflated the in-flight count and shrank the send window for good.
+  const { s } = makeStream({ sendWindowBytes: 65536 });
+  s.write(Buffer.alloc(94 * 4), 0);
+  s.onSegment(encodeAck(188, 65535, 0, 0), 10);
+  assert.equal(s.cumAcked, 188);
+  s.onSegment(encodeAck(94, 65535, 0, 0), 20); // reordered older ACK
+  assert.equal(s.cumAcked, 188, 'the cumulative point is monotonic');
+  assert.equal(s.inflightBytes, 188, 'in-flight bytes did not grow');
+});
+
+test('STREAM: a one-byte-per-run flood is bounded by the chunk ceiling', () => {
+  // The byte window alone does not bound memory: 1024 one-byte runs cost a
+  // Buffer object each and can be 100x their payload in heap.
+  const { s, read } = makeStream({ rcvBufBytes: 256 * 1024 });
+  for (let i = 0; i < 1200; ++i) {
+    s.onSegment(encodeData(2 + i * 2, 0, Buffer.from([1])), i);
+  }
+  assert.ok(s.oobDrops > 0, 'the ceiling dropped runs instead of growing the heap');
+  assert.equal(read.length, 0, 'nothing becomes contiguous');
+  s.onSegment(encodeData(0, 0, Buffer.from([9])), 2000);
+  assert.equal(Buffer.concat(read).length, 1, 'the hole itself is still accepted');
 });
 
 // --- Window ---------------------------------------------------------------

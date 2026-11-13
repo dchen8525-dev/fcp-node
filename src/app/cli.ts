@@ -182,13 +182,37 @@ function parseArgs(argv: string[]): { mode: string; opts: Map<string, string>; f
 function splitHostPort(value: string | undefined, defaultHost: string, defaultPort: number): { host: string; port: number } {
   if (!value) return { host: defaultHost, port: defaultPort };
   const v = value.trim();
-  if (v.startsWith(':')) return { host: defaultHost, port: Number(v.slice(1)) || defaultPort };
-  const idx = v.lastIndexOf(':');
-  if (idx < 0) return { host: v, port: defaultPort };
-  const port = Number(v.slice(idx + 1));
-  return Number.isFinite(port) && port > 0
-    ? { host: v.slice(0, idx), port }
-    : { host: v, port: defaultPort };
+  if (!v) return { host: defaultHost, port: defaultPort };
+  let hostPart = v;
+  let portPart = '';
+  if (v.startsWith('[')) {
+    // Bracketed IPv6 literal: [::1]:4460. The brackets are URL syntax, not
+    // part of the address, and Node's bind/connect want the bare form.
+    const close = v.indexOf(']');
+    if (close < 0) throw new Error(`invalid address "${v}": missing ']'`);
+    hostPart = v.slice(1, close);
+    const rest = v.slice(close + 1);
+    if (rest) {
+      if (rest[0] !== ':') throw new Error(`invalid address "${v}": expected ":port" after ']'`);
+      portPart = rest.slice(1);
+    }
+  } else {
+    const first = v.indexOf(':');
+    const last = v.lastIndexOf(':');
+    if (first >= 0 && first === last) {
+      hostPart = v.slice(0, first);
+      portPart = v.slice(first + 1);
+    }
+    // More than one colon is a bare IPv6 literal: keep it whole and use the
+    // default port instead of reading its last group as a port.
+  }
+  if (!hostPart) hostPart = defaultHost;
+  if (!portPart) return { host: hostPart, port: defaultPort };
+  const port = Number(portPart);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`invalid port "${portPart}" in "${v}": expected 1..65535`);
+  }
+  return { host: hostPart, port };
 }
 
 function loadKey(opts: Map<string, string>): Buffer {
