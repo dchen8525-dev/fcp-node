@@ -68,7 +68,7 @@
         <header class="page-head">
           <div>
             <h1>连接</h1>
-            <p>修改后需重新启动生效。密钥只在本机进程命令行出现，不会写入本界面配置。</p>
+            <p>修改后需重新启动生效。勾选「记住设置」后密钥会保存在本机用户配置目录（与 Qt 版一致），不勾选则只存在于本次进程。</p>
           </div>
           <span class="badge" id="engineBadge">Node · 零依赖</span>
         </header>
@@ -109,7 +109,7 @@
           <div class="key-state" id="keyState">等待输入</div>
           <label class="check">
             <input id="remember" type="checkbox" checked />
-            <span>记住设置（保存在用户配置目录，不含密钥）</span>
+            <span>记住设置（含密钥，保存在本机用户配置目录）</span>
           </label>
         </div>
 

@@ -154,7 +154,7 @@ node scripts/self-interop.mjs --log-dir=logs/smoke
 | 部署目录 | `/opt/fcp-node`（23 个 `.ts` + `package.json`，由本机 `src/` 同步） |
 | 服务端 | systemd `fcp-node.service`，UDP `0.0.0.0:4461`，开机自启，`Restart=always` |
 | 服务日志 | `/var/log/fcp-node/server.log`（`--log-level=debug`），另见 `journalctl -u fcp-node -f` |
-| PSK | 两端**内联同一个** `--key=00112233445566778899aabbccddeeff`；VPS unit 现为 `chmod 600`（明文含密钥），旧 `/etc/fcp-node.env` 已删除 |
+| PSK | 两端**内联同一个** `--key=00112233445566778899aabbccddeeff`（示例占位密钥，部署时替换为你的真实 PSK）；VPS unit 现为 `chmod 600`（明文含密钥），旧 `/etc/fcp-node.env` 已删除 |
 | 本机客户端 | `127.0.0.1:1080`，日志 `logs/client.log`，一键启动 `scripts/start-client.cmd` |
 | 两端参数 | `--key=11c1…c9a --mtu-min=1040 --mtu-max=1500 --fec=10:3 --log-level=debug` |
 | 防火墙 | 无 ufw/iptables 规则，UDP 4461 直通 |

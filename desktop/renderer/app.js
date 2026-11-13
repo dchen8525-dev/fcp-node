@@ -118,7 +118,9 @@ el.key.addEventListener('input', refreshKeyState);
 let saveTimer = null;
 
 function collectSettings() {
+  const key = el.key.value.replace(/\s+/g, '').replace(/^0x/i, '');
   return {
+    key: el.remember.checked ? key : '',
     host: el.host.value.trim(),
     port: Number(el.port.value) || 4460,
     listenHost: el.listenHost.value.trim() || '127.0.0.1',
@@ -137,7 +139,12 @@ function collectSettings() {
 
 function scheduleSave() {
   if (!el.remember.checked) {
-    window.fcp.saveSettings({ remember: false, cleared: true });
+    // Wipe every stored field, including the key, so unchecking really forgets.
+    window.fcp.saveSettings({
+      remember: false, key: '', host: '', port: 4460, listenHost: '',
+      listenPort: 1080, mtu: 1040, fec: '', logLevel: '', logFile: '',
+      pmtud: true, speedUrl: '', speedSeconds: 10, speedPort: 1080,
+    });
     return;
   }
   clearTimeout(saveTimer);
@@ -151,6 +158,10 @@ function scheduleSave() {
 function applySettings(s) {
   if (!s || typeof s !== 'object') return;
   const set = (node, v) => { if (v !== undefined && v !== null) node.value = v; };
+  if (typeof s.key === 'string' && s.key) {
+    el.key.value = s.key;
+    refreshKeyState();
+  }
   set(el.host, s.host);
   set(el.port, s.port);
   set(el.listenHost, s.listenHost);

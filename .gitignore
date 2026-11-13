@@ -21,3 +21,4 @@ desktop/dist/
 desktop/resources/cli.mjs
 desktop/shot*.png
 desktop/final-*.png
+desktop/fill-example.png
