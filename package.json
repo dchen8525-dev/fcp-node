@@ -1,6 +1,6 @@
 {
   "name": "fcp-node",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "FCP v7 UDP tunnel (AES-128-GCM / Reed-Solomon FEC / FCP-STREAM ARQ / BBR-lite) - zero-dependency TypeScript port of the C++ implementation",
   "type": "module",
   "engines": {
@@ -19,7 +19,10 @@
     "server": "node src/app/server.ts",
     "client": "node src/app/client.ts",
     "bench": "node src/app/bench.ts",
-    "replay": "node src/app/replay.ts"
+    "replay": "node src/app/replay.ts",
+    "pack:deb": "node packaging/linux/build-deb.mjs",
+    "pack:client-exe": "node packaging/win/build-client-exe.mjs",
+    "pack:desktop": "npm --prefix desktop run pack"
   },
   "dependencies": {},
   "devDependencies": {},

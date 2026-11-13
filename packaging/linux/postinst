@@ -1,0 +1,49 @@
+#!/bin/sh
+set -e
+
+CONF=/etc/fcp-node/server.conf
+GENERATED=0
+
+if [ "$1" = "configure" ] && [ -f "$CONF" ]; then
+  # The tar entry ships as root:root (the service account's gid is only known
+  # at install time); fix ownership on every configure, including upgrades.
+  chown root:fcp-node "$CONF"
+  chmod 0640 "$CONF"
+  if grep -q '^FCP_KEY=CHANGE_ME_32_HEX_CHARS$' "$CONF"; then
+    KEY=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    sed -i "s|^FCP_KEY=CHANGE_ME_32_HEX_CHARS$|FCP_KEY=${KEY}|" "$CONF"
+    GENERATED=1
+  fi
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+if [ "$1" = "configure" ]; then
+  # $2 is the previously installed version; non-empty means this is an upgrade.
+  if [ -n "${2:-}" ]; then
+    cat <<'EOF'
+fcp-server upgraded. The existing /etc/fcp-node/server.conf was kept.
+Restart the service to run the new binary: systemctl restart fcp-node
+EOF
+  else
+    if [ "$GENERATED" = "1" ]; then
+      printf '\nfcp-server: generated a new PSK for this host:\n\n  %s\n\n' "$KEY"
+      printf 'Use the same key on the client. It is stored in %s\n' "$CONF"
+      printf 'and is not shown again.\n\n'
+    fi
+    cat <<'EOF'
+fcp-server installed (not started automatically).
+
+  config : /etc/fcp-node/server.conf   (0640 root:fcp-node, contains the PSK)
+  binary : /usr/bin/fcp-server
+  logs   : /var/log/fcp-node/server.log  (journalctl -u fcp-node -f)
+
+  start  : systemctl enable --now fcp-node
+  status : systemctl status fcp-node
+EOF
+  fi
+fi
+
+exit 0

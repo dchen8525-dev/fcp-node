@@ -1,0 +1,19 @@
+#!/bin/sh
+# FCP Node server launcher.
+#
+# systemd reads /etc/fcp-node/server.conf as an EnvironmentFile and calls this
+# wrapper. Keeping the argument list here (instead of in the unit) means the
+# operator can also run `fcp-server ...` by hand with the same defaults.
+set -eu
+
+: "${FCP_KEY:?FCP_KEY is not set; edit /etc/fcp-node/server.conf (32 hex chars)}"
+
+exec /opt/fcp-node/node/bin/node /opt/fcp-node/fcp-server.mjs \
+  --key="${FCP_KEY}" \
+  -b "${FCP_BIND:-0.0.0.0:4461}" \
+  --mtu-min="${FCP_MTU_MIN:-1040}" \
+  --mtu-max="${FCP_MTU_MAX:-1500}" \
+  --fec="${FCP_FEC:-10:6}" \
+  --log-level="${FCP_LOG_LEVEL:-info}" \
+  --log-file="${FCP_LOG_FILE:-/var/log/fcp-node/server.log}" \
+  "$@"

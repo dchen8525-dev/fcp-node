@@ -145,6 +145,45 @@ node scripts/self-interop.mjs --log-dir=logs/smoke
 # logs/smoke/{server,client,bad}.log
 ```
 
+## 发布产物（Release）
+
+每次发布带四个资产，全部由本仓库的 `packaging/` 脚本生成：
+
+| 资产 | 平台 | 说明 |
+|---|---|---|
+| `fcp-server_<ver>_amd64.deb` | Debian/Ubuntu amd64 | 服务端。内嵌 Node 22 运行时，带 systemd unit 和 `/etc/fcp-node/server.conf`；首次安装自动生成 PSK 并只打印一次 |
+| `FCP-Node-Setup-<ver>.exe` | Windows x64 | 桌面 GUI 客户端 NSIS 安装包（per-user，无需管理员） |
+| `FCP-Node-<ver>-portable.exe` | Windows x64 | 桌面 GUI 客户端免安装单文件版 |
+| `fcp-client-<ver>.exe` | Windows x64 | 纯命令行客户端（Node SEA 单文件，不需要装 Node） |
+
+构建：
+
+```bash
+npm run pack:deb            # 首次会下载并校验 Node 22 到 packaging/.cache；deb 由 Node 直接生成
+npm run pack:client-exe     # 复用 desktop/node_modules 里的 esbuild
+npm --prefix desktop install
+npm --prefix desktop run pack   # -> desktop/dist/FCP-Node-*.exe
+```
+
+服务端安装：
+
+```bash
+sudo apt install ./fcp-server_0.0.2_amd64.deb
+# 安装脚本会打印随机生成的 PSK；把同一个 key 填到客户端
+sudo systemctl enable --now fcp-node
+systemctl status fcp-node
+tail -f /var/log/fcp-node/server.log
+```
+
+配置在 `/etc/fcp-node/server.conf`（`0640 root:fcp-node`），升级时作为 conffile 保留。
+卸载用 `apt remove fcp-server`；`apt purge` 会连同服务账号、配置和日志一起删除。
+
+客户端 exe 与桌面端参数一致：
+
+```bat
+fcp-client-0.0.2.exe --key=<HEX32> --peer=<SERVER_IP>:4461 -b 127.0.0.1:1080
+```
+
 ## 当前 VPS 部署（2026-11-11）
 
 | 项 | 值 |

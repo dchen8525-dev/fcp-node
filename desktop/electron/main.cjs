@@ -361,7 +361,7 @@ function buildRequest(target, host) {
   const pathAndQuery = `${target.pathname || '/'}${target.search || ''}`;
   return `GET ${pathAndQuery} HTTP/1.1\r\n` +
     `Host: ${host}\r\n` +
-    'User-Agent: fcp-desktop/0.0.1\r\n' +
+    'User-Agent: fcp-desktop/0.0.2\r\n' +
     'Accept: */*\r\n' +
     'Accept-Encoding: identity\r\n' +
     'Connection: close\r\n\r\n';
