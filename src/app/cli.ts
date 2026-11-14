@@ -47,16 +47,14 @@ speedtest:
                         (--speedtest-seconds=N is accepted as the old spelling)
 
 MTU (PMTUD is ON by default):
-  --mtu-min=N           datagram bytes incl. the 20B IP + 8B UDP headers where the
+  --mtu=N               datagram bytes incl. the 20B IP + 8B UDP headers where the
                         probe walk STARTS (default 1040; 128..9000). It is a FLOOR,
                         not a cap: the tunnel grows past it as the path proves it.
                         With --no-pmtud this becomes the fixed budget.
-                        (--packet-size / --mtu / -m were removed; they are rejected)
-  --mtu-max=N           ceiling for the walk (default 1500, raised to --mtu-min when
-                        that is higher; 128..9000, >= --mtu-min).
-                        Probes step up by 100B until the path answers or this is hit.
-  --no-pmtud            disable probing and pin the datagram budget at --mtu-min
-                        (--pmtud is gone: probing is already the default)
+                        The walk's ceiling needs no second flag: it is 1500, or
+                        this value when it is higher. (--mtu-min / --mtu-max were
+                        merged into this flag; the old C++ spelling --mtu / -m is
+                        back as the canonical name, --packet-size stays rejected.)
 
 Common:
   --fec=D:P             frame geometry (default 10:6); P is the per-set parity
@@ -105,14 +103,14 @@ const BOOL_FLAGS = new Set([
 ]);
 
 const ALIASES: Record<string, string> = {
-  b: 'bind', h: 'help',
+  b: 'bind', h: 'help', m: 'mtu',
 };
 
 // Everything the parser is allowed to produce. Anything else is a typo, and a
 // typo used to be dropped in silence (e.g. `--speedtest`, which no code path
 // ever reached because the client branch matched first).
 const KNOWN_OPTS = new Set([
-  'key', 'bind', 'peer', 'mtu-min', 'mtu-max', 'fec', 'metrics',
+  'key', 'bind', 'peer', 'mtu', 'fec', 'metrics',
   'log-level', 'log-file', 'seconds', 'speedtest-seconds', 'positional',
 ]);
 
@@ -121,9 +119,9 @@ const KNOWN_OPTS = new Set([
 // (peer budget mismatch, every oversize symbol silently dropped) and an
 // ignored `--log=debug` reverts to info (the traces you asked for vanish).
 const REMOVED_OPTS: Record<string, { use: string; why: string; short?: boolean }> = {
-  mtu: { use: '--mtu-min=N (and --mtu-max=N)', why: 'the budget is now a probe floor, the old fixed cap would pin the path' },
-  m: { use: '--mtu-min=N (and --mtu-max=N)', why: 'the budget is now a probe floor, the old fixed cap would pin the path', short: true },
-  'packet-size': { use: '--mtu-min=N (and --mtu-max=N)', why: 'packet-size was a hard cap; the budget now starts at a floor and grows by PMTUD' },
+  'mtu-min': { use: '--mtu=N', why: 'min and max merged into one flag: the ceiling is not worth a second knob, it follows 1500 (or the floor when higher)' },
+  'mtu-max': { use: '--mtu=N', why: 'min and max merged into one flag: the ceiling follows automatically (1500, raised to the floor when higher)' },
+  'packet-size': { use: '--mtu=N', why: 'packet-size was a hard cap; the budget now starts at a floor and grows by PMTUD' },
   log: { use: '--log-level=LEVEL', why: 'the default info level would silently drop the debug traces' },
   parity: { use: '--fec=D:P to raise the P ceiling; k itself is automatic', why: 'a pinned k disables the loss-driven adaptation, which is the whole point of the controller' },
   'fec-budget': { use: '--fec=D:P: P is the ceiling k may climb to', why: 'the ratio never bounded anything (the default 0.8 mapped to k=7, above the agreed P, so the extra parity was dropped by the peer as IndexPastS); the agreed P is the only honest ceiling' },
@@ -373,15 +371,12 @@ async function main(): Promise<void> {
   // same terms — one extra empty TLV, gated by the peer's answer.
   const fecGeo = parseFec(opts.get('fec'));
   const debugLog = logLevel === 'debug' ? (l: string) => log(`DBG ${l}`) : undefined;
-  const mtuMin = intOpt(opts, 'mtu-min', DEFAULT_MTU_MIN, 128, 9000);
-  // A floor above the default ceiling is a legal configuration, not an error:
-  // default the ceiling to the floor instead of demanding a redundant
-  // --mtu-max on the command line. An explicit --mtu-max below the floor is
-  // still rejected below.
-  const mtuMax = intOpt(opts, 'mtu-max', Math.max(DEFAULT_PMTU_MAX_MTU, mtuMin), 128, 9000);
-  if (mtuMax < mtuMin) {
-    throw new Error(`--mtu-max=${mtuMax} is below --mtu-min=${mtuMin}; the probe walk needs a ceiling at or above its floor`);
-  }
+  const mtuMin = intOpt(opts, 'mtu', DEFAULT_MTU_MIN, 128, 9000);
+  // One knob instead of two: the walk's ceiling is not worth a second flag, so
+  // it follows the floor — 1500 by default, raised to the floor when that is
+  // higher (a floor above the default ceiling is a legal configuration, not an
+  // error, and the old --mtu-max below the floor was rejected anyway).
+  const mtuMax = Math.max(DEFAULT_PMTU_MAX_MTU, mtuMin);
   const common: TunnelOptions = {
     psk: Buffer.alloc(16),
     mtu: mtuMin,

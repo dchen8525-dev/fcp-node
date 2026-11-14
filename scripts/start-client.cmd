@@ -12,4 +12,4 @@ rem (~45 MB/min while downloading), which is pointless for daily use.
 rem Debug is no longer a throughput hazard (log lines are batched), but if you
 rem need it, prefer a short session: replace info below with debug.
 cd /d D:\work\fcp-node
-node src\app\client.ts --key=00112233445566778899aabbccddeeff --peer=144.34.186.164:4461 -b 127.0.0.1:1080 --mtu-min=1040 --mtu-max=1500 --fec=10:6 --log-level=info --log-file=logs\client.log
+node src\app\client.ts --key=00112233445566778899aabbccddeeff --peer=144.34.186.164:4461 -b 127.0.0.1:1080 --mtu=1040 --fec=10:6 --log-level=info --log-file=logs\client.log
