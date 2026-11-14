@@ -17,7 +17,7 @@ const walk = (dir, out = []) => {
   return out;
 };
 const all = [...walk(join(root, 'src')), ...walk(join(root, 'tests'))];
-const entrypoints = new Set(['server.ts', 'client.ts', 'bench.ts', 'replay.ts', 'cli.ts']);
+const entrypoints = new Set(['server.ts', 'client.ts', 'bench.ts', 'metrics-report.ts', 'cli.ts']);
 const isTest = (p) => p.includes('\\tests\\') || p.includes('/tests/');
 const libs = all.filter((p) => !isTest(p) && !entrypoints.has(p.split(/[\\/]/).pop()));
 const tests = all.filter(isTest);
@@ -92,10 +92,10 @@ writeFileSync(join(traceDir, 'run-client-aa.jsonl'), '{"t":"bbr"}\n');
 writeFileSync(join(traceDir, 'run-server-aa.jsonl'), '{"t":"bbr"}\n{"t":"fec_k"}\n');
 writeFileSync(join(traceDir, 'cache.jsonl'), '{"t":"bbr"}\n');
 const replayRun = spawnSync(process.execPath,
-  ['src/app/replay.ts', `--metrics=${join(traceDir, 'run')}`], { cwd: root, encoding: 'utf8' });
+  ['src/app/metrics-report.ts', `--metrics=${join(traceDir, 'run')}`], { cwd: root, encoding: 'utf8' });
 const replayOut = (replayRun.stdout ?? '').trim();
 const traceOk = replayRun.status === 0 && /2 file\(s\), 3 events/.test(replayOut) && !/cache/.test(replayOut);
-results.push(['trace replay', traceOk ? 'PASS' : 'FAIL',
+results.push(['metrics report', traceOk ? 'PASS' : 'FAIL',
   traceOk ? '2 files / 3 events, no neighbours' : replayOut.split('\n')[0] || 'no output']);
 if (!traceOk) { console.error((replayRun.stderr ?? '') + replayOut); ++failed; }
 rmSync(traceDir, { recursive: true, force: true });

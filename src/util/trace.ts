@@ -1,5 +1,5 @@
 // JSONL controller trace: the writer used on the packet path, and the offline
-// reader behind `replay`. Both halves live here so the file-naming rule and the
+// reader behind `metrics-report`. Both halves live here so the file-naming rule and the
 // matching rule cannot drift apart (they did: the reader looked for `c*` while
 // the writer produced `c-client-*`).
 //

@@ -20,7 +20,7 @@ Usage:
   node cli.ts server [options]
   node cli.ts client [options]
   node cli.ts speedtest [--seconds=N] [options]
-  node cli.ts replay --metrics=PREFIX
+  node cli.ts metrics-report --metrics=PREFIX
 
 Key (required, both ends equal):
   --key=HEX32           16-byte pre-shared key, 32 hex chars.
@@ -70,7 +70,7 @@ Common:
                         Records the adaptive controllers' decisions (fec_k)
                         and estimates (bbr). The directory is created if
                         missing; read the files back with:
-                        replay --metrics=PREFIX
+                        metrics-report --metrics=PREFIX
   --log-level=LEVEL     debug|info|warn|error|off (default info)
                         debug adds per-datagram / per-segment / per-connection traces
                         (--log was removed; it is rejected, not ignored)
@@ -93,7 +93,7 @@ the session key. --key-update was removed: it had no off-state worth keeping,
 and one-sided use is settled by the TLV handshake rather than by a flag.
 
 Node.js-only differences from the C++ CLI: speedtest uses an in-process
-loopback; replay summarises --metrics JSONL instead of replaying it.
+loopback; metrics-report summarises --metrics JSONL instead of replaying it.
 See docs/移植对照与差异.md for the full delta list.
 `;
 
@@ -307,17 +307,17 @@ async function speedtest(base: TunnelOptions, seconds: number): Promise<void> {
   client.stop(); server.stop(); echo.close();
 }
 
-async function replay(prefix: string): Promise<void> {
+async function metricsReport(prefix: string): Promise<void> {
   // The directory comes from the prefix. It used to come from the working
   // directory, which reported "0 files" for every absolute --metrics path.
   const files = resolveTraceFiles(prefix);
   if (files.length === 0) {
-    throw new Error(`replay ${prefix}: no ${normaliseTracePrefix(prefix)}-client-*.jsonl ` +
+    throw new Error(`metrics-report ${prefix}: no ${normaliseTracePrefix(prefix)}-client-*.jsonl ` +
       'or -server-*.jsonl found (tracing writes one file per session)');
   }
   const s = summariseTrace(files);
   process.stdout.write(
-    `replay ${prefix}: ${s.files} file(s), ${s.events} events` +
+    `metrics-report ${prefix}: ${s.files} file(s), ${s.events} events` +
     `${s.malformed ? `, ${s.malformed} malformed line(s)` : ''}\n`,
   );
   for (const [k, v] of [...s.kinds].sort((a, b) => b[1] - a[1])) {
@@ -396,9 +396,9 @@ async function main(): Promise<void> {
     log,
     debugLog,
   };
-  if (mode === 'replay') {
-    if (!opts.has('metrics')) throw new Error('replay requires --metrics=PREFIX');
-    await replay(opts.get('metrics')!);
+  if (mode === 'metrics-report') {
+    if (!opts.has('metrics')) throw new Error('metrics-report requires --metrics=PREFIX');
+    await metricsReport(opts.get('metrics')!);
     return;
   }
   if (opts.has('metrics')) common.tracePrefix = prepareTracePrefix(opts.get('metrics')!);
@@ -430,8 +430,10 @@ async function main(): Promise<void> {
     const seconds = Math.min(30, Math.max(3, Number(raw) || 8));
     await speedtest(common, seconds);
     return;
+  } else if (mode === 'replay') {
+    throw new Error('replay was renamed: use metrics-report --metrics=PREFIX');
   } else {
-    throw new Error(`unknown mode "${mode}"; use server | client | speedtest | replay`);
+    throw new Error(`unknown mode "${mode}"; use server | client | speedtest | metrics-report`);
   }
 
   await tunnel.start();
