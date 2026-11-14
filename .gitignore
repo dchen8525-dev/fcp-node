@@ -26,3 +26,6 @@ desktop/fill-example.png
 # Packaging caches (downloaded Node/nfpm) and release artifacts.
 packaging/.cache/
 dist/
+
+# literal-tilde dir from an unexpanded ~ path argument
+/~/

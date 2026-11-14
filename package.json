@@ -1,6 +1,6 @@
 {
   "name": "fcp-node",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "FCP v7 UDP tunnel (AES-128-GCM / Reed-Solomon FEC / FCP-STREAM ARQ / BBR-lite) - zero-dependency TypeScript port of the C++ implementation",
   "type": "module",
   "engines": {
