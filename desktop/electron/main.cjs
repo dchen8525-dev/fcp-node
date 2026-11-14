@@ -157,7 +157,7 @@ function notifyMinimizedToTray() {
 function statsArgs(cfg) {
   const args = ['client', `--key=${cfg.key}`, `--peer=${cfg.host}:${cfg.port}`,
     `--bind=${cfg.listenHost}:${cfg.listenPort}`];
-  if (cfg.mtu) args.push(`--mtu=${cfg.mtu}`);
+  if (cfg.mtu) args.push(`--mtu-min=${cfg.mtu}`);
   if (cfg.pmtud === false) args.push('--no-pmtud');
   args.push(`--fec=${cfg.fec || '10:6'}`);
   args.push(`--log-level=${cfg.logLevel || 'info'}`);

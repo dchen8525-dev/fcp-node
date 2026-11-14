@@ -26,7 +26,7 @@ if netstat -ano 2>/dev/null | grep "127.0.0.1:1080" | grep -q LISTENING; then
 fi
 node src/app/client.ts --key=00112233445566778899aabbccddeeff \
   --peer=144.34.186.164:4461 -b 127.0.0.1:1080 \
-  --mtu=1040 --fec=10:6 --log-level=error \
+  --mtu-min=1040 --fec=10:6 --log-level=error \
   >/dev/null 2>&1 &
 CLI=$!
 

@@ -33,7 +33,7 @@ npm run pack:deb
 |---|---|
 | `FCP_KEY` | 首次安装随机生成 |
 | `FCP_BIND` | `0.0.0.0:4461` |
-| `FCP_MTU` | `1040`（探测起点；上限固定 1500，起点高于它时跟随起点） |
+| `FCP_MTU_MIN` | `1040`（探测起点；上限固定 1500，起点高于它时跟随起点） |
 | `FCP_FEC` | `10:6` |
 | `FCP_LOG_LEVEL` / `FCP_LOG_FILE` | `info` / `/var/log/fcp-node/server.log` |
 
