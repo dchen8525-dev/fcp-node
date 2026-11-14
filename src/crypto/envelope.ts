@@ -158,7 +158,7 @@ export class Envelope {
   private sealUnchecked(counter: bigint, plain: Uint8Array): Buffer | null {
     const sealed = gcmSeal(this.sendKey, makeIv(counter, this.sendDirection), plain);
     if (sealed === null) return null;
-    const wire = Buffer.alloc(ENVELOPE_OVERHEAD + plain.length);
+    const wire = Buffer.allocUnsafe(ENVELOPE_OVERHEAD + plain.length); // fully written below
     this.salt.copy(wire, 0);
     putLe64(counter, wire, SALT_LEN);
     sealed.cipher.copy(wire, SALT_LEN + NONCE_LEN);

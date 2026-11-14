@@ -7,7 +7,8 @@ import { randomBytes } from 'node:crypto';
 import {
   SALT_LEN, Direction, type DirectionValue,
   HandshakeRole, HandshakeState, HandshakeError,
-  CAP_PMTUD, CAP_TLV, TLV_TYPE_ACK_V2, TLV_TYPE_KEY_UPDATE, TLV_TYPE_PREWARM, LOCAL_FLAGS_M1,
+  CAP_PMTUD, CAP_TLV, TLV_TYPE_ACK_V2, TLV_TYPE_KEY_UPDATE, TLV_TYPE_PREWARM,
+  TLV_TYPE_MULTIPLEX, MUX_MAX_STREAMS, LOCAL_FLAGS_M1,
   HANDSHAKE_SEND_BUDGET, BOOTSTRAP_PROBES_PER_SECOND,
   NAT_KEEPALIVE_MS, PEER_ALIVE_GRACE_MS, KEEPALIVE_MAGIC, KEEPALIVE_LEN,
   RESET_MAGIC, RESET_MAGIC_LEN, ENVELOPE_OVERHEAD, NONCE_LIMIT,
@@ -35,8 +36,22 @@ import {
 } from '../fec/frame.ts';
 import { hdrType, parseHdr } from '../fec/hdr.ts';
 import { FecstatValidator, FecstatStatus } from '../fec/fecstat.ts';
-import { Stream } from '../stream/stream.ts';
+import { Stream, type StreamCallbacks } from '../stream/stream.ts';
 import { AdaptiveFec, BbrLite, FecstatReporter } from '../control/controller.ts';
+
+/** Host-side stream bookkeeping for multiplexed sessions. The default stream
+ *  (sid 0) stays wired through the SessionCallbacks read/eof/closed; sids
+ *  1..255 arrive via inboundStream and leave via streamClosed. */
+export interface StreamHost {
+  /** Inbound stream the host did not open (server: an OPEN arrived on it).
+   *  Return null to drop the stream's bytes. */
+  inboundStream(sid: number): StreamCallbacks | null;
+  /** The Stream instance for a just-created inbound stream (host writes into
+   *  it). Called before the first segment is processed. */
+  streamReady?(sid: number, stream: Stream): void;
+  /** A sid stream finished (both directions or reset): free host state. */
+  streamClosed(sid: number, reason: string): void;
+}
 
 export interface SessionConfig {
   psk: Uint8Array;
@@ -64,6 +79,8 @@ export interface SessionCallbacks {
   log?: (line: string) => void;
   /** Verbose per-datagram / per-segment trace. No-op unless --log-level=debug. */
   debug?: (line: string) => void;
+  /** Multiplexing host (server side): creates per-sid stream state. */
+  streamHost?: StreamHost;
 }
 
 export interface SessionStats {
@@ -114,6 +131,10 @@ export class Session {
   private pmtuBackoffMs = 0;
   private pmtuCeilingLogged = false;
   private pmtuStartMtu = 0;
+  /** Upper bound proven by blackholed probes (0 = unknown, still walking up).
+   *  DPLPMTUD-style binary search between the acked floor and this ceiling
+   *  converges in ~3 probes instead of 100 B linear steps. */
+  private pmtuCeiling = 0;
   /** Largest symbol this end will accept, independent of its send budget. */
   private rxSymbolMax = 65535;
   private pinnedK: number;
@@ -123,6 +144,11 @@ export class Session {
    *  failed its handshake or got a stateless reset never closes its Stream, so
    *  "streamRef.isClosed" is not a sufficient liveness test. */
   private closeNotified = false;
+  /** M1 multiplexing: negotiated in the handshake, a 1-byte stream id prefixes
+   *  every DATA symbol payload (0 = the session's default stream). */
+  private mux = false;
+  private streams = new Map<number, Stream>();
+  private streamHost: StreamHost | null = null;
 
   get isClosed(): boolean { return this.closeNotified; }
 
@@ -136,6 +162,7 @@ export class Session {
     this.cfg = cfg;
     this.cb = cb;
     this.dbg = cb.debug ?? (() => {});
+    this.streamHost = cb.streamHost ?? null;
     const tag = () => Buffer.from(cfg.salt).toString('hex').slice(0, 8);
     this.tag = tag;
     this.salt = Buffer.from(cfg.salt);
@@ -183,10 +210,22 @@ export class Session {
     this.stream = new Stream(
       { maxSegment: this.limits.payloadMax, initialSrttMs: cfg.initialSrttMs ?? DEFAULT_SRTT_MS },
       {
-        send: (seg) => this.onStreamSegment(seg),
+        send: (seg) => this.sendStreamSegment(0, seg),
         read: (bytes) => { this.bbr.onDelivery(bytes.length, this.nowMs); this.cb.read(bytes); },
-        closed: (reason) => this.notifyClosed(reason),
-        eof: () => this.cb.eof?.(),
+        // In mux mode the default stream may idle out while sid streams are
+        // still alive (a shared session serves many local connections); only a
+        // default-stream close with no live sid streams ends the session.
+        closed: (reason) => {
+          if (this.mux && this.streams.size > 0) {
+            this.dbg(`[${this.tag()}] default stream closed (${reason}) with live sid streams; session stays`);
+            return;
+          }
+          this.notifyClosed(reason);
+        },
+        eof: () => {
+          if (this.mux && this.streams.size > 0) return;
+          this.cb.eof?.();
+        },
         rtt: (ms) => {
           this.bbr.onRtt(ms); this.sndBbr.onRtt(ms); this.tx?.setSrttMs(ms);
         },
@@ -228,6 +267,9 @@ export class Session {
     // key after FIRST_ROLL_AT packets while a peer that did not opt in keeps
     // decrypting with the session key, and the link dies with no error at all.
     if (this.cfg.keyUpdate) tlvs.push({ type: TLV_TYPE_KEY_UPDATE, value: Buffer.alloc(0) });
+    // M1: always offered. A peer that does not echo it keeps the single-stream
+    // wire (sid framing only engages when BOTH ends offered).
+    tlvs.push({ type: TLV_TYPE_MULTIPLEX, value: Buffer.alloc(0) });
     if (this.cfg.prewarmTicket) tlvs.push({ type: TLV_TYPE_PREWARM, value: encodePrewarmTlv(this.cfg.prewarmTicket) });
     this.hs.setLocalTlvs(tlvs);
     // #77: no TLVs at all -> plain v7 shape (no kCapTlv bit), which an old
@@ -358,6 +400,13 @@ export class Session {
     // still uses the session key — every packet after the first roll decrypted
     // to garbage, with nothing logged on either side.
     this.env.setKeyUpdate(this.hs.tlvAgreed(TLV_TYPE_KEY_UPDATE));
+    // M1: framing engages only when BOTH ends offered the TLV; an old peer
+    // keeps today's single-stream wire, byte for byte.
+    this.mux = this.hs.tlvAgreed(TLV_TYPE_MULTIPLEX);
+    // The 1-byte sid prefix rides inside the symbol payload, so every stream
+    // must carve segments one byte below payloadMax or FrameTx drops each
+    // full-size segment as oversize.
+    this.stream.setMaxSegment(this.mux ? this.limits.payloadMax - 1 : this.limits.payloadMax);
     this.tx = new FrameTx(np.d, this.limits, (s) => this.emitSymbol(s, false));
     this.tx.setSrttMs(this.bbr.srttMs);
     // Follow the agreed parity, not our own proposal: a peer may have offered a
@@ -368,7 +417,7 @@ export class Session {
     this.rx = new FrameRx({
       d: np.d, p: np.p,
       maxSymbolLen: this.rxSymbolMax,
-      deliver: (bytes) => { this.stream.onSegment(bytes, this.nowMs); },
+      deliver: (bytes) => { this.deliverStreamFrame(bytes); },
       oob: (msg, t) => { this.onOob(msg, t); },
       event: (e) => {
         if (e.event === 'recovered' && e.repairMs !== undefined) this.reporter.recordRepairLatency(e.repairMs);
@@ -380,7 +429,6 @@ export class Session {
       },
     });
     this.stream.setAckV2(this.hs.tlvAgreed(TLV_TYPE_ACK_V2));
-    this.stream.setMaxSegment(this.limits.payloadMax);
     const prewarm = this.hs.peerTlv(TLV_TYPE_PREWARM);
     if (prewarm) {
       const p = decodePrewarmTlv(prewarm);
@@ -446,7 +494,8 @@ export class Session {
     const up = mtu > this.limits.mtu;
     this.limits = l;
     if (up) this.tx?.raiseLimits(l); else this.tx?.lowerLimits(l);
-    this.stream.setMaxSegment(l.payloadMax);
+    this.stream.setMaxSegment(l.payloadMax - (this.mux ? 1 : 0));
+    if (this.mux) for (const st of this.streams.values()) st.setMaxSegment(l.payloadMax - 1);
     this.dbg(`[${this.tag()}] PMTU ${why} mtu=${mtu} payloadMax=${l.payloadMax}`);
   }
 
@@ -454,8 +503,13 @@ export class Session {
     if (!this.cfg.pmtud) return;
     const gap = Math.max(1000, 5 * this.bbr.srttMs) + this.pmtuBackoffMs;
     if (nowMs - this.pmtuLastProbeMs < gap) return;
-    const target = Math.min(this.pmtuMaxMtu, this.pmtuMtu + PMTU_PROBE_STEP);
-    if (target <= this.pmtuMtu) return;
+    // Within one step of the proven ceiling: the acked size is the answer,
+    // further probing only burns datagrams.
+    if (this.pmtuCeiling > 0 && this.pmtuCeiling - this.pmtuAckedMtu <= PMTU_PROBE_STEP) return;
+    const target = this.pmtuCeiling > 0
+      ? Math.floor((this.pmtuAckedMtu + this.pmtuCeiling) / 2)
+      : Math.min(this.pmtuMaxMtu, this.pmtuMtu + PMTU_PROBE_STEP);
+    if (target <= this.pmtuAckedMtu) return;
     const len = pmtuProbeLen(target, this.cfg.ipHdrLen ?? DEFAULT_IP_HEADER_LEN);
     if (len < PMTU_HEADER_LEN) return;
     const msg = Buffer.alloc(len);
@@ -467,17 +521,19 @@ export class Session {
     this.pmtuProbeMtu = target;
     this.pmtuLastProbeMs = nowMs;
     ++this.pmtuProbesSent;
-    this.dbg(`[${this.tag()}] PMTU probe tx mtu=${target} (cur=${this.pmtuMtu} lost=${this.pmtuProbesLost})`);
-    // Three unacknowledged probes = black hole: fall back to the proved size
-    // and back off, so a path that cannot grow is not hammered every second.
+    this.dbg(`[${this.tag()}] PMTU probe tx mtu=${target} (cur=${this.pmtuMtu} ceiling=${this.pmtuCeiling || '—'} lost=${this.pmtuProbesLost})`);
+    // Three unacknowledged probes at this size = black hole: that size becomes
+    // the ceiling (binary search halves the next probe), the budget falls back
+    // to the proved size, and the walk backs off.
     if (++this.pmtuProbesLost >= 3) {
       this.pmtuProbesLost = 0;
       this.pmtuBackoffMs = Math.min(PMTU_BACKOFF_MAX_MS, Math.max(1000, this.pmtuBackoffMs * 2));
+      this.pmtuCeiling = target;
       if (this.pmtuMtu !== this.pmtuAckedMtu) {
         this.pmtuMtu = this.pmtuAckedMtu;
         this.applyPmtuMtu(this.pmtuMtu, 'blackhole-fallback');
       }
-      this.dbg(`[${this.tag()}] PMTU probe ${target} unanswered x3; pinned at ${this.pmtuMtu}, backoff=${this.pmtuBackoffMs}ms`);
+      this.dbg(`[${this.tag()}] PMTU probe ${target} unanswered x3; ceiling=${this.pmtuCeiling} pinned at ${this.pmtuMtu}, backoff=${this.pmtuBackoffMs}ms`);
     }
   }
 
@@ -516,6 +572,10 @@ export class Session {
     const rcvNext = Math.max(this.stream.rcvBufBytes, rcvWant);
     if (sendWant === this.stream.sendWindowBytes && rcvNext === this.stream.rcvBufBytes) return;
     this.stream.setWindows(sendWant, rcvNext);
+    // Mux streams share the same window targets; the per-stream advertise
+    // still collapses under each stream's own reorder occupancy, which is
+    // what actually throttles a busy multiplexed session.
+    if (this.mux) for (const st of this.streams.values()) st.setWindows(sendWant, rcvNext);
     this.dbg(`[${this.tag()}] window send ${this.stream.sendWindowBytes}B rcv ${this.stream.rcvBufBytes}B ` +
       `(sendBw=${this.sndBbr.bwBytesPerMs.toFixed(2)}B/ms rcvBw=${this.bbr.bwBytesPerMs.toFixed(2)}B/ms srtt=${this.bbr.srttMs}ms)`);
   }
@@ -546,6 +606,71 @@ export class Session {
     // timer is ~srtt (200 ms), a download can never exceed D symbols per
     // 200 ms no matter how fast the path is.
     if (kind === STREAM_TYPE_ACK || kind === STREAM_TYPE_ACK_V2 || kind === STREAM_TYPE_RST) this.tx.flush();
+  }
+
+  /** M1: host-initiated stream (client side). Mux sessions only; sid 0 is the
+   *  session's default stream and is never opened through here. */
+  openStream(sid: number, cb: StreamCallbacks): Stream | null {
+    if (!this.mux || sid === 0 || sid > MUX_MAX_STREAMS || this.streams.has(sid)) return null;
+    return this.makeStream(sid, cb);
+  }
+
+  get muxActive(): boolean { return this.mux; }
+
+  private makeStream(sid: number, cb: StreamCallbacks): Stream {
+    const stream = new Stream(
+      { maxSegment: this.limits.payloadMax - (this.mux ? 1 : 0), initialSrttMs: this.cfg.initialSrttMs ?? DEFAULT_SRTT_MS },
+      {
+        ...cb,
+        send: (seg) => this.sendStreamSegment(sid, seg),
+        // The bbr/sndBbr estimators and the FEC srtt are session-wide: every
+        // stream's delivery/ack/rtt sample must reach them, exactly like the
+        // default stream's callbacks do.
+        read: (bytes) => { this.bbr.onDelivery(bytes.length, this.nowMs); cb.read(bytes); },
+        closed: (reason) => {
+          this.streams.delete(sid);
+          cb.closed(reason);
+          this.streamHost?.streamClosed(sid, reason);
+        },
+        eof: () => cb.eof?.(),
+        rtt: (ms) => {
+          this.bbr.onRtt(ms); this.sndBbr.onRtt(ms); this.tx?.setSrttMs(ms);
+        },
+        acked: (bytes, nowMs) => this.sndBbr.onDelivery(bytes, nowMs),
+      },
+    );
+    this.streams.set(sid, stream);
+    return stream;
+  }
+
+  /** Route a delivered DATA symbol payload to its stream. Mux sessions prefix
+   *  a 1-byte sid (0 = default stream); legacy sessions take the whole
+   *  payload. An inbound sid without host state (server: an OPEN arrived on a
+   *  fresh stream) is created through the host, or dropped when refused. */
+  private deliverStreamFrame(bytes: Buffer): void {
+    if (!this.mux) { this.stream.onSegment(bytes, this.nowMs); return; }
+    const sid = bytes[0];
+    let stream = sid === 0 ? this.stream : this.streams.get(sid);
+    if (!stream) {
+      if (sid === 0) { ++this.structFail; return; }
+      const cb = this.streamHost?.inboundStream(sid);
+      if (!cb) { this.dbg(`[${this.tag()}] stream ${sid} refused by host; bytes dropped`); return; }
+      stream = this.makeStream(sid, cb);
+      this.streamHost?.streamReady?.(sid, stream);
+    }
+    stream.onSegment(bytes.subarray(1), this.nowMs);
+  }
+
+  private sendStreamSegment(sid: number, seg: Buffer): void {
+    this.onStreamSegment(this.mux ? this.frameSid(sid, seg) : seg);
+  }
+
+  /** The 1-byte sid prefix is fully written here, so allocUnsafe is safe. */
+  private frameSid(sid: number, seg: Buffer): Buffer {
+    const framed = Buffer.allocUnsafe(1 + seg.length);
+    framed[0] = sid;
+    seg.copy(framed, 1);
+    return framed;
   }
 
   private emitSymbol(s: TxSymbol, bootstrap: boolean): void {
@@ -585,14 +710,20 @@ export class Session {
   write(data: Uint8Array): number { return this.stream.write(data, this.nowMs); }
   closeWrite(): void { this.stream.closeWrite(this.nowMs); }
   consumed(n: number): void { this.stream.consumed(n); }
-  get inflightBytes(): number { return this.stream.inflightBytes; }
+  /** Aggregate over the default stream + every live sid stream (dbg lines). */
+  private eachStream(fn: (s: Stream) => number): number {
+    let total = fn(this.stream);
+    for (const st of this.streams.values()) total += fn(st);
+    return total;
+  }
+  get inflightBytes(): number { return this.eachStream((s) => s.inflightBytes); }
   get peerWindowBytes(): number { return this.stream.peerWindowBytes; }
-  get queuedBytes(): number { return this.stream.pendingQueueBytes; }
+  get queuedBytes(): number { return this.eachStream((s) => s.pendingQueueBytes); }
   get recvNext(): number { return this.stream.recvNext; }
-  get reorderBytes(): number { return this.stream.reorderBytes; }
-  get recvPendingBytes(): number { return this.stream.deliveryPendingBytes; }
-  get segsSent(): number { return this.stream.segsSent; }
-  get segsRetransmitted(): number { return this.stream.retransmits; }
+  get reorderBytes(): number { return this.eachStream((s) => s.reorderBytes); }
+  get recvPendingBytes(): number { return this.eachStream((s) => s.deliveryPendingBytes); }
+  get segsSent(): number { return this.eachStream((s) => s.segsSent); }
+  get segsRetransmitted(): number { return this.eachStream((s) => s.retransmits); }
   /** fast-retransmit copies / RTO copies / fast-retransmit rounds. */
   get retxSplit(): string {
     return `${this.stream.retxFast}/${this.stream.retxRto}/${this.stream.fastRounds}`;
@@ -626,6 +757,7 @@ export class Session {
       this.syncFecControl(nowMs);
       this.updateStreamWindows(nowMs);
       this.stream.onTick(nowMs);
+      if (this.mux) for (const st of this.streams.values()) st.onTick(nowMs);
       const report = this.reporter.onTick(nowMs, this.rx?.counters ?? emptyCounters(), this.rx?.accountedThroughSetId() ?? 0);
       if (report) {
         // FECSTAT is oob and never retransmitted; reporter.cc sends the 128-byte

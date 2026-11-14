@@ -17,6 +17,7 @@ import {
   HOLE_DUP_ACK_MS, FAST_RETX_SEGMENTS, MIN_RETX_INTERVAL_MS,
   FAST_RETX_MIN_AGE_MS, RETX_RTT_FACTOR,
   MIN_OOB_CHUNKS, MAX_OOB_CHUNKS,
+  TLP_MIN_PTO_MS, TLP_MAX_PROBES,
 } from '../constants.ts';
 import {
   seqAfter, seqAtOrAfter, seqDist, getLe32, putLe32,
@@ -87,6 +88,23 @@ export class Stream {
   /** Best RTT ever observed. Anchors the estimator so hole-delayed segments
    *  (a segment that sat behind a gap for seconds) cannot inflate srtt. */
   private minRttMs = 0;
+  /** Tail-loss probing: 0 = no probe in flight, counts toward TLP_MAX_PROBES. */
+  private tlpProbes = 0;
+  /** Send time of the most recent data segment (TLP clock base). */
+  private lastSendMs = 0;
+  /** Fast-retransmit reorder relaxation: multiplies the RTT-derived age base
+   *  (1 = off, up to 2 = quic-go's relaxed time threshold). Raised after
+   *  rounds that bought nothing (reordering), decayed after rounds that
+   *  recovered real loss. */
+  private retxRelax = 1;
+  /** SACK ranges carried by the most recent ACK (v2: up to 64; v1: 0 or 1).
+   *  Two or more ranges starting beyond a segment are decisive loss evidence:
+   *  the receiver demonstrably holds several separate later arrivals, which
+   *  reordering cannot produce for the hole in between. */
+  private sackRanges: Array<{ start: number; end: number }> = [];
+  private fastRoundMs = 0;
+  private fastRoundUna = 0;
+  private fastRoundSeq = -1;
 
   // Receive side.
   private rcvNxt = 0; private oob: RcvChunk[] = []; private oobBytes = 0;
@@ -225,7 +243,15 @@ export class Stream {
     return Math.max(0, Math.min(this.cfg.sendWindowBytes, this.peerRwnd));
   }
 
-  private pump(nowMs: number, burstBytes = PUMP_BURST_BYTES): void {
+  private pump(nowMs: number): void {
+    // Burst budget must cover one full ACK cycle (ACK_EVERY_SEGMENTS segments).
+    // A fixed byte budget starves the replenish loop once PMTUD grows the
+    // segment past ~1 KiB payload: at 1430 B/segment six segments need 8580 B,
+    // and a 6 KiB budget caps steady-state throughput at 71.6% of window/RTT.
+    const burstBytes = Math.max(
+      PUMP_BURST_BYTES,
+      ACK_EVERY_SEGMENTS * Math.max(0, this.cfg.maxSegment - STREAM_DATA_HDR_LEN),
+    );
     if (this.state === StreamState.Closed) return;
     let guard = 0;
     let sentBytes = 0;
@@ -251,7 +277,7 @@ export class Stream {
       this.tx.push(seg);
       this.sndNext = end;
       if (seqAfter(end, this.sndMax)) this.sndMax = end;
-      this.emitData(seg);
+      this.emitData(seg, nowMs);
       if (fin) break;
       // Hand the rest to the next tick / ACK. Emitting a whole window in one
       // synchronous loop is what made the path drop the tail of every burst.
@@ -262,7 +288,7 @@ export class Stream {
 
   private takePending(n: number): Buffer {
     if (n <= 0 || this.pendingBytes === 0) return Buffer.alloc(0);
-    const out = Buffer.alloc(Math.min(n, this.pendingBytes));
+    const out = Buffer.allocUnsafe(Math.min(n, this.pendingBytes)); // fully copied below
     let off = 0;
     while (off < out.length && this.pending.length) {
       const head = this.pending[0];
@@ -276,9 +302,10 @@ export class Stream {
     return out;
   }
 
-  private emitData(s: SndSeg): void {
+  private emitData(s: SndSeg, nowMs: number): void {
     this.cb.send(encodeData(s.offset, s.fin ? STREAM_FLAG_FIN : 0, s.bytes));
     ++this.segsSent;
+    this.lastSendMs = nowMs;
   }
 
   onSegment(buf: Uint8Array, nowMs: number): void {
@@ -472,6 +499,7 @@ export class Stream {
   private onAck(cum: number, rwnd: number, ranges: Array<{ start: number; end: number }>, nowMs: number): void {
     if (seqAfter(cum, this.sndMax)) { ++this.badSegs; return; }
     this.peerRwnd = rwnd;
+    this.sackRanges = ranges.filter((r) => seqAfter(r.end, r.start));
     const prevUna = this.sndUna;
     // A cumulative point that does not move forward is a duplicate or a stale
     // ACK reordered behind a newer one. Moving sndUna backwards would inflate
@@ -540,11 +568,20 @@ export class Stream {
       this.dupAcks = 0;
     }
     this.lastAckCum = cum; this.haveAckCum = true;
-    if (!advanced) return;
+    if (advanced) {
+      // Cumulative progress proves the tail is not lost: the probe budget
+      // restarts for the next tail.
+      this.tlpProbes = 0;
+      this.resolveFastRound(cum);
+    }
     if (this.finSent && seqAtOrAfter(cum, (this.finOffset + 1) >>> 0) && this.eofDelivered) {
       this.finish('local_eof');
       return;
     }
+    // Pump on every ACK, not only on cumulative advance: a duplicate ack
+    // still carries a fresh rwnd, and once the peer's window opens again this
+    // is the only trigger before the next tick (whose budget alone caps
+    // recovery at ~600 KB/s).
     this.pump(nowMs);
   }
 
@@ -584,20 +621,47 @@ export class Stream {
     // RACK uses for the same reason.
     const base = this.minRttMs > 0 ? Math.min(Math.round(this.minRttMs * 1.25), srtt) : srtt;
     const repeatAfter = Math.max(MIN_RETX_INTERVAL_MS, Math.round(base * RETX_RTT_FACTOR * 1.25));
-    const firstAfter = Math.max(FAST_RETX_MIN_AGE_MS, base);
+    // firstAfter adapts: a round that bought nothing (reordering) relaxes the
+    // RTT base, a round that recovered real loss decays the relaxation away.
+    const firstAfter = Math.max(FAST_RETX_MIN_AGE_MS, Math.round(base * this.retxRelax));
     ++this.fastRounds;
     let sent = 0;
+    let firstSeq = -1;
     for (const s of this.tx) {
       if (s.acked || s.sacked) continue;
       // Not proven missing: the peer has not reported anything past it yet.
       if (!seqAtOrAfter(this.sackedHigh, s.end)) continue;
-      const wait = s.retransmits === 0 ? firstAfter : repeatAfter;
+      // Strong SACK evidence: two or more distinct received ranges start
+      // beyond this segment — reordering cannot explain that pattern, so the
+      // segment is provably lost and the age wait is skipped. A single range
+      // (or a v1 rotating block) keeps the reorder guard.
+      let beyond = 0;
+      for (const r of this.sackRanges) {
+        if (seqAtOrAfter(r.start, s.end) && ++beyond >= 2) break;
+      }
+      const wait = s.retransmits !== 0 ? repeatAfter : beyond >= 2 ? 0 : firstAfter;
       if (nowMs - s.sentMs < wait) continue;
-      this.emitData(s);
+      if (firstSeq < 0) firstSeq = s.offset;
+      this.emitData(s, nowMs);
       ++s.retransmits; // Karn: this copy must not feed the RTT estimator
       ++this.retransmits; ++this.retxFast;
       s.sentMs = nowMs;
       if (++sent >= FAST_RETX_SEGMENTS) break;
+    }
+    if (sent > 0 && this.fastRoundSeq < 0) {
+      this.fastRoundMs = nowMs;
+      this.fastRoundUna = this.sndUna;
+      this.fastRoundSeq = firstSeq;
+    }
+  }
+
+  /** A cumulative ack covering the round's first retransmitted segment proves
+   *  the path delivered: decay the reorder relaxation toward 1. */
+  private resolveFastRound(cum: number): void {
+    if (this.fastRoundSeq < 0) return;
+    if (seqAtOrAfter(cum, this.fastRoundSeq)) {
+      this.retxRelax = Math.max(1, Math.round(this.retxRelax * 0.8 * 100) / 100);
+      this.fastRoundSeq = -1;
     }
   }
 
@@ -612,14 +676,43 @@ export class Stream {
     // is resent within one round trip. Same ack, no extra state on the wire.
     else if (this.oobBytes > 0 && nowMs - this.lastAckMs >= HOLE_DUP_ACK_MS) this.emitAck(nowMs);
     if (nowMs - this.lastInboundMs >= this.cfg.idleTimeoutMs) { this.finish('idle'); return; }
+    // Tail-loss probe: everything queued is on the wire and only the tail is
+    // unconfirmed. Nothing after it will ever produce a duplicate ack, so
+    // without a probe the tail waits out the full backed-off RTO. Resend the
+    // tail segment early — the duplicate makes the receiver answer at once,
+    // and the probe budget resets as soon as cum moves again.
+    if (this.tx.length > 0 && this.pendingBytes === 0 && !this.finPending &&
+        this.window() > 0 && this.tlpProbes < TLP_MAX_PROBES) {
+      const pto = Math.max(TLP_MIN_PTO_MS, Math.round(this.srttMs + 2 * this.rttvarMs));
+      if (nowMs - this.lastSendMs >= pto) {
+        const tail = this.tx[this.tx.length - 1]!;
+        this.emitData(tail, nowMs);
+        ++tail.retransmits;
+        ++this.retransmits;
+        tail.sentMs = nowMs;
+        ++this.tlpProbes;
+      }
+    }
+    // A fast-retransmit round that bought nothing within 1.5 sRTT points at
+    // reordering rather than loss: relax the next round's age base (up to 2x).
+    if (this.fastRoundSeq >= 0 && nowMs - this.fastRoundMs >= Math.round(1.5 * this.srttMs)) {
+      if (this.sndUna === this.fastRoundUna) {
+        this.retxRelax = Math.min(2, Math.round(this.retxRelax * 1.3 * 100) / 100);
+      } else {
+        this.retxRelax = Math.max(1, Math.round(this.retxRelax * 0.8 * 100) / 100);
+      }
+      this.fastRoundSeq = -1;
+    }
     // Retransmission timeout: resend the oldest unacked, unsacked segment.
+    // The per-segment 2^retransmits deadline IS the backoff; a global rtoMs
+    // doubling here would make the *next* segment's first RTO pay for this
+    // one's loss (six losses inflated the timer 64x on the old loop).
     for (const s of this.tx) {
       if (s.acked || s.sacked) continue;
       if (nowMs - s.sentMs >= this.rtoMs * (1 << Math.min(s.retransmits, 5))) {
-        this.emitData(s);
+        this.emitData(s, nowMs);
         ++s.retransmits; ++this.retransmits; ++this.retxRto;
         s.sentMs = nowMs;
-        this.rtoMs = Math.min(this.rtoMs * 2, this.cfg.rtoMaxMs);
         break;
       }
     }
@@ -652,7 +745,7 @@ export class Stream {
     this.tx.push(seg);
     this.sndNext = end;
     if (seqAfter(end, this.sndMax)) this.sndMax = end;
-    this.emitData(seg);
+    this.emitData(seg, nowMs);
   }
 
   private finish(reason: string): void {

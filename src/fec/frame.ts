@@ -73,7 +73,7 @@ export class FrameTx {
     this.maybeFlush(nowMs);
     if (this.n === 0) { this.k = this.nextK; this.symbolMax = 0; this.symbols = []; }
     const symLen = seg.length + 2;
-    const symbol = Buffer.alloc(symLen);
+    const symbol = Buffer.allocUnsafe(symLen); // len + payload fully written
     putLe16(symLen, symbol, 0);
     Buffer.from(seg).copy(symbol, 2);
     this.symbolMax = Math.max(this.symbolMax, symLen);
@@ -194,7 +194,8 @@ export class FrameRx {
     setsExpected: 0, dataExpected: 0, parityExpected: 0, setsKUnknown: 0,
     ledgerGroups: 0, ledgerFailed: 0, ledgerKHist: new Array(8).fill(0),
   };
-  readonly repairLatencies: number[] = [];
+  // (No per-recovery latency array here: it was write-only and grew for the
+  // whole session. The FecstatReporter keeps its own per-interval list.)
 
   constructor(o: FrameRxOptions) {
     this.d = o.d; this.p = o.p;
@@ -292,12 +293,14 @@ export class FrameRx {
     if (set.parity.has(hdr.index)) return;
     if (!set.nKnown && set.maxDataIndex >= nNew) { ++this.counters.structFail; return; }
     set.n = nNew; set.nKnown = true;
-    set.parity.set(hdr.index, symbol);
-    this.store(set, hdr.index, symbol);
+    // Only register the parity when the byte budget accepted it, otherwise
+    // retirement would subtract bytes that were never added and the global
+    // budget could drift below zero, silently disabling the ceiling.
+    if (this.store(set, hdr.index, symbol)) set.parity.set(hdr.index, symbol);
     this.tryDecode(set, nowMs);
   }
 
-  private store(set: RxSet, idx: number, symbol: Buffer): void {
+  private store(set: RxSet, idx: number, symbol: Buffer): boolean {
     set.hasAnySymbol = true;
     set.symbolMax = Math.max(set.symbolMax, symbol.length);
     const old = set.data.get(idx);
@@ -306,10 +309,11 @@ export class FrameRx {
       // Same policy as frame_rx.cc: dropping is recovered by the peer's ARQ,
       // growing the heap is not. Index masks stay set, exactly as in C++.
       ++this.counters.symbolBudgetDrops;
-      return;
+      return false;
     }
     this.symbolBytes += symbol.length - oldLen;
     set.data.set(idx, symbol);
+    return true;
   }
 
   private setBytes(set: RxSet): number {
@@ -355,7 +359,6 @@ export class FrameRx {
       set.recov.add(i);
       set.data.set(i, s);
       const repairMs = Math.min(0xffff, Math.max(0, nowMs - set.tFirstMs));
-      this.repairLatencies.push(repairMs);
       const late = set.accounted;
       if (late) ++this.counters.recoveredLate; else ++this.counters.recovered;
       ++this.counters.dataDelivered;
@@ -478,13 +481,13 @@ export class FrameRx {
 
 /** §4.7: oob headers carry set_id = 0, index = 0, type = oob. */
 export function packOobFrame(msg: Uint8Array): Buffer {
-  const out = Buffer.alloc(FEC_HDR_LEN + msg.length);
+  const out = Buffer.allocUnsafe(FEC_HDR_LEN + msg.length);
   packHdr({ setId: 0, index: 0, typeK: packTypeK(0, 0, SymbolType.Oob) }).copy(out, 0);
   Buffer.from(msg).copy(out, FEC_HDR_LEN);
   return out;
 }
 export function packTxFrame(s: TxSymbol): Buffer {
-  const out = Buffer.alloc(FEC_HDR_LEN + s.symbol.length);
+  const out = Buffer.allocUnsafe(FEC_HDR_LEN + s.symbol.length);
   packHdr({ setId: s.setId, index: s.index, typeK: s.typeK }).copy(out, 0);
   s.symbol.copy(out, FEC_HDR_LEN);
   return out;

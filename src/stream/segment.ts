@@ -16,7 +16,7 @@ export type Segment =
   | { type: typeof STREAM_TYPE_RST; code: number };
 
 export function encodeData(seq: number, flags: number, payload: Uint8Array): Buffer {
-  const out = Buffer.alloc(STREAM_DATA_HDR_LEN + payload.length);
+  const out = Buffer.allocUnsafe(STREAM_DATA_HDR_LEN + payload.length);
   out[0] = STREAM_TYPE_DATA;
   putLe32(seq, out, 1);
   out[5] = flags & 0xff;
@@ -24,7 +24,7 @@ export function encodeData(seq: number, flags: number, payload: Uint8Array): Buf
   return out;
 }
 export function encodeAck(cum: number, rwnd: number, sackStart: number, sackEnd: number): Buffer {
-  const out = Buffer.alloc(STREAM_ACK_LEN);
+  const out = Buffer.allocUnsafe(STREAM_ACK_LEN);
   out[0] = STREAM_TYPE_ACK;
   putLe32(cum, out, 1);
   putLe32(rwnd, out, 5);

@@ -373,6 +373,9 @@ function makePair(opts: {
     ...base, sendDirection: Direction.S2C, recvDirection: Direction.C2S, role: HandshakeRole.Server,
     keyUpdate: ku === 'both' || ku === 'server',
   };
+  const clock = { now: 0 };
+  const sReadBySid = new Map<number, Buffer[]>();
+  const sStreamsBySid = new Map<number, { write: (b: Buffer) => number; closeWrite: () => void; isClosed: boolean }>();
   const client = new Session(cCfg, {
     sendWire: (w) => toServer.push(Buffer.from(w)),
     read: (b) => cRead.push(Buffer.from(b)),
@@ -382,12 +385,34 @@ function makePair(opts: {
     sendWire: (w) => toClient.push(Buffer.from(w)),
     read: (b) => sRead.push(Buffer.from(b)),
     closed: (r) => sClosed.push(r),
+    streamHost: {
+      inboundStream: (sid) => ({
+        send: () => {},
+        read: (b) => { const a = sReadBySid.get(sid) ?? []; a.push(Buffer.from(b)); sReadBySid.set(sid, a); },
+        closed: () => {},
+        eof: () => {
+          // Echo a marker when the peer's FIN lands: proves the FIN crossed
+          // the multiplexed session and the sid stream saw it.
+          const st = sStreamsBySid.get(sid);
+          if (st && !st.isClosed) st.write(Buffer.from('EOF-' + sid));
+        },
+      }),
+      streamReady: (sid, stream) => {
+        sStreamsBySid.set(sid, {
+          write: (b) => stream.write(b, clock.now),
+          closeWrite: () => stream.closeWrite(clock.now),
+          get isClosed() { return stream.isClosed; },
+        });
+      },
+      streamClosed: (sid) => { sReadBySid.delete(sid); sStreamsBySid.delete(sid); },
+    },
   });
   client.start(0); server.start(0);
   let now = 0;
   const pump = (ms = 5, rounds = 1): void => {
     for (let n = 0; n < rounds; ++n) {
       now += ms;
+      clock.now = now;
       client.onTick(now); server.onTick(now);
       let guard = 0;
       while ((toServer.length || toClient.length) && guard++ < 100) {
@@ -396,7 +421,7 @@ function makePair(opts: {
       }
     }
   };
-  return { client, server, cRead, sRead, cClosed, sClosed, pump, now: () => now };
+  return { client, server, cRead, sRead, cClosed, sClosed, pump, now: () => now, sReadBySid, sStreamsBySid };
 }
 
 test('full stack: handshake + AEAD + FEC carry bidirectional stream bytes', () => {
@@ -486,3 +511,69 @@ test('#84 key update stays off unless BOTH ends offer TLV type 4', () => {
 });
 
 function hex(b: Uint8Array): string { return Buffer.from(b).toString('hex'); }
+
+// --- M1: session multiplexing ----------------------------------------------
+
+test('M1: mux negotiates between modern peers and sid streams stay independent', () => {
+  const p = makePair();
+  p.pump(5, 12);
+  assert.equal(p.client.muxActive, true, 'both ends offer TLV 5');
+  assert.equal(p.server.muxActive, true);
+
+  const got1: Buffer[] = [], got2: Buffer[] = [], closed: string[] = [];
+  const s1 = p.client.openStream(1, {
+    send: () => {}, read: (b) => got1.push(b), closed: (r) => closed.push('1:' + r), eof: () => {},
+  });
+  const s2 = p.client.openStream(2, {
+    send: () => {}, read: (b) => got2.push(b), closed: (r) => closed.push('2:' + r), eof: () => {},
+  });
+  assert.ok(s1 && s2, 'both sids open');
+  assert.equal(p.client.openStream(1, { send: () => {}, read: () => {}, closed: () => {} }), null,
+    'a taken sid is refused');
+  assert.equal(p.client.openStream(0, { send: () => {}, read: () => {}, closed: () => {} }), null,
+    'sid 0 is the default stream, never opened through openStream');
+
+  // Interleaved writes keep the streams independent.
+  s1!.write(Buffer.from('one-aaa'));
+  s2!.write(Buffer.from('two-bbb'));
+  s1!.write(Buffer.from('-ccc'));
+  p.pump(5, 20);
+  assert.equal(Buffer.concat(p.sReadBySid.get(1) ?? []).toString(), 'one-aaa-ccc');
+  assert.equal(Buffer.concat(p.sReadBySid.get(2) ?? []).toString(), 'two-bbb');
+  assert.equal(p.sRead.join(''), '', 'the default stream stays empty while sid streams run');
+
+  // Closing one sid stream leaves the other fully functional.
+  s1!.closeWrite();
+  p.pump(5, 30);
+  s2!.write(Buffer.from('-more'));
+  p.pump(5, 30);
+  assert.equal(Buffer.concat(p.sReadBySid.get(2) ?? []).toString(), 'two-bbb-more');
+});
+
+test('M1: per-sid streams carry their own FIN and the default stream coexists', () => {
+  const p = makePair();
+  p.pump(5, 12);
+  const gotBack: Buffer[] = [];
+  const s1 = p.client.openStream(3, {
+    send: () => {}, read: (b) => gotBack.push(b), closed: () => {}, eof: () => {},
+  });
+  const big = Buffer.alloc(5000);
+  for (let i = 0; i < big.length; ++i) big[i] = i & 0xff;
+  let off = 0;
+  while (off < big.length) off += s1!.write(big.subarray(off));
+  s1!.closeWrite();
+  // The default stream keeps carrying data alongside.
+  const msg = Buffer.from('default-stream-still-works');
+  assert.equal(p.client.write(msg), msg.length);
+  p.pump(5, 120);
+  const gotSid = Buffer.concat(p.sReadBySid.get(3) ?? []);
+  assert.equal(gotSid.length, big.length, '5000 bytes cross the sid stream');
+  const back = Buffer.concat(gotBack).toString();
+  assert.ok(back.includes('EOF-3'), 'server observed the sid FIN and answered through the same sid stream');
+  assert.equal(Buffer.concat(p.sRead).toString(), msg.toString(), 'default stream unaffected');
+  // The server closes its half too: only then is the sid freed for reuse.
+  p.sStreamsBySid.get(3)?.closeWrite();
+  p.pump(5, 60);
+  assert.equal(p.client.openStream(3, { send: () => {}, read: () => {}, closed: () => {} }) !== null, true,
+    'both halves closed: the sid is freed for reuse');
+});

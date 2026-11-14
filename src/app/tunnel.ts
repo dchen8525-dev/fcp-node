@@ -8,8 +8,10 @@ import { randomBytes } from 'node:crypto';
 import {
   SALT_LEN, Direction, HandshakeRole, DEFAULT_MTU_MIN, DEFAULT_D, DEFAULT_P,
   OPEN_MAX_BYTES, ATYP_DOMAIN, ATYP_IPV4, DATA_WIRE_OVERHEAD, NONCE_LIMIT,
+  MUX_MAX_STREAMS, MUX_SESSION_POOL,
 } from '../constants.ts';
 import { Session, type SessionConfig } from '../session/session.ts';
+import { Stream, type StreamCallbacks } from '../stream/stream.ts';
 import { sealReset } from '../crypto/envelope.ts';
 import {
   detectEntry, socks5ParseGreeting, socks5GreetingReply, socks5ParseRequest,
@@ -55,10 +57,38 @@ export interface TunnelOptions {
 
 interface Binding {
   session: Session;
-  rinfo?: RemoteInfo;
+  /** M1: per-sid tunnels on a multiplexed session (server side). */
+  sidTunnels?: Map<number, ServerTunnel>;
+  /** Latest authenticated peer address. Mutable on purpose: sendWire reads it
+   *  on every datagram, so a NAT rebinding mid-session is followed instead of
+   *  starving the tunnel for 135 s. */
+  addr?: { host: string; port: number };
   cleanup: () => void;
   trace?: TraceSink;
 }
+
+/** M1: the session every eligible local connection multiplexes onto. */
+interface SharedClientSession {
+  session: Session;
+  key: string;
+  sids: Set<number>;
+  /** Attached connections riding this session, keyed by sid. */
+  streams: Map<number, ConnStreamState>;
+  trace?: TraceSink;
+}
+/** Client-side state of one attached connection (freed on stream close). */
+interface ConnStreamState {
+  sock: TcpSocket;
+  kill: (reason: string) => void;
+}
+
+/** Per-IP session creation budget: a browser page load opens dozens of local
+ *  TCP connections (one FCP session each), so the cap must sit far above that
+ *  while still cutting a garbage-flood's allocation churn to noise. */
+const MAX_NEW_SESSIONS_PER_IP = 64;
+const RATE_WINDOW_MS = 1000;
+/** Bound the bookkeeping maps: a spoofed-source flood must not grow them. */
+const RATE_MAP_MAX = 4096;
 
 function nowMs(): number { return Date.now(); }
 
@@ -142,6 +172,12 @@ export class TunnelClient {
   private udp: UdpSocket;
   private tcp: TcpServer;
   private sessions = new Map<string, Binding>();
+  /** M1: eligible local connections multiplex onto up to MUX_SESSION_POOL
+   *  shared sessions, assigned round-robin — each session is an independent
+   *  window and an independent loss/NAT domain, so concurrent streams
+   *  aggregate their throughput instead of queueing behind one window. */
+  private pool: SharedClientSession[] = [];
+  private poolNext = 0;
   private timer: NodeJS.Timeout | null = null;
   private statsTimer: NodeJS.Timeout | null = null;
   private opts: TunnelOptions;
@@ -165,7 +201,13 @@ export class TunnelClient {
     this.log = opts.log ?? (() => {});
     this.dbg = opts.debugLog ?? (() => {});
     this.udp = createSocket('udp4');
-    this.tcp = createServer((sock) => this.onLocalConnection(sock));
+    // allowHalfOpen is load-bearing: with the default (false), a local app that
+    // half-closes after its upload (request body, "POST + read the response")
+    // makes Node auto-end the proxy socket the moment the app's FIN lands, the
+    // app sees EOF at once, closes fully, and the abort path RSTs the tunnel —
+    // the response never crosses. The endPending/flushPending machinery below
+    // owns the FIN instead: queue the close until the backlog has drained.
+    this.tcp = createServer({ allowHalfOpen: true }, (sock) => this.onLocalConnection(sock));
     this.udp.on('message', (msg, rinfo) => this.onUdp(msg, rinfo));
     this.udp.on('error', (e) => this.log(`udp error: ${e.message}`));
     this.tcp.on('error', (e) => this.log(`tcp error: ${e.message}`));
@@ -222,6 +264,117 @@ export class TunnelClient {
       uptimeMs: this.startedMs === 0 ? 0 : nowMs() - this.startedMs,
     };
   }
+
+  /** M1: create one pool session. Callers attach connections round-robin; a
+   *  session whose negotiation turns out legacy is skipped by the attach
+   *  policy and its connections fall back to per-conn sessions. */
+  private ensurePoolEntry(): SharedClientSession {
+    const salt = randomBytes(SALT_LEN);
+    const key = salt.toString('hex');
+    const trace = sessionTrace(this.opts, 'client', key);
+    const cfg: SessionConfig = {
+      psk: this.opts.psk, salt,
+      sendDirection: Direction.C2S, recvDirection: Direction.S2C,
+      role: HandshakeRole.Client,
+      d: this.opts.d ?? DEFAULT_D, p: this.opts.p ?? DEFAULT_P,
+      mtu: this.opts.mtu ?? DEFAULT_MTU_MIN,
+      pmtuMaxMtu: this.opts.pmtuMaxMtu,
+      pinnedK: this.opts.pinnedK,
+      ack_v2: this.opts.ack_v2, pmtud: this.opts.pmtud, keyUpdate: this.opts.keyUpdate,
+      trace: trace?.write,
+    };
+    const entry: SharedClientSession = {
+      session: null as unknown as Session, key, sids: new Set(), streams: new Map(), trace,
+    };
+    const session = new Session(cfg, {
+      sendWire: (wire) => {
+        if (!this.running) return;
+        this.dbg(`[${key.slice(0, 8)}] udp tx ${wire.length}B -> ${this.opts.host ?? '127.0.0.1'}:${this.opts.port ?? 4460}`);
+        this.bytesTx += wire.length;
+        this.udp.send(wire, this.opts.port ?? 4460, this.opts.host ?? '127.0.0.1');
+      },
+      // Sid streams deliver through the StreamHost; the default stream carries
+      // no connection on a pooled session.
+      read: () => {},
+      closed: () => {
+        // Session-level death (peer_dead, reset, handshake failure): every
+        // attached connection goes down with it.
+        for (const st of entry.streams.values()) st.kill('pool session closed');
+        entry.streams.clear();
+        this.pool = this.pool.filter((p) => p.key !== key);
+      },
+      eof: () => {},
+      streamHost: {
+        // The client opens every stream itself; nothing inbound to accept.
+        inboundStream: () => null,
+        streamClosed: (sid) => {
+          entry.sids.delete(sid);
+          entry.streams.delete(sid);
+        },
+      },
+      log: this.log,
+      debug: this.dbg,
+    });
+    entry.session = session;
+    if (!session.start(nowMs())) { trace?.close(); throw new Error('pool session start failed'); }
+    this.dbg(`[${key.slice(0, 8)}] pool session+ (${this.pool.length + 1}/${MUX_SESSION_POOL}, mux pending negotiation)`);
+    this.pool.push(entry);
+    this.sessions.set(key, {
+      session,
+      cleanup: () => {
+        for (const st of entry.streams.values()) st.kill('session closed');
+        entry.streams.clear();
+        this.pool = this.pool.filter((p) => p.key !== key);
+      },
+      trace,
+    });
+    session.onTick(nowMs());
+    return entry;
+  }
+
+
+  /** M1: attach a local connection round-robin across the session pool.
+   *  Returns null when the caller must build a per-conn session instead
+   *  (legacy negotiation detected, or the round-robin session is full). The
+   *  Stream comes back immediately when the session is already established;
+   *  otherwise sendOpen allocates it once the handshake lands. */
+  private tryAttachPool(sock: TcpSocket, callbacks: StreamCallbacks, kill: (reason: string) => void): { session: Session; entry: SharedClientSession; sid: number; stream: Stream | null } | null {
+    // Legacy gate: if ANY established pool session negotiated without mux,
+    // this peer speaks the single-stream wire — per-conn sessions for all.
+    for (const p of this.pool) {
+      if (p.session.established && !p.session.muxActive) return null;
+    }
+    // Grow the pool toward the cap on the first MUX_SESSION_POOL attaches so
+    // even a simultaneous burst disperses across sessions deterministically.
+    const want = Math.min(MUX_SESSION_POOL, this.poolNext + 1);
+    while (this.pool.length < want) this.ensurePoolEntry();
+    const entry = this.pool[this.poolNext % this.pool.length];
+    ++this.poolNext;
+    if (entry.session.established && !entry.session.muxActive) return null;
+    if (entry.sids.size >= MUX_MAX_STREAMS) return null;
+    let sid = 0;
+    for (let i = 1; i <= MUX_MAX_STREAMS; ++i) if (!entry.sids.has(i)) { sid = i; break; }
+    if (sid === 0) return null;
+    entry.sids.add(sid);
+    entry.streams.set(sid, { sock, kill });
+    const stream = entry.session.established && entry.session.muxActive
+      ? entry.session.openStream(sid, callbacks)
+      : null;
+    if (stream === null && entry.session.established) {
+      // Established sessions must be able to open a reserved sid; failing here
+      // would strand the connection.
+      entry.sids.delete(sid);
+      entry.streams.delete(sid);
+      return null;
+    }
+    return { session: entry.session, entry, sid, stream };
+  }
+
+  private releasePoolSid(entry: SharedClientSession, sid: number): void {
+    entry.sids.delete(sid);
+    entry.streams.delete(sid);
+  }
+
 
   private emitStats(): void {
     const now = nowMs();
@@ -287,7 +440,10 @@ export class TunnelClient {
           `recvNext=${b.session.recvNext} ` +
           `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B`);
       }
-      if (b.session.streamRef.isClosed) { this.sessions.delete(key); b.cleanup(); b.trace?.close(); }
+      // Session-level isClosed only: on a shared mux session the default
+      // stream may idle out while sid streams live — that must not tear the
+      // session down (the default stream's close callback already guards).
+      if (b.session.isClosed) { this.sessions.delete(key); b.cleanup(); b.trace?.close(); }
     }
   }
 
@@ -306,14 +462,44 @@ export class TunnelClient {
     let handshakeWait: NodeJS.Timeout | null = null;
     let endPending = false;
     let streamRead: (b: Buffer) => void = () => {};
+    // M1: attached-shared connections write through their sid stream;
+    // per-conn sessions write through the session's default stream.
+    let connStream: Stream | null = null;
+    let attachedShared = false;
+    let attachedEntry: SharedClientSession | null = null;
+    let connSid = 0;
+    let writeConn: (b: Buffer) => number = () => 0;
+    let consumedConn: (n: number) => void = () => {};
+    let closeWriteConn: () => void = () => {};
+    let rstConn: () => void = () => {};
+    let connClosedNow = (): boolean => true;
     const pendingLocal: Buffer[] = [];
     let pendingLocalBytes = 0;
     let localPaused = false;
     let drainTimer: NodeJS.Timeout | null = null;
     const replyParser = new PrefixParser(openParseReply);
 
+    const killConn = (reason: string) => {
+      if (dead) return;
+      dead = true;
+      this.dbg(`[${saltKey.slice(0, 8)}] local conn killed: ${reason}`);
+      sock.destroy();
+    };
+
+    // The per-sid Stream and the legacy default stream share one callback
+    // shape; makeStream overrides send/closed, the rest lands here.
+    const streamCallbacks: StreamCallbacks = {
+      send: () => {},
+      read: (b: Buffer) => streamRead(b),
+      closed: (reason: string) => {
+        if (!dead) { dead = true; sock.destroy(); }
+      },
+      eof: () => { if (!sock.destroyed) sock.end(); },
+    };
+
     const destroy = (buf?: Buffer) => {
       if (dead) return;
+      dead = true; // no second reply, no further data handling while the 30 ms drain runs
       if (buf && !sock.destroyed) sock.write(buf);
       setTimeout(() => sock.destroy(), 30);
     };
@@ -336,7 +522,7 @@ export class TunnelClient {
     const flushPending = () => {
       while (pendingLocal.length && session) {
         const b = pendingLocal[0];
-        const n = session.write(b);
+        const n = writeConn(b);
         if (n <= 0) break;
         pendingLocalBytes -= n;
         if (n < b.length) { pendingLocal[0] = b.subarray(n); break; }
@@ -348,7 +534,7 @@ export class TunnelClient {
       }
       if (session && !pendingLocal.length && endPending) {
         endPending = false;
-        session.closeWrite();
+        closeWriteConn();
       }
       // Whatever the write window still holds continues on the tick; without a
       // timer it waited for another local data event, which may never come.
@@ -370,10 +556,21 @@ export class TunnelClient {
         return;
       }
       if (handshakeWait) { clearTimeout(handshakeWait); handshakeWait = null; }
+      if (attachedShared && !connStream) {
+        // The handshake just landed and negotiated multiplexing: allocate this
+        // connection's sid stream before any byte flows.
+        connStream = session.openStream(connSid, streamCallbacks);
+        if (!connStream) { destroy(); return; }
+        writeConn = (b) => connStream!.write(b, nowMs());
+        consumedConn = (n) => connStream!.consumed(n);
+        closeWriteConn = () => connStream!.closeWrite(nowMs());
+        rstConn = () => connStream!.sendRst();
+        connClosedNow = () => connStream!.isClosed;
+      }
       const open = openWriteRequest(target);
       if (!open) { destroy(); return; }
       opened = true;
-      this.dbg(`[${saltKey.slice(0, 8)}] OPEN tx ${open.length}B -> ${targetText(target)}`);
+      this.dbg(`[${saltKey.slice(0, 8)}] OPEN tx ${open.length}B -> ${targetText(target)} (sid ${attachedShared ? connSid : 0})`);
       // Queue rather than write: a short Stream.write must keep its remainder,
       // and the first payload may not overtake the OPEN.
       queueLocal(open);
@@ -388,8 +585,8 @@ export class TunnelClient {
       // immediate consumed() let a slow reader grow Node's writable buffer
       // without bound.
       const writeAndConsume = (b: Buffer, len: number) => {
-        if (sock.destroyed || b.length === 0) { session?.consumed(len); return; }
-        sock.write(b, () => session?.consumed(len));
+        if (sock.destroyed || b.length === 0) { consumedConn(len); return; }
+        sock.write(b, () => consumedConn(len));
       };
       if (replyParser.done) {
         this.dbg(`[${saltKey.slice(0, 8)}] tunnel->local ${bytes.length}B`);
@@ -397,24 +594,52 @@ export class TunnelClient {
         return;
       }
       const rest = replyParser.push(bytes);
-      if (!replyParser.done) { session?.consumed(bytes.length); return; }
+      if (!replyParser.done) { consumedConn(bytes.length); return; }
       const r = replyParser.result;
-      if (!r || r.status !== 'ok' || !r.value) { session?.consumed(bytes.length); destroy(); return; }
+      if (!r || r.status !== 'ok' || !r.value) { consumedConn(bytes.length); destroy(); return; }
       this.dbg(`[${saltKey.slice(0, 8)}] OPEN reply rx ok=${r.value.ok} err=${r.value.ok ? 0 : r.value.err} kind=${entryKind}`);
       if (!r.value.ok) {
         const rep = socks5RepForOpenError(r.value.err);
-        session?.consumed(bytes.length);
+        consumedConn(bytes.length);
         destroy(entryKind === 'socks5' ? socks5Reply(rep) : HTTP_BAD_GATEWAY);
         return;
       }
       if (entryKind === 'socks5') sock.write(socks5Reply(Socks5Rep.Succeeded));
       else if (entryKind === 'connect') sock.write(HTTP_OK);
       if (rest.length) writeAndConsume(rest, bytes.length);
-      else session?.consumed(bytes.length);
+      else consumedConn(bytes.length);
       flushPending();
     };
 
-    const setupSession = () => {
+    /** M1: attach round-robin across the session pool (each session an
+     *  independent window and loss domain); fall back to a per-conn session
+     *  for old peers or an exhausted pool. */
+    const openTunnel = (): void => {
+      const attached = this.tryAttachPool(sock, streamCallbacks, killConn);
+      if (attached) {
+        session = attached.session;
+        attachedEntry = attached.entry;
+        saltKey = attached.entry.key;
+        connSid = attached.sid;
+        connStream = attached.stream;
+        attachedShared = true;
+        if (connStream) {
+          writeConn = (b) => connStream!.write(b, nowMs());
+          consumedConn = (n) => connStream!.consumed(n);
+          closeWriteConn = () => connStream!.closeWrite(nowMs());
+          rstConn = () => connStream!.sendRst();
+          connClosedNow = () => connStream!.isClosed;
+        }
+        this.dbg(`[${saltKey.slice(0, 8)}] session+ (shared${attached.stream ? ' established' : ', awaiting handshake'}) local conn -> ${targetText(target)}`);
+        session.onTick(nowMs());
+        sendOpen();
+        return;
+      }
+      createOwnSession();
+      sendOpen();
+    };
+
+    const createOwnSession = (): void => {
       const salt = randomBytes(SALT_LEN);
       saltKey = salt.toString('hex');
       const trace = sessionTrace(this.opts, 'client', saltKey);
@@ -447,8 +672,12 @@ export class TunnelClient {
       this.sessions.set(saltKey, {
         session, cleanup: () => { dead = true; sock.destroy(); }, trace,
       });
+      writeConn = (b) => session!.write(b);
+      consumedConn = (n) => session!.consumed(n);
+      closeWriteConn = () => session!.closeWrite();
+      rstConn = () => session!.streamRef.sendRst();
+      connClosedNow = () => session!.streamRef.isClosed;
       session.onTick(nowMs());
-      sendOpen();
     };
 
     const parseEntry = (): void => {
@@ -498,7 +727,7 @@ export class TunnelClient {
         firstPayload = Buffer.concat([r.value.rewrittenHead, entryBuf.subarray(r.consumed)]);
         entryBuf = Buffer.alloc(0);
       }
-      setupSession();
+      openTunnel();
     };
 
     sock.on('data', (chunk: Buffer) => {
@@ -510,8 +739,15 @@ export class TunnelClient {
         return;
       }
       this.dbg(`[${saltKey.slice(0, 8)}] local rx ${chunk.length}B opened=${opened}`);
-      if (!opened || !session) { queueLocal(chunk); return; }
-      const n = session.write(chunk);
+      // A non-empty pendingLocal means an earlier short write is still waiting
+      // for the window; writing this chunk straight into the stream would
+      // overtake it and reorder the tunnel byte stream. Queue and drain FIFO.
+      if (!opened || !session || pendingLocal.length) {
+        queueLocal(chunk);
+        if (session) flushPending();
+        return;
+      }
+      const n = writeConn(chunk);
       this.dbg(`[${saltKey.slice(0, 8)}] local->tunnel ${n}/${chunk.length}B`);
       if (n < chunk.length) {
         // Keep the remainder ahead of anything that arrives next; the stream's
@@ -529,6 +765,14 @@ export class TunnelClient {
       dead = true;
       if (handshakeWait) clearTimeout(handshakeWait);
       if (drainTimer) { clearInterval(drainTimer); drainTimer = null; }
+      if (attachedShared) {
+        // The sid frees itself via the stream's closed callback
+        // (host.streamClosed). Tell the peer now so its target drains instead
+        // of pushing a window into a socket nobody reads.
+        if (session && session.established && !connClosedNow()) rstConn();
+        else if (attachedEntry) this.releasePoolSid(attachedEntry, connSid);
+        return;
+      }
       if (saltKey) {
         const b = this.sessions.get(saltKey);
         if (b) {
@@ -552,8 +796,13 @@ export class TunnelClient {
 // ---------------------------------------------------------------------------
 
 interface ServerTunnel {
-  session: Session;
-  rinfo: RemoteInfo;
+  key: string;
+  addr: { host: string; port: number };
+  /** The stream this tunnel rides: the session default (sid 0) or a mux sid
+   *  stream. Every write/consume/closeWrite goes through it. */
+  stream: Stream;
+  /** M1 sid this tunnel serves (0 = the session's default tunnel). */
+  sid: number;
   parser: PrefixParser<ProxyTarget>;
   targetSock: TcpSocket | null;
   openDone: boolean;
@@ -568,6 +817,10 @@ interface ServerTunnel {
   paused: boolean;
   pumping: boolean;
   cleanup: () => void;
+  writeBuf: (b: Buffer) => number;
+  consumeBuf: (n: number) => void;
+  closeWriteBuf: () => void;
+  callbacks: () => StreamCallbacks;
   trace?: TraceSink;
 }
 
@@ -580,6 +833,8 @@ export class TunnelServer {
   private running = false;
   private log: (line: string) => void;
   private dbg: (line: string) => void;
+  private newSessionsByIp = new Map<string, { count: number; windowStart: number }>();
+  private resetReplyByIp = new Map<string, number>();
 
   constructor(opts: TunnelOptions) {
     this.opts = opts;
@@ -617,6 +872,40 @@ export class TunnelServer {
 
   get sessionCount(): number { return this.sessions.size; }
 
+  /** S5: per-IP session creation budget. A garbage flood used to pay only
+   *  allocation churn per datagram; now it pays at most 64 new sessions per
+   *  second per source IP. */
+  private allowNewSession(ip: string, now: number): boolean {
+    if (this.newSessionsByIp.size > RATE_MAP_MAX) this.pruneRateMaps(now);
+    const entry = this.newSessionsByIp.get(ip);
+    if (!entry || now - entry.windowStart >= RATE_WINDOW_MS) {
+      this.newSessionsByIp.set(ip, { count: 1, windowStart: now });
+      return true;
+    }
+    if (entry.count >= MAX_NEW_SESSIONS_PER_IP) return false;
+    entry.count += 1;
+    return true;
+  }
+
+  /** S5: stateless reset replies at 1 Hz per peer IP — the same reflector
+   *  guard the client side already had. */
+  private allowResetReply(ip: string, now: number): boolean {
+    if (this.resetReplyByIp.size > RATE_MAP_MAX) this.pruneRateMaps(now);
+    const last = this.resetReplyByIp.get(ip);
+    if (last !== undefined && now - last < RATE_WINDOW_MS) return false;
+    this.resetReplyByIp.set(ip, now);
+    return true;
+  }
+
+  private pruneRateMaps(now: number): void {
+    for (const [ip, e] of this.newSessionsByIp) {
+      if (now - e.windowStart >= RATE_WINDOW_MS * 10) this.newSessionsByIp.delete(ip);
+    }
+    for (const [ip, t] of this.resetReplyByIp) {
+      if (now - t >= RATE_WINDOW_MS * 10) this.resetReplyByIp.delete(ip);
+    }
+  }
+
   private onUdp(msg: Buffer, rinfo: RemoteInfo): void {
     // Anything shorter than an empty data symbol cannot be an FCP datagram;
     // replying to it only turned the server into a reflector for 8-byte junk.
@@ -624,8 +913,23 @@ export class TunnelServer {
     const key = msg.subarray(0, SALT_LEN).toString('hex');
     this.dbg(`[${key.slice(0, 8)}] udp rx ${msg.length}B from ${rinfo.address}:${rinfo.port} known=${this.sessions.has(key)}`);
     const b = this.sessions.get(key);
-    if (b) { b.rinfo = rinfo; b.session.onWire(msg, nowMs()); return; }
+    if (b) {
+      const ok = b.session.onWire(msg, nowMs());
+      // S1: only an AUTHENTICATED datagram moves the reply address. Forging
+      // one requires the PSK, and a spoofed replay is rejected by the nonce
+      // window, so following the source cannot be turned into an amplification
+      // redirect. Without this a NAT rebinding starved the tunnel: every
+      // datagram authenticated fine but every reply flew to the stale address
+      // until the 135 s peer_dead clock killed the session.
+      if (ok && (b.addr.port !== rinfo.port || b.addr.host !== rinfo.address)) {
+        b.addr.host = rinfo.address;
+        b.addr.port = rinfo.port;
+        this.dbg(`[${key.slice(0, 8)}] peer address moved -> ${rinfo.address}:${rinfo.port}; following`);
+      }
+      return;
+    }
     if (this.sessions.size >= MAX_TUNNEL_SESSIONS) return;
+    if (!this.allowNewSession(rinfo.address, nowMs())) return;
     const created = this.createSession(msg.subarray(0, SALT_LEN), rinfo);
     if (!created) return;
     const ok = created.session.onWire(msg, nowMs());
@@ -639,11 +943,14 @@ export class TunnelServer {
     }
     if (!ok) {
       // #86: authenticated-looking traffic for a salt we do not own. Answer
-      // once with a stateless reset under the bootstrap key.
-      const reset = created.session.makeReset();
-      if (reset) {
-        this.dbg(`[${key.slice(0, 8)}] auth failed -> stateless reset tx ${reset.length}B`);
-        this.udp.send(reset, rinfo.port, rinfo.address);
+      // once with a stateless reset under the bootstrap key, at most 1 Hz per
+      // peer IP so a flood cannot turn this path into a reflector.
+      if (this.allowResetReply(rinfo.address, nowMs())) {
+        const reset = created.session.makeReset();
+        if (reset) {
+          this.dbg(`[${key.slice(0, 8)}] auth failed -> stateless reset tx ${reset.length}B`);
+          this.udp.send(reset, rinfo.port, rinfo.address);
+        }
       }
       created.cleanup();
       created.trace?.close();
@@ -666,7 +973,7 @@ export class TunnelServer {
           `recvNext=${b.session.recvNext} ` +
           `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B`);
       }
-      if (b.session.isClosed || b.session.streamRef.isClosed) {
+      if (b.session.isClosed) {
         this.sessions.delete(key);
         b.cleanup(); b.trace?.close();
         this.tunnels.delete(key);
@@ -676,6 +983,11 @@ export class TunnelServer {
     // the target->tunnel backlog outside of the socket callback.
     for (const t of this.tunnels.values()) {
       if (t.pendingToTunnel.length || t.endFromTarget) this.pumpToTunnel(t);
+    }
+    for (const b of this.sessions.values()) {
+      if (b.sidTunnels) for (const t of b.sidTunnels.values()) {
+        if (t.pendingToTunnel.length || t.endFromTarget) this.pumpToTunnel(t);
+      }
     }
   }
 
@@ -692,7 +1004,7 @@ export class TunnelServer {
     try {
       while (t.pendingToTunnel.length) {
         const head = t.pendingToTunnel[0];
-        const n = t.session.write(head);
+        const n = t.writeBuf(head);
         if (n <= 0) break;
         if (n < head.length) { t.pendingToTunnel[0] = head.subarray(n); break; }
         t.pendingToTunnel.shift();
@@ -708,7 +1020,7 @@ export class TunnelServer {
     if (t.paused && sock && !sock.destroyed) { t.paused = false; sock.resume(); }
     if (t.endFromTarget) {
       t.endFromTarget = false;
-      if (!t.session.streamRef.isClosed) t.session.closeWrite();
+      t.closeWriteBuf();
     }
   }
 
@@ -728,17 +1040,29 @@ export class TunnelServer {
     };
     let closed = false;
     let tunnel: ServerTunnel | null = null;
+    /** M1: per-sid tunnels on a multiplexed session (the default tunnel stays
+     *  in `this.tunnels` under the session key). */
+    const sidTunnels = new Map<number, ServerTunnel>();
     const cleanup = () => {
       if (closed) return;
       closed = true;
-      if (tunnel) { tunnel.pendingToTarget.length = 0; tunnel.pendingToTunnel.length = 0; }
-      if (tunnel?.targetSock && !tunnel.targetSock.destroyed) tunnel.targetSock.destroy();
+      const teardown = (t: ServerTunnel) => {
+        t.pendingToTarget.length = 0;
+        t.pendingToTunnel.length = 0;
+        if (t.targetSock && !t.targetSock.destroyed) t.targetSock.destroy();
+      };
+      if (tunnel) teardown(tunnel);
+      for (const t of sidTunnels.values()) teardown(t);
+      sidTunnels.clear();
     };
+    const addr = { host: rinfo.address, port: rinfo.port };
     const session = new Session(cfg, {
       sendWire: (wire) => {
         if (!this.running || closed) return;
-        this.dbg(`[${key.slice(0, 8)}] udp tx ${wire.length}B -> ${rinfo.address}:${rinfo.port}`);
-        this.udp.send(wire, rinfo.port, rinfo.address);
+        // Reads `addr`, not the captured rinfo: onUdp updates addr on every
+        // authenticated datagram, so a NAT rebinding is followed mid-session.
+        this.dbg(`[${key.slice(0, 8)}] udp tx ${wire.length}B -> ${addr.host}:${addr.port}`);
+        this.udp.send(wire, addr.port, addr.host);
       },
       read: (bytes) => { if (tunnel) this.onStreamBytes(tunnel, bytes); },
       closed: (reason) => {
@@ -748,53 +1072,151 @@ export class TunnelServer {
         this.tunnels.delete(key);
       },
       eof: () => { if (tunnel?.targetSock && !tunnel.targetSock.destroyed) tunnel.targetSock.end(); },
+      streamHost: {
+        inboundStream: (sid) => {
+          if (closed) return null;
+          let t = sidTunnels.get(sid);
+          if (t) return { ...t.callbacks() };
+          t = this.newSidTunnel(key, sid, addr, trace, cleanup);
+          sidTunnels.set(sid, t);
+          return { ...t.callbacks() };
+        },
+        streamReady: (sid, stream) => {
+          const t = sidTunnels.get(sid);
+          if (t) t.stream = stream;
+        },
+        streamClosed: (sid) => {
+          const t = sidTunnels.get(sid);
+          if (t) {
+            sidTunnels.delete(sid);
+            this.log(`stream ${key}#${sid} closed`);
+            this.destroyTunnel(t, key);
+          }
+        },
+      },
       log: this.log,
       debug: this.dbg,
     });
     if (!session.start(nowMs())) { trace?.close(); return null; }
     this.dbg(`[${key.slice(0, 8)}] session+ from ${rinfo.address}:${rinfo.port}`);
-    tunnel = {
-      session, rinfo, parser: new PrefixParser(openParseRequest),
-      targetSock: null, openDone: false, openOkSent: false, pendingToTarget: [], pendingToTunnel: [],
-      endFromTarget: false, paused: false, pumping: false, cleanup, trace,
-    };
+    tunnel = this.newDefaultTunnel(session, key, addr, trace, cleanup);
     this.tunnels.set(key, tunnel);
     session.onTick(nowMs());
-    return { session, rinfo, cleanup, trace };
+    return { session, addr, sidTunnels, cleanup, trace };
+  }
+
+  /** The session's default tunnel (sid 0): writes route through the session
+   *  API, exactly as they did before multiplexing existed. */
+  private newDefaultTunnel(session: Session, key: string, addr: { host: string; port: number }, trace: TraceSink | undefined, sessionCleanup: () => void): ServerTunnel {
+    const t: ServerTunnel = {
+      session, key, addr, stream: session.streamRef, sid: 0,
+      parser: new PrefixParser(openParseRequest),
+      targetSock: null, openDone: false, openOkSent: false, pendingToTarget: [], pendingToTunnel: [],
+      endFromTarget: false, paused: false, pumping: false, cleanup: sessionCleanup, trace,
+      writeBuf: (b) => session.write(b),
+      consumeBuf: (n) => session.consumed(n),
+      closeWriteBuf: () => session.closeWrite(),
+      callbacks: () => ({
+        send: () => {},
+        read: (bytes) => { this.onStreamBytes(t, bytes); },
+        closed: () => {},
+        eof: () => { if (t.targetSock && !t.targetSock.destroyed) t.targetSock.end(); },
+      }),
+    };
+    return t;
+  }
+
+  /** M1: a tunnel for an inbound sid stream on a multiplexed session. */
+  private newSidTunnel(key: string, sid: number, addr: { host: string; port: number }, trace: TraceSink | undefined): ServerTunnel {
+    let t: ServerTunnel;
+    t = {
+      key, addr, sid,
+      stream: null as unknown as Stream, // streamReady assigns it before any byte
+      parser: new PrefixParser(openParseRequest),
+      targetSock: null, openDone: false, openOkSent: false, pendingToTarget: [], pendingToTunnel: [],
+      endFromTarget: false, paused: false, pumping: false,
+      cleanup: () => {
+        t.pendingToTarget.length = 0;
+        t.pendingToTunnel.length = 0;
+        if (t.targetSock && !t.targetSock.destroyed) t.targetSock.destroy();
+      },
+      writeBuf: (b) => t.stream.write(b, nowMs()),
+      consumeBuf: (n) => t.stream.consumed(n),
+      closeWriteBuf: () => t.stream.closeWrite(nowMs()),
+      callbacks: () => ({
+        send: () => {},
+        read: (bytes) => { this.onStreamBytes(t, bytes); },
+        closed: () => {},
+        eof: () => { if (t.targetSock && !t.targetSock.destroyed) t.targetSock.end(); },
+      }),
+      trace,
+    };
+    return t;
+  }
+
+  private destroyTunnel(t: ServerTunnel, key: string): void {
+    t.cleanup();
+    if (t.sid === 0) this.tunnels.delete(key);
+  }
+
+  /**
+   * Drain the tunnel->target FIFO with backpressure. Everything queued here is
+   * already consumed (the receive window was released at queue time), so the
+   * queue is bounded by the peer's send window; a `false` from write() keeps
+   * the rest until the socket drains.
+   */
+  private pumpToTarget(t: ServerTunnel): void {
+    const sock = t.targetSock;
+    if (!sock || sock.destroyed || !t.openOkSent) return;
+    while (t.pendingToTarget.length) {
+      const b = t.pendingToTarget[0]!;
+      if (!sock.write(b)) break;
+      t.pendingToTarget.shift();
+    }
   }
 
   private onStreamBytes(t: ServerTunnel, bytes: Buffer): void {
     if (t.openDone) {
       const sock = t.targetSock;
-      if (sock && !sock.destroyed) {
-        // Release the receive window only once the local TCP socket flushed:
-        // otherwise a slow target lets Node's writable buffer grow without
-        // bound while the peer keeps filling a window we never close.
-        sock.write(bytes, () => t.session.consumed(bytes.length));
-      } else {
+      if (!sock || sock.destroyed) {
         // Target is gone (OPEN was refused, connect failed, or the socket was
         // destroyed). Drop rather than queue forever.
-        t.session.consumed(bytes.length);
+        t.consumeBuf(bytes.length);
+        return;
       }
+      // Before 'connect' fires (or while a backlog is waiting), bytes must not
+      // bypass pendingToTarget: Node flushes its connect buffer ahead of any
+      // later write, so a direct sock.write() here would overtake the OPEN
+      // payload and reorder the stream. Everything goes through the FIFO.
+      if (!t.openOkSent || t.pendingToTarget.length) {
+        t.pendingToTarget.push(bytes);
+        t.consumeBuf(bytes.length);
+        this.pumpToTarget(t);
+        return;
+      }
+      // Release the receive window only once the local TCP socket flushed:
+      // otherwise a slow target lets Node's writable buffer grow without
+      // bound while the peer keeps filling a window we never close.
+      sock.write(bytes, () => t.consumeBuf(bytes.length));
       return;
     }
     const rest = t.parser.push(bytes);
-    if (!t.parser.done) { t.session.consumed(bytes.length); return; }
+    if (!t.parser.done) { t.consumeBuf(bytes.length); return; }
     const r = t.parser.result;
     if (!r || r.status !== 'ok' || !r.value) {
       // Refuse once and stop parsing: every later byte used to re-enter this
       // branch and emit another OPEN_ERR, while the session stayed open.
       t.openDone = true;
-      t.session.consumed(bytes.length);
-      t.session.write(openWriteErr(OpenError.NotSupported));
-      t.session.closeWrite();
+      t.consumeBuf(bytes.length);
+      t.writeBuf(openWriteErr(OpenError.NotSupported));
+      t.closeWriteBuf();
       return;
     }
     t.openDone = true;
-    t.session.consumed(bytes.length);
+    t.consumeBuf(bytes.length);
     if (rest.length) t.pendingToTarget.push(rest);
     const target = r.value;
-    this.dbg(`[${t.session.salt.toString('hex').slice(0, 8)}] OPEN rx target=${targetText(target)}:${target.port} firstPayload=${rest.length}B`);
+    this.dbg(`[${t.key.slice(0, 8)}] OPEN rx target=${targetText(target)}:${target.port} firstPayload=${rest.length}B`);
     const host = dialHost(target);
     const sock = connect({ host, port: target.port, family: target.atyp === 0x04 ? 6 : 4 });
     t.targetSock = sock;
@@ -803,51 +1225,43 @@ export class TunnelServer {
     sock.on('connect', () => {
       sock.setTimeout(0);
       this.log(`target connected: ${targetText(target)}`);
-      this.dbg(`[${t.session.salt.toString('hex').slice(0, 8)}] target connected -> OPEN_OK tx`);
+      this.dbg(`[${t.key.slice(0, 8)}] target connected -> OPEN_OK tx`);
       t.openOkSent = true;
-      t.session.write(openWriteOk());
+      t.writeBuf(openWriteOk());
       // OPEN is followed by the client's first application bytes (e.g. a TLS
       // ClientHello). They belong on the target socket, not back in the tunnel.
-      while (t.pendingToTarget.length) {
-        const b = t.pendingToTarget.shift()!;
-        if (!sock.write(b)) { t.pendingToTarget.unshift(b); break; }
-      }
+      this.pumpToTarget(t);
     });
-    sock.on('drain', () => {
-      while (t.pendingToTarget.length) {
-        const b = t.pendingToTarget.shift()!;
-        if (!sock.write(b)) { t.pendingToTarget.unshift(b); break; }
-      }
-    });
+    sock.on('drain', () => this.pumpToTarget(t));
     sock.on('data', (chunk: Buffer) => {
       t.pendingToTunnel.push(chunk);
       this.pumpToTunnel(t);
-      this.dbg(`[${t.session.salt.toString('hex').slice(0, 8)}] target->tunnel ${chunk.length}B backlog=${t.pendingToTunnel.length}`);
+      this.dbg(`[${t.key.slice(0, 8)}] target->tunnel ${chunk.length}B backlog=${t.pendingToTunnel.length}`);
     });
     sock.on('end', () => {
       t.endFromTarget = true;
       this.pumpToTunnel(t); // FIN only after the backlog is written
     });
     sock.on('timeout', () => {
-      if (!t.openOkSent) t.session.write(openWriteErr(OpenError.TargetTimeout));
-      t.session.closeWrite();
+      if (!t.openOkSent) t.writeBuf(openWriteErr(OpenError.TargetTimeout));
+      t.closeWriteBuf();
       sock.destroy();
     });
     sock.on('error', (e) => {
-      this.dbg(`[${t.session.salt.toString('hex').slice(0, 8)}] target error: ${e.message}`);
+      this.dbg(`[${t.key.slice(0, 8)}] target error: ${e.message}`);
       this.log(`target error ${targetText(target)}: ${e.message}`);
       // Only a pre-connect failure is still an OPEN reply. After OPEN_OK the
       // client is parsing response bytes, so an OPEN_ERR frame there would be
       // delivered to the local application as garbage; EOF is the signal.
       if (!t.openOkSent) {
-        t.session.write(openWriteErr(e.message.includes('ENOTFOUND') ? OpenError.Dns : OpenError.Refused));
+        t.writeBuf(openWriteErr(e.message.includes('ENOTFOUND') ? OpenError.Dns : OpenError.Refused));
       }
       // Queue the error and FIN, then let the stream flush on the next ticks.
       // Calling cleanup() here would flip `closed`, and sendWire() drops every
       // datagram once that is set: the error would never reach the client and
       // the session would linger in the map as a send-dead zombie while the
       // peer keeps retrying.
-      t.session.closeWrite();
+      t.closeWriteBuf();
       sock.destroy();
     });
   }

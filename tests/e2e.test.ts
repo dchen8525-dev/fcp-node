@@ -206,3 +206,178 @@ test('e2e: wrong PSK cannot establish a tunnel', async (t) => {
     'an unauthenticated datagram is answered with #86 reset and leaves no session behind');
   sock.destroy();
 });
+
+test('e2e: window-pressure integrity — bursty upload + paced download stay byte-exact', async (t) => {
+  // Both reorder traps live under backpressure: a short Stream.write leaves a
+  // remainder queued at the tunnel, and the next local data event must never
+  // overtake it (client side), just as pre-connect stream bytes must never
+  // overtake the OPEN payload (server side). This test saturates the windows
+  // in both directions and checks every byte at the far end.
+  const UPLOAD = 3 * 1024 * 1024;
+  const DOWNLOAD = 2 * 1024 * 1024;
+  let uploadBad = false;
+  const origin = createServer((sock) => {
+    let rx = 0;
+    sock.on('data', (b: Buffer) => {
+      for (let i = 0; i < b.length; ++i) {
+        if (b[i] !== ((rx + i) & 0xff)) { uploadBad = true; sock.destroy(); return; }
+      }
+      rx += b.length;
+      // Read slower than the tunnel delivers: the server's tunnel->target
+      // write backpressures, the advertised rwnd collapses, and the client's
+      // session.write starts returning short (residue lands in pendingLocal).
+      sock.pause();
+      setTimeout(() => sock.resume(), 40);
+    });
+    sock.on('end', () => {
+      if (uploadBad || rx !== UPLOAD) { sock.destroy(); return; }
+      let off = 0;
+      const writeChunk = () => {
+        while (off < DOWNLOAD) {
+          const len = Math.min(64 * 1024, DOWNLOAD - off);
+          const body = Buffer.alloc(len).map((_, i) => (off + i) & 0xff);
+          off += len;
+          if (!sock.write(body)) { setTimeout(writeChunk, 4); return; }
+        }
+        sock.end();
+      };
+      writeChunk();
+    });
+  });
+  await listen(origin, 0);
+  const targetPort = portOf(origin);
+  const udpPort = freePort(), proxyPort = freePort();
+  const server = new TunnelServer({ psk: PSK, port: udpPort, log: () => {} });
+  const client = new TunnelClient({ psk: PSK, host: '127.0.0.1', port: udpPort, listenPort: proxyPort, log: () => {} });
+  await server.start();
+  await client.start();
+  t.after(() => { client.stop(); server.stop(); origin.close(); });
+
+  const outcome = await withTimeout(new Promise<{ downBad: boolean; down: number }>((resolve, reject) => {
+    const sock = connect(proxyPort, '127.0.0.1');
+    let stage: 'greet' | 'req' | 'stream' = 'greet';
+    let sentUp = 0;
+    let rxDown = 0;
+    let downBad = false;
+    const upload = Buffer.alloc(UPLOAD).map((_, i) => i & 0xff);
+    const fail = (e: Error) => { sock.destroy(); reject(e); };
+    sock.setTimeout(25000, () => fail(new Error(`stress timeout up=${sentUp} down=${rxDown}`)));
+    sock.on('error', fail);
+    const sendNext = () => {
+      if (sentUp >= UPLOAD) { sock.end(); return; }
+      // Many mid-size data events with 1 ms gaps: between two of them an ACK
+      // opens the send window, which is exactly the interleaving that used to
+      // let a direct write overtake the queued remainder.
+      const len = Math.min(16384 + Math.floor(Math.random() * 16384), UPLOAD - sentUp);
+      sock.write(upload.subarray(sentUp, sentUp + len));
+      sentUp += len;
+      setTimeout(sendNext, 1);
+    };
+    sock.on('connect', () => sock.write(Buffer.from([5, 1, 0])));
+    sock.on('data', (b: Buffer) => {
+      if (stage === 'greet') {
+        if (b[0] !== 5 || b[1] !== 0) return fail(new Error('greeting rejected'));
+        stage = 'req';
+        sock.write(Buffer.concat([
+          Buffer.from([5, 1, 0, 1, 127, 0, 0, 1]),
+          Buffer.from([(targetPort >>> 8) & 0xff, targetPort & 0xff]),
+        ]));
+        return;
+      }
+      if (stage === 'req') {
+        if (b[1] !== 0) return fail(new Error('socks connect refused'));
+        stage = 'stream';
+        sendNext();
+        return;
+      }
+      for (let i = 0; i < b.length; ++i) {
+        if (b[i] !== ((rxDown + i) & 0xff)) { downBad = true; break; }
+      }
+      rxDown += b.length;
+      // Read slower than the tunnel delivers so the server->client direction
+      // also runs with a closed window and a pending backlog.
+      sock.pause();
+      setTimeout(() => sock.resume(), 10);
+    });
+    sock.on('end', () => { sock.destroy(); resolve({ downBad, down: rxDown }); });
+    sock.on('close', () => resolve({ downBad, down: rxDown }));
+  }), 40000, 'stress round trip');
+
+  assert.equal(uploadBad, false, 'client->tunnel bytes arrived in order at the origin');
+  assert.equal(outcome.downBad, false, 'tunnel->client bytes arrived in order at the local app');
+  assert.equal(outcome.down, DOWNLOAD, `full download crossed the tunnel (${outcome.down}/${DOWNLOAD})`);
+});
+
+test('e2e: concurrent connections multiplex over a single session', async (t) => {
+  // M1: N local TCP connections ride ONE shared FCP session (sid streams).
+  // Five concurrent echo downloads of distinct patterns must all stay
+  // byte-exact, and the client must end with exactly one session.
+  const N = 5, SIZE = 96 * 1024;
+  const origin = createServer((sock) => {
+    sock.on('data', (b: Buffer) => sock.write(b)); // echo
+    sock.on('end', () => sock.end());
+  });
+  await listen(origin, 0);
+  const targetPort = portOf(origin);
+  const udpPort = freePort(), proxyPort = freePort();
+  const server = new TunnelServer({ psk: PSK, port: udpPort, log: () => {} });
+  const client = new TunnelClient({ psk: PSK, host: '127.0.0.1', port: udpPort, listenPort: proxyPort, log: () => {} });
+  await server.start();
+  await client.start();
+  t.after(() => { client.stop(); server.stop(); origin.close(); });
+
+  const oneConn = (n: number) => new Promise<void>((resolve, reject) => {
+    const sock = connect(proxyPort, '127.0.0.1');
+    let stage = 'greet';
+    const sent: Buffer[] = [];
+    const got: Buffer[] = [];
+    let gotBytes = 0;
+    sock.setTimeout(15000, () => { sock.destroy(); reject(new Error(`conn ${n} timeout`)); });
+    sock.on('error', reject);
+    const sendNext = () => {
+      // one 16 KB write per event, pattern = n*16 + (byte & 0x3f) so the five
+      // streams' payloads are distinguishable
+      if (sent.length >= SIZE / 16384) { sock.end(); return; }
+      const chunk = Buffer.alloc(16384).map((_, i) => (n * 16 + ((sent.length * 16384 + i) & 0x3f)) & 0xff);
+      sent.push(chunk);
+      sock.write(chunk);
+      setTimeout(sendNext, 1);
+    };
+    sock.on('connect', () => sock.write(Buffer.from([5, 1, 0])));
+    sock.on('data', (b: Buffer) => {
+      if (stage === 'greet') {
+        if (b[1] !== 0) return reject(new Error('greeting refused'));
+        stage = 'req';
+        sock.write(Buffer.concat([
+          Buffer.from([5, 1, 0, 1, 127, 0, 0, 1]),
+          Buffer.from([(targetPort >>> 8) & 0xff, targetPort & 0xff]),
+        ]));
+        return;
+      }
+      if (stage === 'req') {
+        if (b[1] !== 0) return reject(new Error(`conn ${n} refused`));
+        stage = 'echo';
+        sendNext();
+        return;
+      }
+      got.push(b);
+      gotBytes += b.length;
+      if (gotBytes >= SIZE) {
+        const all = Buffer.concat(got).subarray(0, SIZE);
+        for (let i = 0; i < SIZE; ++i) {
+          if (all[i] !== (n * 16 + (i & 0x3f)) & 0xff) {
+            return reject(new Error(`conn ${n} corrupt at ${i}`));
+          }
+        }
+        sock.destroy();
+        resolve();
+      }
+    });
+    sock.on('close', () => { if (gotBytes < SIZE) reject(new Error(`conn ${n} closed early at ${gotBytes}`)); });
+  });
+
+  await Promise.all([0, 1, 2, 3, 4].map((n) => oneConn(n)));
+  // M1 round-robin pool: 5 connections disperse across the 2-session cap,
+  // each session an independent window and loss domain.
+  assert.equal(client.sessionCount, 2, `round-robin pool disperses connections across 2 sessions (got ${client.sessionCount})`);
+});

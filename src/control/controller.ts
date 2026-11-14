@@ -66,6 +66,12 @@ export class AdaptiveFec {
    *  fallback: it describes the *inbound* direction, and using it to size
    *  outbound parity is wrong on an asymmetric link. */
   private peerReports = false;
+  /** Below-threshold accumulation: a slow path (< FEC_LOSS_MIN_SHARDS per
+   *  report) used to be a permanent blind spot — k never moved on it. Samples
+   *  from consecutive reports are summed until the noise floor is crossed,
+   *  then evaluated as one window. */
+  private pendExpected = 0;
+  private pendOrig = 0;
   private trace?: (line: string) => void;
 
   constructor(cfg: ControllerConfig = {}) {
@@ -148,10 +154,26 @@ export class AdaptiveFec {
     // FECSTAT counters are per interval (the reporter emits deltas), exactly
     // like the C++ settlement view. `data_expected` is Σ n_used over the sets
     // settled in this interval, so short flush groups cannot inflate the
-    // denominator the way `groups x d` did.
+    // denominator the way `groups x d` did. Samples below the noise floor are
+    // summed across reports so a slow path (~120 KB/s and under) eventually
+    // crosses FEC_LOSS_MIN_SHARDS and gets a k decision too.
     const expected = stat.dataExpected >>> 0;
     const rxOrig = stat.dataRxOrig >>> 0;
-    if (expected < FEC_LOSS_MIN_SHARDS) return;
+    if (expected < FEC_LOSS_MIN_SHARDS) {
+      this.pendExpected += expected;
+      this.pendOrig += rxOrig;
+      if (this.pendExpected < FEC_LOSS_MIN_SHARDS) return;
+      const evalExpected = this.pendExpected;
+      const evalOrig = this.pendOrig;
+      this.pendExpected = 0;
+      this.pendOrig = 0;
+      this.peerReports = true;
+      const lost = Math.max(0, Math.min(evalExpected, evalExpected - evalOrig));
+      this.adjust(lost / evalExpected, 'fecstat_loss');
+      return;
+    }
+    this.pendExpected = 0;
+    this.pendOrig = 0;
     this.peerReports = true;
     const lost = Math.max(0, Math.min(expected, expected - rxOrig));
     this.adjust(lost / expected, 'fecstat_loss');
@@ -222,13 +244,6 @@ export class BbrLite {
     if (this.bwBytesPerMs <= 0) return 0;
     return Math.max(0, bytes / this.bwBytesPerMs);
   }
-}
-
-export interface ReporterStats {
-  accountedThroughSetId: number;
-  authFail: number; structFail: number;
-  dataBytesRx: number; parityBytesRx: number;
-  repairLatencies: number[];
 }
 
 /** The settlement counters FECSTAT carries, snapshotted per interval. */

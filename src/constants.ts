@@ -64,6 +64,17 @@ export const TLV_TYPE_PREWARM = 3;
 // The roll itself is derived from the counter, so there is nothing else to carry;
 // what this buys is knowing that turning it on will not desync the peer.
 export const TLV_TYPE_KEY_UPDATE = 4;
+/** Session multiplexing (M1): both ends offer → every DATA symbol payload
+ *  gains a 1-byte stream id prefix (0 = the session's default stream), and
+ *  each id carries its own FCP-STREAM byte stream. Old peers never offer it
+ *  and see today's single-stream wire, byte for byte. */
+export const TLV_TYPE_MULTIPLEX = 5;
+export const MUX_MAX_STREAMS = 255; // stream ids 1..255; 0 = default stream
+/** Client-side session pool: eligible local connections round-robin across
+ *  this many shared sessions (each an independent window and loss domain).
+ *  2 doubles the aggregate window; more sessions = more handshakes and cold
+ *  windows for little extra dispersion on most paths. */
+export const MUX_SESSION_POOL = 2;
 export const HANDSHAKE_MAX_RETRIES = 9;
 export const HANDSHAKE_RETRY_MS = 250;
 export const HANDSHAKE_RETRY_CAP_MS = 8000;
@@ -97,7 +108,7 @@ export const RS_MAX_PARITY = 7;
 
 // Defaults (defaults.h)
 export const DEFAULT_D = 10;
-export const DEFAULT_P = 3;
+export const DEFAULT_P = 4;
 export const DEFAULT_MTU = 1400;
 // PMTUD is on by default: the datagram budget starts at a conservative floor
 // and walks upward toward the ceiling. 1040 is deliberately below the IPv6
@@ -218,17 +229,25 @@ export const STREAM_ACK_V2_MIN_LEN = 10;
 export const STREAM_ACK_V2_MAX_RANGES = 64;
 export const STREAM_RST_LEN = 2;
 export const STREAM_FLAG_FIN = 1 << 0;
-export const DUP_ACK_THRESH = 3;
+/** Duplicate acks required to arm the fast-retransmit pass. The SACK ranges
+ *  already carry the loss evidence; the threshold only filters reordered ACK
+ *  arrivals, and 2 fires one ack-cycle (~40 ms) sooner than 3. */
+export const DUP_ACK_THRESH = 2;
 export const STREAM_RST_ABORT = 1;
 export const ACK_DELAY_MS = 4;
 /** Data segments per acknowledgement. One ack per segment turned the uplink
  *  into a 97-byte burst per received datagram; the path drops bursts, so most
- *  acks never arrived and the sender's window only crept forward. */
-export const ACK_EVERY_SEGMENTS = 6;
+ *  acks never arrived and the sender's window only crept forward. 6 was the
+ *  measured sweet spot for coalescing, but evidence latency then cost the
+ *  sender ~1.5 RTT per hole (the dup-ack counter fills 2x slower); 3 halves
+ *  that while keeping ack volume at a level the lossy uplink tolerated. */
+export const ACK_EVERY_SEGMENTS = 3;
 /** While a sequence hole is open the receiver must keep answering, otherwise
  *  the sender sits on a full window waiting for an ack that will never come
- *  until its RTO expires (seconds). Repeated acks drive fast retransmit. */
-export const HOLE_DUP_ACK_MS = 100;
+ *  until its RTO expires (seconds). Repeated acks drive fast retransmit.
+ *  50 ms: with DUP_ACK_THRESH at 2 the fast-retransmit trigger lands within
+ *  ~1 RTT of the hole forming. Same ack, no extra wire state. */
+export const HOLE_DUP_ACK_MS = 50;
 /** Segments repaired per duplicate-ack round. Retransmitting only the oldest
  *  hole makes a 20-segment gap take 20 rounds; the rest are provably missing
  *  because they were sent before the sacked block that produced the dup ack.
@@ -299,4 +318,4 @@ export const TARGET_RECOVERY = 0.80;
 export const FECSTAT_INTERVAL_MS = 2000;
 export const FECSTAT_MAX_INTERVAL_MS = 60000;
 
-export const PRODUCT_VERSION = '0.0.2';
+export const PRODUCT_VERSION = '0.0.3';
