@@ -131,13 +131,13 @@ function statOrNull(p: string): ReturnType<typeof statSync> | null {
 }
 
 /**
- * `--trace` takes a *prefix*, not a file name: the writer appends
+ * `--metrics` takes a *prefix*, not a file name: the writer appends
  * `-client-<salt>.jsonl` / `-server-<salt>.jsonl`. A trailing `.jsonl` is
  * dropped so both spellings name the same set.
  */
 export function normaliseTracePrefix(raw: string): string {
   const trimmed = raw.trim();
-  if (!trimmed) throw new Error('--trace expects a file prefix, got an empty value');
+  if (!trimmed) throw new Error('--metrics expects a file prefix, got an empty value');
   const stripped = trimmed.replace(/\.jsonl$/i, '');
   if (statOrNull(stripped)?.isDirectory()) throw new Error(directoryHint(trimmed, stripped));
   return stripped;
@@ -159,9 +159,9 @@ function directoryHint(shown: string, dir: string): string {
   } catch { /* unreadable directory: fall back to the generic message */ }
   const examples = [...found].sort().slice(0, 3);
   const tail = examples.length
-    ? `did you mean ${examples.map((p) => `--trace=${p}`).join(' or ')}?`
+    ? `did you mean ${examples.map((p) => `--metrics=${p}`).join(' or ')}?`
     : `use --trace=${head}${sep}name`;
-  return `--trace=${shown} is a directory, not a file prefix; ${tail}`;
+  return `--metrics=${shown} is a directory, not a file prefix; ${tail}`;
 }
 
 /**
@@ -171,7 +171,7 @@ function directoryHint(shown: string, dir: string): string {
  */
 export function resolveTraceFiles(raw: string): string[] {
   const trimmed = raw.trim();
-  if (!trimmed) throw new Error('--trace expects a file prefix, got an empty value');
+  if (!trimmed) throw new Error('--metrics expects a file prefix, got an empty value');
   // An explicit file name wins over the prefix interpretation, and has to be
   // tested before normalisation strips its `.jsonl` suffix.
   const asGiven = statOrNull(trimmed);
@@ -181,7 +181,7 @@ export function resolveTraceFiles(raw: string): string[] {
   const dir = dirname(prefix);
   const base = basename(prefix);
   if (!statOrNull(dir)?.isDirectory()) {
-    throw new Error(`--trace=${raw}: directory ${dir} does not exist, so no trace can be there`);
+    throw new Error(`--metrics=${raw}: directory ${dir} does not exist, so no metrics can be there`);
   }
   // Match `<base>-…`, not `<base>*`: a prefix of "c" used to pull in
   // cache.jsonl and cfg.jsonl as if they were part of this run.

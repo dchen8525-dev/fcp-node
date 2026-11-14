@@ -20,7 +20,7 @@ Usage:
   node cli.ts server [options]
   node cli.ts client [options]
   node cli.ts speedtest [--seconds=N] [options]
-  node cli.ts replay --trace=PREFIX
+  node cli.ts replay --metrics=PREFIX
 
 Key (required, both ends equal):
   --key=HEX32           16-byte pre-shared key, 32 hex chars.
@@ -65,10 +65,12 @@ Common:
                         min(3,P) and adjusts k itself from loss feedback, so
                         there is no --parity / --k / --fec-budget knob any more
                         (all three are rejected).
-  --trace=PREFIX        per-session controller trace, one JSONL file per
+  --metrics=PREFIX      per-session controller metrics, one JSONL file per
                         session: <PREFIX>-client-<salt>.jsonl (and -server-).
-                        The directory is created if missing; read the files
-                        back with: replay --trace=PREFIX
+                        Records the adaptive controllers' decisions (fec_k)
+                        and estimates (bbr). The directory is created if
+                        missing; read the files back with:
+                        replay --metrics=PREFIX
   --log-level=LEVEL     debug|info|warn|error|off (default info)
                         debug adds per-datagram / per-segment / per-connection traces
                         (--log was removed; it is rejected, not ignored)
@@ -91,7 +93,7 @@ the session key. --key-update was removed: it had no off-state worth keeping,
 and one-sided use is settled by the TLV handshake rather than by a flag.
 
 Node.js-only differences from the C++ CLI: speedtest uses an in-process
-loopback; replay summarises --trace JSONL instead of replaying it.
+loopback; replay summarises --metrics JSONL instead of replaying it.
 See docs/移植对照与差异.md for the full delta list.
 `;
 
@@ -110,7 +112,7 @@ const ALIASES: Record<string, string> = {
 // typo used to be dropped in silence (e.g. `--speedtest`, which no code path
 // ever reached because the client branch matched first).
 const KNOWN_OPTS = new Set([
-  'key', 'bind', 'peer', 'mtu-min', 'mtu-max', 'fec', 'trace',
+  'key', 'bind', 'peer', 'mtu-min', 'mtu-max', 'fec', 'metrics',
   'log-level', 'log-file', 'seconds', 'speedtest-seconds', 'positional',
 ]);
 
@@ -140,6 +142,7 @@ const REMOVED_OPTS: Record<string, { use: string; why: string; short?: boolean }
   tlv: { use: 'nothing: the always-on ACK v2 offer sets CAP_TLV by itself', why: 'the switch advertised no TLV type of its own, so it could not change the wire' },
   'ack-v2': { use: 'nothing: the wide ACK is always offered now', why: 'keeping it as a flag implied the classic ACK was still a real choice, and one forgotten flag silently halved SACK coverage' },
   version: { use: '-h (the first line prints the version)', why: 'a second way to ask for the same string only created room for the two to disagree' },
+  trace: { use: '--metrics=PREFIX', why: 'it records controller decisions/estimates (fec_k, bbr), not packet traces; --metrics says so' },
   'key-update': { use: 'nothing: the epoch key roll is always offered, and engages only when both ends offer TLV type 4', why: 'the flag had no useful off-state; whether the session key can roll is a fact about the peer, settled in the handshake' },
 };
 
@@ -306,7 +309,7 @@ async function speedtest(base: TunnelOptions, seconds: number): Promise<void> {
 
 async function replay(prefix: string): Promise<void> {
   // The directory comes from the prefix. It used to come from the working
-  // directory, which reported "0 files" for every absolute --trace path.
+  // directory, which reported "0 files" for every absolute --metrics path.
   const files = resolveTraceFiles(prefix);
   if (files.length === 0) {
     throw new Error(`replay ${prefix}: no ${normaliseTracePrefix(prefix)}-client-*.jsonl ` +
@@ -323,7 +326,7 @@ async function replay(prefix: string): Promise<void> {
 }
 
 /**
- * Fail fast on a bad --trace prefix: create its directory now instead of
+ * Fail fast on a bad --metrics prefix: create its directory now instead of
  * letting the first handshake find out. The old writer opened the file lazily
  * and an unhandled 'error' from that open killed the server at handshake time.
  */
@@ -394,11 +397,11 @@ async function main(): Promise<void> {
     debugLog,
   };
   if (mode === 'replay') {
-    if (!opts.has('trace')) throw new Error('replay requires --trace=PREFIX');
-    await replay(opts.get('trace')!);
+    if (!opts.has('metrics')) throw new Error('replay requires --metrics=PREFIX');
+    await replay(opts.get('metrics')!);
     return;
   }
-  if (opts.has('trace')) common.tracePrefix = prepareTracePrefix(opts.get('trace')!);
+  if (opts.has('metrics')) common.tracePrefix = prepareTracePrefix(opts.get('metrics')!);
   common.psk = loadKey(opts);
 
   let tunnel: TunnelClient | TunnelServer;

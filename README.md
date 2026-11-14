@@ -60,7 +60,7 @@ PSK 在本项目的部署方式里是**直接内联**的（两端同一个值，
 | `--key-update` | ~~已删除~~ | `#84` epoch 换密钥（TLV type=4）**已经常开**：两端都发布该 TLV 时自动启用，只有一端支持时自动保持关闭、连接照常跑 |
 | `--ack-v2` | ~~已删除~~ | 宽 ACK（一次最多 64 个 SACK 块）**已经常开**，不再有开关；对端不支持时会自己退回旧 ACK |
 | `--tlv` | ~~已删除~~ | 它本身不发布任何 TLV 类型，写不写都改不了线上内容 |
-| `--trace=PREFIX` | 无 | 每会话控制器 JSONL 轨迹，一个会话一个文件：`<PREFIX>-client-<salt>.jsonl` / `-server-<salt>.jsonl`。目录不存在会自动创建；写不进只打一条 `WRN` 并关闭该文件，不影响隧道。回读用 `node src/app/replay.ts --trace=PREFIX`（给目录会提示正确前缀） |
+| `--metrics=PREFIX` | 无 | 每会话控制器 JSONL 指标（fec_k 决策与 bbr 估计），一个会话一个文件：`<PREFIX>-client-<salt>.jsonl` / `-server-<salt>.jsonl`。目录不存在会自动创建；写不进只打一条 `WRN` 并关闭该文件，不影响隧道。回读用 `node src/app/replay.ts --metrics=PREFIX`（给目录会提示正确前缀） |
 | `--log-level=LEVEL` | `info` | `debug|info|warn|error|off`；旧名 `--log` 已移除，写了会直接报错 |
 | `--log-file=PATH` | 无 | 日志同时追加落盘 |
 | `-h, --help` | — | 完整 Usage，第一行就是版本号（`--version` 已删除，写了会直接报错） |

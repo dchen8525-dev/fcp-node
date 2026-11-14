@@ -92,7 +92,7 @@ writeFileSync(join(traceDir, 'run-client-aa.jsonl'), '{"t":"bbr"}\n');
 writeFileSync(join(traceDir, 'run-server-aa.jsonl'), '{"t":"bbr"}\n{"t":"fec_k"}\n');
 writeFileSync(join(traceDir, 'cache.jsonl'), '{"t":"bbr"}\n');
 const replayRun = spawnSync(process.execPath,
-  ['src/app/replay.ts', `--trace=${join(traceDir, 'run')}`], { cwd: root, encoding: 'utf8' });
+  ['src/app/replay.ts', `--metrics=${join(traceDir, 'run')}`], { cwd: root, encoding: 'utf8' });
 const replayOut = (replayRun.stdout ?? '').trim();
 const traceOk = replayRun.status === 0 && /2 file\(s\), 3 events/.test(replayOut) && !/cache/.test(replayOut);
 results.push(['trace replay', traceOk ? 'PASS' : 'FAIL',

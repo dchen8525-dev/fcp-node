@@ -92,7 +92,7 @@ test('prefix normalisation strips .jsonl and rejects an empty value', () => {
   assert.throws(() => normaliseTracePrefix('   '), /empty value/);
 });
 
-test('a directory is rejected: --trace takes a prefix, not a folder', () => {
+test('a directory is rejected: --metrics takes a prefix, not a folder', () => {
   const dir = tempDir();
   assert.throws(() => normaliseTracePrefix(dir), /is a directory/);
   rmSync(dir, { recursive: true, force: true });
