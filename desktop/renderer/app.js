@@ -253,12 +253,20 @@ el.toggleBtn.addEventListener('click', () => {
 // ---------------------------------------------------------------- stats + chart
 
 // 应用层(浏览器真实)速率:0.0.5 及更早的隧道不携带 app_* → 回退 wire 值。
-// 卡片显示用 4 样本滑动平均压掉 0.5s 采样的抖动(单样本曾显示 629 B/s)。
+// 卡片显示用 2 样本滑动平均压掉 0.5s 采样的抖动(单样本曾显示 629 B/s)。
+// 4 样本(2s 窗口)在速度爬坡时滞后 1.5s+,与浏览器速度偏差肉眼可见;
+// 2 样本只滞后一个采样周期(0.5s),抖动压平效果仍然够用。
 const rateWindow = { rx: [], tx: [] };
 function avgRate(win, v) {
   win.push(v);
-  while (win.length > 4) win.shift();
+  while (win.length > 2) win.shift();
   return Math.round(win.reduce((a, b) => a + b, 0) / win.length);
+}
+
+function pushSample(rx, tx) {
+  state.samples.push({ rx: Math.max(0, rx), tx: Math.max(0, tx) });
+  while (state.samples.length > CHART_POINTS) state.samples.shift();
+  state.peak = Math.max(state.peak, rx, tx);
 }
 
 window.fcp.onStats((s) => {
@@ -270,7 +278,7 @@ window.fcp.onStats((s) => {
   const txSmooth = avgRate(rateWindow.tx, appTxRate);
   const appRx = s.appRx !== undefined ? s.appRx : s.rx;
   const appTx = s.appTx !== undefined ? s.appTx : s.tx;
-  pushSample({ rxRate: appRxRate, txRate: appTxRate });
+  pushSample(appRxRate, appTxRate);
   el.rxRate.innerHTML = fmtRate(rxSmooth);
   el.txRate.innerHTML = fmtRate(txSmooth);
   el.rxTotal.textContent = `累计 ${fmtBytes(appRx)}`;
