@@ -7,7 +7,8 @@ import assert from 'node:assert/strict';
 import { TunnelClient } from '../src/app/tunnel.ts';
 
 const STATS_RE =
-  /^stats ([\d.]+)s live=(\d+) up=(\d+) tunnels=(\d+) tx=(\d+)B rx=(\d+)B tx_rate=(-?\d+)B\/s rx_rate=(-?\d+)B\/s$/;
+  // 尾部追加的 app_* 字段是 GUI 真实速度的数据源,属于格式契约的一部分
+  /^stats ([\d.]+)s live=(\d+) up=(\d+) tunnels=(\d+) tx=(\d+)B rx=(\d+)B tx_rate=(-?\d+)B\/s rx_rate=(-?\d+)B\/s(?: app_rx=(\d+)B app_tx=(\d+)B app_rx_rate=(-?\d+)B\/s app_tx_rate=(-?\d+)B\/s)?$/;
 
 test('stats line is emitted on a timer and parses', async () => {
   const lines: string[] = [];

@@ -174,7 +174,8 @@ function classify(line) {
   return 'info';
 }
 
-const STATS_RE = /^stats\s+([\d.]+)s\s+live=(\d+)\s+up=(\d+)\s+tunnels=(\d+)\s+tx=(\d+)B\s+rx=(\d+)B\s+tx_rate=(-?\d+)B\/s\s+rx_rate=(-?\d+)B\/s/;
+// 末尾的 app_* 字段为应用层(浏览器真实)字节:0.0.5 及更早的隧道不带,捕获可选。
+const STATS_RE = /^stats\s+([\d.]+)s\s+live=(\d+)\s+up=(\d+)\s+tunnels=(\d+)\s+tx=(\d+)B\s+rx=(\d+)B\s+tx_rate=(-?\d+)B\/s\s+rx_rate=(-?\d+)B\/s(?:\s+app_rx=(\d+)B\s+app_tx=(\d+)B\s+app_rx_rate=(-?\d+)B\/s\s+app_tx_rate=(-?\d+)B\/s)?/;
 
 function startTunnel(cfg) {
   if (child) stopTunnel();
@@ -216,6 +217,12 @@ function startTunnel(cfg) {
           uptimeSec: Number(m[1]), live: Number(m[2]), up: Number(m[3]),
           tunnels: Number(m[4]), tx: Number(m[5]), rx: Number(m[6]),
           txRate: Number(m[7]), rxRate: Number(m[8]),
+          // 应用层(浏览器真实)字节:0.0.5 及更早的隧道不携带 → undefined,
+          // 渲染层自行降级到 wire 值显示。
+          appRx: m[9] !== undefined ? Number(m[9]) : undefined,
+          appTx: m[10] !== undefined ? Number(m[10]) : undefined,
+          appRxRate: m[11] !== undefined ? Number(m[11]) : undefined,
+          appTxRate: m[12] !== undefined ? Number(m[12]) : undefined,
         });
       } else {
         send('fcp:log', { level: 'info', line });

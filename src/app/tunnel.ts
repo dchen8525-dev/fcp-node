@@ -194,6 +194,13 @@ export class TunnelClient {
   // graph is about what the socket carried, not what the stream accepted.
   private bytesTx = 0;
   private bytesRx = 0;
+  /** M1 应用层字节:下行 = 交付给本地应用(浏览器)的字节;上行 = 本地应用
+   *  发来并被接收的字节。与 wire 字节(含 FEC parity/ACK/重传/封套)分开
+   *  统计——GUI 的下行/上行卡片按这两个数显示"真实速度"。 */
+  private bytesAppRx = 0;
+  private bytesAppTx = 0;
+  private statsPrevAppRx = 0;
+  private statsPrevAppTx = 0;
   private statsPrevTx = 0;
   private statsPrevRx = 0;
   private statsPrevMs = 0;
@@ -389,15 +396,22 @@ export class TunnelClient {
     const dt = Math.max(1, now - this.statsPrevMs) / 1000;
     const txRate = Math.round((this.bytesTx - this.statsPrevTx) / dt);
     const rxRate = Math.round((this.bytesRx - this.statsPrevRx) / dt);
+    // 应用层速率:交付给浏览器/从浏览器接收的真实字节(不含 FEC/ACK/封套开销)
+    const appRxRate = Math.round((this.bytesAppRx - this.statsPrevAppRx) / dt);
+    const appTxRate = Math.round((this.bytesAppTx - this.statsPrevAppTx) / dt);
     let up = 0;
     for (const b of this.sessions.values()) if (b.session.established) up += 1;
     const uptime = ((now - this.startedMs) / 1000).toFixed(1);
     this.opts.onStats?.(
       `stats ${uptime}s live=${this.sessions.size} up=${up} tunnels=${this.sessions.size} ` +
-        `tx=${this.bytesTx}B rx=${this.bytesRx}B tx_rate=${txRate}B/s rx_rate=${rxRate}B/s`,
+        `tx=${this.bytesTx}B rx=${this.bytesRx}B tx_rate=${txRate}B/s rx_rate=${rxRate}B/s ` +
+        `app_rx=${this.bytesAppRx}B app_tx=${this.bytesAppTx}B ` +
+        `app_rx_rate=${appRxRate}B/s app_tx_rate=${appTxRate}B/s`,
     );
     this.statsPrevTx = this.bytesTx;
     this.statsPrevRx = this.bytesRx;
+    this.statsPrevAppRx = this.bytesAppRx;
+    this.statsPrevAppTx = this.bytesAppTx;
     this.statsPrevMs = now;
   }
 
@@ -571,7 +585,12 @@ export class TunnelClient {
         // here means the peer broke the TLV contract — drop the connection.
         connStream = session.openStream(connSid, streamCallbacks);
         if (!connStream) { destroy(); return; }
-        writeConn = (b) => connStream!.write(b, nowMs());
+        // 应用层上行的唯一计数点:隧道接受的字节恰好在此经过一次
+        writeConn = (b) => {
+          const n = connStream!.write(b, nowMs());
+          this.bytesAppTx += n;
+          return n;
+        };
         consumedConn = (n) => connStream!.consumed(n);
         closeWriteConn = () => connStream!.closeWrite(nowMs());
         rstConn = () => connStream!.sendRst();
@@ -590,6 +609,8 @@ export class TunnelClient {
     };
 
     streamRead = (bytes: Buffer) => {
+      // 应用层下行:交付给本地应用(浏览器)的字节,不含任何隧道开销。
+      this.bytesAppRx += bytes.length;
       // Consumption is what releases the peer's send window. Doing it only
       // after the local socket has flushed applies real backpressure; the old
       // immediate consumed() let a slow reader grow Node's writable buffer

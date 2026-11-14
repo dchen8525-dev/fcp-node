@@ -252,18 +252,29 @@ el.toggleBtn.addEventListener('click', () => {
 
 // ---------------------------------------------------------------- stats + chart
 
-function pushSample(s) {
-  state.samples.push({ rx: Math.max(0, s.rxRate), tx: Math.max(0, s.txRate) });
-  while (state.samples.length > CHART_POINTS) state.samples.shift();
-  state.peak = Math.max(state.peak, s.rxRate, s.txRate);
+// 应用层(浏览器真实)速率:0.0.5 及更早的隧道不携带 app_* → 回退 wire 值。
+// 卡片显示用 4 样本滑动平均压掉 0.5s 采样的抖动(单样本曾显示 629 B/s)。
+const rateWindow = { rx: [], tx: [] };
+function avgRate(win, v) {
+  win.push(v);
+  while (win.length > 4) win.shift();
+  return Math.round(win.reduce((a, b) => a + b, 0) / win.length);
 }
 
 window.fcp.onStats((s) => {
-  pushSample(s);
-  el.rxRate.innerHTML = fmtRate(s.rxRate);
-  el.txRate.innerHTML = fmtRate(s.txRate);
-  el.rxTotal.textContent = `累计 ${fmtBytes(s.rx)}`;
-  el.txTotal.textContent = `累计 ${fmtBytes(s.tx)}`;
+  const wireRx = Math.max(0, s.rxRate ?? 0);
+  const wireTx = Math.max(0, s.txRate ?? 0);
+  const appRxRate = s.appRxRate !== undefined ? Math.max(0, s.appRxRate) : wireRx;
+  const appTxRate = s.appTxRate !== undefined ? Math.max(0, s.appTxRate) : wireTx;
+  const rxSmooth = avgRate(rateWindow.rx, appRxRate);
+  const txSmooth = avgRate(rateWindow.tx, appTxRate);
+  const appRx = s.appRx !== undefined ? s.appRx : s.rx;
+  const appTx = s.appTx !== undefined ? s.appTx : s.tx;
+  pushSample({ rxRate: appRxRate, txRate: appTxRate });
+  el.rxRate.innerHTML = fmtRate(rxSmooth);
+  el.txRate.innerHTML = fmtRate(txSmooth);
+  el.rxTotal.textContent = `累计 ${fmtBytes(appRx)}`;
+  el.txTotal.textContent = `累计 ${fmtBytes(appTx)}`;
   el.kSessions.textContent = String(s.live);
   el.kUp.textContent = String(s.up);
   el.kUptime.textContent = fmtUptime(s.uptimeSec * 1000);
