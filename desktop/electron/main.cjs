@@ -3,7 +3,7 @@
 // way the Qt shell spawns fcp-client, so a tunnel crash cannot take the UI down.
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, nativeTheme } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -372,7 +372,7 @@ function buildRequest(target, host) {
 function createWindow() {
   win = new BrowserWindow({
     width: 980, height: 700, minWidth: 820, minHeight: 600,
-    backgroundColor: '#f4f7f5',
+    backgroundColor: '#080d0b',
     title: 'FCP Node',
     icon: ICON_PATH,
     show: false,
@@ -433,6 +433,9 @@ if (!gotLock) {
   app.quit();
 } else {
   app.whenReady().then(() => {
+    // The renderer is a dark console; a light native title bar on top of it
+    // looks like two different applications.
+    nativeTheme.themeSource = 'dark';
     createWindow();
     createTray();
   });

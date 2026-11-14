@@ -270,7 +270,7 @@ function drawChart() {
   const plotH = h - padT - padB;
 
   // horizontal grid
-  ctx.strokeStyle = '#eef4f1';
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.055)';
   ctx.lineWidth = 1;
   for (let i = 0; i <= 3; i += 1) {
     const y = padT + (plotH * i) / 3;
@@ -309,16 +309,16 @@ function drawChart() {
     ctx.closePath();
     const g = ctx.createLinearGradient(0, padT, 0, padT + plotH);
     g.addColorStop(0, fillTop);
-    g.addColorStop(1, 'rgba(255,255,255,0)');
+    g.addColorStop(1, 'rgba(8, 13, 11, 0)');
     ctx.fillStyle = g;
     ctx.fill();
   };
 
-  drawSeries('tx', '#f0b46a', 'rgba(240, 180, 106, 0.20)');
-  drawSeries('rx', '#0f9d76', 'rgba(15, 157, 118, 0.20)');
+  drawSeries('tx', '#fbbf24', 'rgba(251, 191, 36, 0.20)');
+  drawSeries('rx', '#34d399', 'rgba(52, 211, 153, 0.22)');
 
   // baseline labels
-  ctx.fillStyle = '#a7b5ad';
+  ctx.fillStyle = '#5b6f66';
   ctx.font = '10px "Cascadia Mono", Consolas, monospace';
   ctx.textBaseline = 'top';
   const peak = data.length ? data.reduce((m, p) => Math.max(m, p.rx, p.tx), 0) : 0;
@@ -412,6 +412,7 @@ el.speedBtn.addEventListener('click', async () => {
   if (!state.running) { el.speedNote.textContent = '请先启动代理'; return; }
   el.speedBtn.disabled = true;
   el.speedStopBtn.disabled = false;
+  el.speedMbps.parentElement.classList.remove('is-empty');
   el.speedMbps.textContent = '0.00';
   el.speedBytes.textContent = '—';
   el.speedElapsed.textContent = '—';
@@ -448,6 +449,7 @@ window.fcp.onSpeed((p) => {
   el.speedMeter.style.width = '100%';
   if (p.error) {
     el.speedNote.textContent = p.error;
+    el.speedMbps.parentElement.classList.add('is-empty');
     el.speedMbps.textContent = '—';
     addLog({ level: 'error', line: `speedtest: ${p.error}`, ts: Date.now() });
     return;

@@ -4,11 +4,11 @@
 `resources/cli.mjs`，由主进程以子进程方式启动，接口与 C++ 版的 `fcp-client`
 完全一致（同一套 12 参数白名单、同一行 `stats` 格式）。
 
-界面参照 `../fcp/apps/desktop`（Qt Widgets 版）的配色与四页结构重做：
+页面结构沿用 `../fcp/apps/desktop`（Qt Widgets 版），视觉改为深色控制台：
 
 | 项 | Qt 版 | 这里 |
 |---|---|---|
-| 配色 | `#f4f7f5` / `#e6ede9` / `#0f9d76` / `#f0b46a` | 沿用同一套 CSS 变量 |
+| 配色 | 浅色 `#f4f7f5` / `#e6ede9` / `#0f9d76` / `#f0b46a` | 近黑绿底、翡翠绿强调、琥珀色上行；`nativeTheme` 同步深色标题栏 |
 | 页面 | 连接 / 状态 / 测速 / 日志 | 同四页 |
 | 图表 | `QPainter` sparkline | Canvas 双线 + 渐变填充 |
 | 测速 | `fcp-client --speedtest` 对远端打流 | 经本地 SOCKS 真实下载（见下） |
@@ -29,7 +29,7 @@ Node 版的 `speedtest` 子命令是**进程内自环**（自己起 echo server 
 electron/main.cjs     窗口、托盘、子进程管理、stats 解析、SOCKS 测速
 electron/preload.cjs  contextBridge 暴露的 IPC 面
 renderer/index.html   四页结构
-renderer/styles.css   视觉（浅色主题、卡片分层、等宽数字）
+renderer/styles.css   视觉（深色控制台主题、卡片分层、等宽数字）
 renderer/app.js       导航、表单校验、图表、日志、测速交互
 scripts/build-tunnel.mjs  esbuild 把 src/app/cli.ts 打成一个 ESM
 scripts/cdp.mjs           自测用：CDP eval / reload / 截图
