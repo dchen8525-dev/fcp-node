@@ -8,7 +8,7 @@ const el = {
   appVersion: $('appVersion'),
   pages: document.querySelectorAll('.page'),
   host: $('host'), port: $('port'), listenHost: $('listenHost'), listenPort: $('listenPort'),
-  key: $('key'), keyToggle: $('keyToggle'), keyState: $('keyState'), remember: $('remember'),
+  key: $('key'), keyToggle: $('keyToggle'), remember: $('remember'),
   mtu: $('mtu'), fec: $('fec'), logLevel: $('logLevel'), logFile: $('logFile'), pmtud: $('pmtud'),
   advToggle: $('advToggle'), advBody: $('advBody'),
   toggleBtn: $('toggleBtn'), actionNote: $('actionNote'),
@@ -94,26 +94,6 @@ el.keyToggle.addEventListener('click', () => {
 
 const HEX32 = /^[0-9a-fA-F]{32}$/;
 
-function refreshKeyState() {
-  const raw = el.key.value.replace(/\s+/g, '');
-  const clean = raw.replace(/^0x/i, '');
-  if (!raw) {
-    el.keyState.textContent = '等待输入';
-    el.keyState.className = 'key-state';
-    return false;
-  }
-  if (HEX32.test(clean)) {
-    el.keyState.textContent = '16 字节 ✓';
-    el.keyState.className = 'key-state ok';
-    return true;
-  }
-  el.keyState.textContent = `${clean.length} 位`;
-  el.keyState.className = 'key-state bad';
-  return false;
-}
-
-el.key.addEventListener('input', refreshKeyState);
-
 // ---------------------------------------------------------------- settings
 
 let saveTimer = null;
@@ -162,7 +142,6 @@ function applySettings(s) {
   const set = (node, v) => { if (v !== undefined && v !== null) node.value = v; };
   if (typeof s.key === 'string' && s.key) {
     el.key.value = s.key;
-    refreshKeyState();
   }
   set(el.host, s.host);
   set(el.port, s.port);
@@ -520,7 +499,6 @@ window.fcp.onSpeed((p) => {
   } catch { /* 老版本主进程没有该 IPC,保持 v— */ }
   const s = await window.fcp.loadSettings();
   applySettings(s);
-  refreshKeyState();
   const st = await window.fcp.state();
   setRunning(!!st.running);
   if (st.running) {
