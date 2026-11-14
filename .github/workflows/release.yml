@@ -76,6 +76,12 @@ jobs:
           node-version: 22
       - name: install desktop toolchain (esbuild, electron-builder)
         run: npm --prefix desktop ci
+      - name: ensure electron runtime dist exists (postinstall can skip on CI)
+        run: |
+          if (!(Test-Path 'desktop/node_modules/electron/dist')) {
+            node desktop/node_modules/electron/install.js
+          }
+          if (!(Test-Path 'desktop/node_modules/electron/dist')) { throw 'electron dist still missing' }
       - name: build fcp-client SEA exe
         run: npm run pack:client-exe
       - name: build desktop portable + setup installers
