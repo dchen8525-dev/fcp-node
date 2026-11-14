@@ -169,7 +169,11 @@ test('handshake: TLV-offering client vs plain server gets a valid empty-block AC
   assert.equal(client.tlvAgreed(TLV_TYPE_ACK_V2), false, 'peer offered no TLV type');
 });
 
-test('handshake: 9-send retry schedule and TLV downgrade after 2 unanswered HELLOs', () => {
+test('handshake: 9-send retry schedule never drops the TLV block', () => {
+  // Retries used to downgrade to the plain v7 shape after two unanswered
+  // HELLOs. Between current peers that produced a session without multiplexing,
+  // which the proxy cannot serve at all (and which poisoned the whole client
+  // session pool). Loss must not change the offered capabilities.
   const out: Buffer[] = [];
   const c = new Handshake({
     localD: 10, localP: 3, role: HandshakeRole.Client, localNonce: NONCE_C,
@@ -180,9 +184,9 @@ test('handshake: 9-send retry schedule and TLV downgrade after 2 unanswered HELL
   let t = 0;
   for (let i = 0; i < 9; ++i) { c.onTick(t); t = c.nextRetryMs; }
   assert.equal(out.length, 9);
-  assert.equal(out[0].length > HELLO_LEN, true, 'first two HELLOs carry TLV');
-  assert.equal(out[1].length > HELLO_LEN, true);
-  assert.equal(out[2].length, HELLO_LEN, 'third HELLO downgrades to plain v7');
+  for (const [i, h] of out.entries()) {
+    assert.equal(h.length > HELLO_LEN, true, `retry ${i + 1} still offers its TLV block`);
+  }
   c.onTick(t);
   assert.equal(c.failed, true);
   assert.equal(c.error, HandshakeError.NoAck);
@@ -421,7 +425,12 @@ function makePair(opts: {
       }
     }
   };
-  return { client, server, cRead, sRead, cClosed, sClosed, pump, now: () => now, sReadBySid, sStreamsBySid };
+  return {
+    client, server, cRead, sRead, cClosed, sClosed, pump, now: () => now,
+    sReadBySid, sStreamsBySid,
+    // Raw queues let a test step exactly one datagram instead of draining.
+    toServer, toClient,
+  };
 }
 
 test('full stack: handshake + AEAD + FEC carry bidirectional stream bytes', () => {
@@ -576,4 +585,69 @@ test('M1: per-sid streams carry their own FIN and the default stream coexists', 
   p.pump(5, 60);
   assert.equal(p.client.openStream(3, { send: () => {}, read: () => {}, closed: () => {} }) !== null, true,
     'both halves closed: the sid is freed for reuse');
+});
+
+test('M1: sid control segments inherit ACK v2 and are flushed immediately', () => {
+  const p = makePair({ ack_v2: true });
+  p.pump(5, 12);
+  assert.equal(p.client.muxActive, true, 'mux negotiated');
+
+  // Every sid stream must use the wide ack that was negotiated for the
+  // session; makeStream() used to leave ackV2 at its default false.
+  const s1 = p.client.openStream(1, { send: () => {}, read: () => {}, closed: () => {} });
+  assert.ok(s1, 'sid 1 opened');
+  assert.equal(s1!.ackV2Enabled, true, 'sid stream inherits ACK v2');
+  assert.equal(p.client.streamRef.ackV2Enabled, true, 'default stream keeps it too');
+
+  // Drain setup traffic, then deliver exactly one repair group of three DATA
+  // symbols from the server's default stream. Two ack-coalescing slots plus
+  // the third segment is what makes the receiver emit an ACK.
+  p.pump(5, 20);
+  p.toServer.length = 0;
+  p.toClient.length = 0;
+  p.server.write(Buffer.from('aaa'));
+  p.server.write(Buffer.from('bbb'));
+  p.server.write(Buffer.from('ccc'));
+  const t = p.now() + 300; // past the ~srtt flush timer, before any TLP
+  p.server.onTick(t);
+  // Three DATA symbols plus the scaled repair symbol for a short group
+  // (ceil(k*n/d) = 1 at D=10, k=3, n=3).
+  assert.equal(p.toClient.length, 4, 'one repair group carried the three segments');
+
+  const before = p.toServer.length;
+  for (const w of p.toClient.splice(0)) p.client.onWire(w, t);
+  // In mux mode the 1-byte sid prefixes every segment, so the stream type is
+  // at offset 1. Reading offset 0 read the sid (0 here), the ACK was treated
+  // as data, and it sat in the repair group until the flush timer.
+  // flush() closes the group, so the ACK leaves as a DATA symbol plus the one
+  // scaled repair symbol a 1-symbol group gets at D=10, P=3.
+  assert.equal(p.toServer.length, before + 2, 'the ACK left immediately');
+});
+
+test('M1: bytes queued during the handshake are framed with sid 0', () => {
+  // Data written before the handshake is cached unframed because mux is not
+  // known yet. configure() used to replay it raw, so the peer read the stream
+  // type as a sid: a phantom sid 1 stream got the OPEN parser's garbage and
+  // the default stream never ACKed those bytes (retransmitted until idle).
+  const p = makePair();
+  assert.equal(p.client.established, false);
+  assert.equal(p.client.streamRef.write(Buffer.from('early'), 0), 5,
+    'the pre-handshake cache accepts data');
+  p.pump(5, 12);
+  assert.equal(p.client.muxActive, true, 'mux negotiated after the write');
+  p.pump(5, 80); // past the ~srtt flush timer so the repair group goes out
+  assert.equal(Buffer.concat(p.sRead).toString(), 'early',
+    'the server default stream received the bytes');
+  assert.equal(p.sStreamsBySid.size, 0, 'no phantom sid stream was created');
+});
+
+test('M1: a zero-length mux symbol cannot fabricate a stream id', () => {
+  const p = makePair();
+  p.pump(5, 12);
+  assert.equal(p.client.muxActive, true);
+  // An empty payload has no room for the sid byte. This must be accounted as
+  // a structural failure, not routed with sid === undefined.
+  const before = p.server.structFail;
+  (p.server as unknown as { deliverStreamFrame: (b: Buffer) => void }).deliverStreamFrame(Buffer.alloc(0));
+  assert.equal(p.server.structFail, before + 1, 'empty payload rejected as structFail');
 });

@@ -8,10 +8,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { AdaptiveFec } from '../src/control/controller.ts';
+import { makeFecstatPacket } from '../src/fec/fecstat.ts';
 import { Stream } from '../src/stream/stream.ts';
 import { encodeData, encodeAck, encodeAckV2, parseSegment } from '../src/stream/segment.ts';
 import {
-  STREAM_TYPE_DATA, STREAM_TYPE_ACK, STREAM_TYPE_ACK_V2,
+  STREAM_TYPE_DATA, STREAM_TYPE_ACK, STREAM_TYPE_ACK_V2, STREAM_FLAG_FIN,
   ACK_EVERY_SEGMENTS, HOLE_DUP_ACK_MS, MIN_RETX_INTERVAL_MS, FAST_RETX_SEGMENTS,
   ZERO_WINDOW_PROBE_MS,
 } from '../src/constants.ts';
@@ -218,12 +219,14 @@ test('STREAM: a duplicate ack with no SACK evidence does not start a retransmit'
 test('STREAM: a segment is not resent inside the cool-down window', () => {
   // Measured: without this guard the same three segments were re-emitted every
   // duplicate-ack round and the retransmit ratio passed 80%.
-  // Only FAST_RETX_SEGMENTS segments in flight, so every candidate has the same
-  // send time and the cool-down applies to the whole retransmit set.
+  // Only FAST_RETX_SEGMENTS candidates in flight, so every candidate has the
+  // same send time and the cool-down applies to the whole retransmit set. The
+  // last segment is sacked to prove the others missing; a SACK block must stay
+  // inside sndMax (ranges past it are discarded as protocol violations).
   const { s, datas } = makeStream({ sendWindowBytes: 65536, ackV2: true });
-  s.write(Buffer.alloc(94 * FAST_RETX_SEGMENTS), 0);
+  s.write(Buffer.alloc(94 * (FAST_RETX_SEGMENTS + 1)), 0);
   const before = datas();
-  assert.equal(before, FAST_RETX_SEGMENTS);
+  assert.equal(before, FAST_RETX_SEGMENTS + 1);
   const blocks = [{ start: 94 * FAST_RETX_SEGMENTS, end: 94 * (FAST_RETX_SEGMENTS + 1) }];
   for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(0, 65535, blocks), 300);
   assert.equal(datas() - before, FAST_RETX_SEGMENTS);
@@ -255,13 +258,15 @@ test('STREAM: a re-sent segment waits a full RTT, a first-time one does not', ()
   // its predecessor was still in flight. The first retransmit is free (three
   // dup acks already proved the loss); a repeat has to wait one RTT.
   const { s, datas } = makeStream({ sendWindowBytes: 65536, initialSrttMs: 400, ackV2: true });
-  s.write(Buffer.alloc(94 * 6), 0);
+  // Six candidates plus one sached tail; a SACK block may not extend past the
+  // highest byte this side has sent.
+  s.write(Buffer.alloc(94 * 7), 0);
   const blocks = [{ start: 94 * 6, end: 94 * 7 }];
   const dup = (at: number): void => {
     for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(0, 65535, blocks), at);
   };
   const before = datas();
-  assert.equal(before, 6);
+  assert.equal(before, 7);
 
   dup(100);
   assert.equal(datas() - before, 0, 'reordering guard: younger than one RTT');
@@ -409,21 +414,21 @@ test('STREAM: a fast-retx round that bought nothing raises the age threshold', (
   // fresh candidates whose age sits between the old base and the relaxed base
   // stay put until they are genuinely old.
   const { s, datas } = makeStream({ sendWindowBytes: 65536, initialSrttMs: 50, ackV2: true });
-  s.write(Buffer.alloc(94), 0); // segment A1, offset 0; age base = srtt = 50
-  const sackA1 = [{ start: 94, end: 95 }];
+  s.write(Buffer.alloc(94 * 2), 0); // A1, offset 0 (age base = srtt = 50); A2 tail
+  const sackA1 = [{ start: 94, end: 188 }];
   for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(0, 65535, sackA1), 100);
   const afterRound = datas();
-  assert.equal(afterRound, 2, 'A1 fast-retransmitted at age 100 >= base 50');
+  assert.equal(afterRound, 3, 'A1 fast-retransmitted at age 100 >= base 50');
   s.onTick(250); // silent for 1.5*srtt: relax 1.0 -> 1.3 (base 50 -> 65)
-  s.onSegment(encodeAck(94, 65535, 0, 0), 260); // A1 delivered; tx empties
-  s.write(Buffer.alloc(94), 300); // fresh A2, offset 94
+  s.onSegment(encodeAck(188, 65535, 0, 0), 260); // A1+A2 delivered; tx empties
+  s.write(Buffer.alloc(94 * 2), 300); // fresh A3, offset 188; A4 tail at 282
   const beforeRound2 = datas();
-  const sackA2 = [{ start: 188, end: 189 }];
-  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(94, 65535, sackA2), 340);
+  const sackA2 = [{ start: 282, end: 376 }];
+  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(188, 65535, sackA2), 340);
   assert.equal(datas(), beforeRound2, 'age 40 is below the old base 50');
-  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(94, 65535, sackA2), 355);
+  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(188, 65535, sackA2), 355);
   assert.equal(datas(), beforeRound2, 'age 55 crosses the old base but sits below relaxed 65');
-  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(94, 65535, sackA2), 370);
+  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(188, 65535, sackA2), 370);
   assert.equal(datas(), beforeRound2 + 1, 'age 70 crosses the relaxed base: round fires');
 });
 
@@ -461,6 +466,25 @@ test('STREAM: two SACK ranges beyond a hole prove loss and skip the age wait', (
   assert.equal(datas() - before, 2, 'strong evidence fires at the 3rd dup-ack despite age 5ms');
 });
 
+test('STREAM: receiving data does not erase duplicate-ACK evidence', () => {
+  // emitAck() and onAck() shared haveAckCum/lastAckCum. Emitting one ACK for
+  // the *receive* direction rewrote them, so an interleaved inbound segment
+  // made the next peer ACK look like a first one: dupAcks reset, fast
+  // retransmit never armed, and the loss waited for the RTO chain (seconds).
+  const { s, datas } = makeStream({ sendWindowBytes: 65536, initialSrttMs: 400 });
+  s.write(Buffer.alloc(94 * 7), 0);
+  const before = datas();
+  const blocks = [{ start: 94 * 6, end: 94 * 7 }];
+  const dupData = encodeData(0, 0, Buffer.alloc(10));
+  for (let i = 0; i < 4; ++i) {
+    s.onSegment(dupData, 10); // first copy is in-order...
+    s.onSegment(dupData, 10); // ...the duplicate makes us emit an ACK
+    s.onSegment(encodeAckV2(0, 65535, blocks), 450 + i);
+  }
+  assert.equal(datas() - before, FAST_RETX_SEGMENTS,
+    'duplicate ACKs still arm fast retransmit across inbound traffic');
+});
+
 test('STREAM: a single SACK range keeps the age gate', () => {
   // One range beyond the hole is compatible with a single reordered segment;
   // the RTT-based reorder guard must stay in effect.
@@ -470,4 +494,57 @@ test('STREAM: a single SACK range keeps the age gate', () => {
   const ranges = [{ start: 94 * 2, end: 94 * 3 }];
   s.onSegment(encodeAckV2(0, 65535, ranges), 5);
   assert.equal(datas() - before, 0, 'single range: age gate holds');
+});
+
+// --- lifecycle regressions -------------------------------------------------
+
+test('STREAM: closeWrite is idempotent and refuses data after the FIN', () => {
+  // A second closeWrite (an 'end' plus an error path, or a defensive host) used
+  // to emit a second FIN one byte past the first; the peer rejects that offset
+  // as a protocol violation and never acks it, leaving the stream in SendingFin
+  // until the idle timer. Writing after the FIN put bytes past the peer's
+  // peerFinAt, where they are discarded while the sender thinks they were sent.
+  const { s, sent, datas } = makeStream();
+  assert.equal(s.write(Buffer.alloc(10, 1), 0), 10);
+  const fins = () => sent.filter((b) => {
+    const g = parseSegment(b);
+    return g?.type === STREAM_TYPE_DATA && (g.flags & STREAM_FLAG_FIN) !== 0;
+  }).length;
+  s.closeWrite(0);
+  assert.equal(fins(), 1, 'one FIN on the wire');
+  s.closeWrite(0);
+  assert.equal(fins(), 1, 'the second closeWrite is a no-op');
+  assert.equal(s.write(Buffer.from('late'), 0), 0, 'no bytes accepted after the FIN');
+  assert.equal(datas(), 2, 'one data segment + the FIN, nothing else');
+});
+
+test('STREAM: a SACK range past sndMax is discarded, not trusted', () => {
+  // Trusting an over-large range raised sackedHigh beyond anything sent and
+  // marked real in-flight segments sacked, which suppresses their fast/RTO
+  // retransmission: the bytes are then lost for good.
+  const { s } = makeStream();
+  for (let i = 0; i < 3; ++i) assert.equal(s.write(Buffer.alloc(10, i + 1), 0), 10);
+  s.onSegment(encodeAckV2(0, 1 << 20, [{ start: 0, end: 60000 }]), 0);
+  assert.equal(s.sackedHighWater, 0, 'a range beyond the sent bytes changes nothing');
+  s.onSegment(encodeAckV2(0, 1 << 20, [{ start: 0, end: 20 }]), 1);
+  assert.equal(s.sackedHighWater, 20, 'a legitimate range is still honoured');
+});
+
+test('FEC: the local fallback resumes when the peer stops reporting', () => {
+  // peerReports was a permanent latch: once any FECSTAT arrived, a peer that
+  // went silent (one-way loss, wedged reporter) disabled the local ledger for
+  // the rest of the session, so k frozen at its last value.
+  const fec = new AdaptiveFec({ d: 10, p: 6 });
+  const good = makeFecstatPacket(Buffer.alloc(8));
+  good.dataExpected = 1000;
+  good.dataRxOrig = 1000; // 0% loss
+  good.accountedThroughSetId = 1;
+  fec.onFecstat(good, 1000);
+  const afterPeer = fec.currentK();
+  fec.noteLocalCounters(1000, 500, 2000);
+  assert.equal(fec.currentK(), afterPeer, 'a fresh peer report still outranks the local ledger');
+  fec.noteLocalCounters(1000, 500, 8000);  // > 3 FECSTAT intervals since 1000
+  fec.noteLocalCounters(2000, 1000, 8100); // arms the local sampler
+  fec.noteLocalCounters(2000, 1000, 10100);
+  assert.equal(fec.currentK(), 6, 'local 50% loss drives k to the ceiling once the peer is silent');
 });

@@ -71,6 +71,11 @@ export function getUvarint(b: Uint8Array, cap: number, state: { off: number }): 
   for (let i = 0; i < 5; ++i) {
     if (state.off >= cap) return null;
     const byte = b[state.off++];
+    // The fifth byte of a u32 LEB128 may only carry 4 significant bits. Without
+    // this check `0x7f << 28` overflowed the 32-bit accumulator and wrapped,
+    // so non-canonical encodings decoded to a small value instead of failing -
+    // a value that could then disagree with the encoder's canonical form.
+    if (i === 4 && (byte & 0x7f) > 0x0f) return null;
     v |= (byte & 0x7f) << shift;
     if ((byte & 0x80) === 0) return v >>> 0;
     shift += 7;

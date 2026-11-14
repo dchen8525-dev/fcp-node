@@ -126,7 +126,7 @@ function collectSettings() {
     listenHost: el.listenHost.value.trim() || '127.0.0.1',
     listenPort: Number(el.listenPort.value) || 1080,
     mtu: Number(el.mtu.value) || 1040,
-    fec: el.fec.value.trim() || '10:6',
+    fec: el.fec.value.trim() || '10:4',
     logLevel: el.logLevel.value,
     logFile: el.logFile.value.trim(),
     pmtud: el.pmtud.checked,
@@ -149,9 +149,10 @@ function scheduleSave() {
   }
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const s = collectSettings();
-    delete s.remember;
-    window.fcp.saveSettings(s);
+    // Keep remember:true in the stored object. Dropping it saved the key but
+    // left the flag false, so after a restart the checkbox was unchecked while
+    // the key was restored — and the next field edit wiped the key.
+    window.fcp.saveSettings(collectSettings());
   }, 350);
 }
 
@@ -213,7 +214,12 @@ async function start() {
   if (!(cfg.mtu >= 128 && cfg.mtu <= 9000)) return flashNote('MTU 需在 128..9000', 'error');
   const key = el.key.value.replace(/\s+/g, '').replace(/^0x/i, '');
   if (!HEX32.test(key)) return flashNote('密钥需为 32 位十六进制', 'error');
-  if (!/^\d+:\d+$/.test(cfg.fec)) return flashNote('FEC 需形如 10:6', 'error');
+  const fecMatch = /^(\d+):(\d+)$/.exec(cfg.fec);
+  if (!fecMatch) return flashNote('FEC 需形如 10:4', 'error');
+  const fecD = Number(fecMatch[1]), fecP = Number(fecMatch[2]);
+  if (fecD < 1 || fecD > 256 || fecP < 0 || fecP > 7 || fecD + fecP > 256) {
+    return flashNote('FEC 超出范围（D 1..256，P 0..7，D+P≤256）', 'error');
+  }
 
   el.toggleBtn.disabled = true;
   try {
@@ -442,9 +448,14 @@ el.speedBtn.addEventListener('click', async () => {
     const total = Number(el.speedSeconds.value) || 10;
     el.speedMeter.style.width = `${Math.min(100, (s / total) * 100).toFixed(1)}%`;
   }, 200);
+  // The proxy may be bound to a specific address; hardcoding 127.0.0.1 made
+  // every speed test fail with ECONNREFUSED unless the bind was loopback.
+  // Wildcard binds are reachable on loopback.
+  const bind = el.listenHost.value.trim() || '127.0.0.1';
+  const socksHost = (bind === '0.0.0.0' || bind === '::' || bind === '[::]') ? '127.0.0.1' : bind;
   await window.fcp.speedStart({
     url, seconds: Number(el.speedSeconds.value) || 10,
-    socksHost: '127.0.0.1', socksPort: Number(el.speedPort.value) || 1080,
+    socksHost, socksPort: Number(el.speedPort.value) || 1080,
   });
 });
 

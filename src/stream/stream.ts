@@ -78,7 +78,13 @@ export class Stream {
   private tx: SndSeg[] = [];
   private peerRwnd: number;
   private finPending = false; private finSent = false; private finOffset = 0;
+  // Duplicate-ACK detection for the send direction. Kept separate from the
+  // SACK-rotation state below: sharing one pair made an inbound ACK we emitted
+  // (which rewrites these to our own rcvNxt) look like a repeated peer ACK, and
+  // made a delivered segment clear the duplicate-ACK tally, so fast retransmit
+  // either fired spuriously or never armed.
   private lastAckCum = 0; private haveAckCum = false; private dupAcks = 0;
+  private sackRotateCum = 0; private sackRotateHave = false;
   /** Highest byte offset the peer has ever reported receiving (cum ack or any
    *  SACK block). Anything below it that is neither acked nor sacked is
    *  provably missing, which is the only safe basis for fast retransmit. */
@@ -206,6 +212,11 @@ export class Stream {
   get eofReceived(): boolean { return this.eofDelivered; }
   get cumAcked(): number { return this.sndUna; }
   get deliveryPendingBytes(): number { return this.deliveryPending; }
+  /** Negotiated wide ACK. Diagnostic: sid streams must inherit it. */
+  get ackV2Enabled(): boolean { return this.cfg.ackV2; }
+  /** Highest byte the peer has ever reported (cumulative or SACK). Diagnostic:
+   *  a SACK range past sndMax must not raise it. */
+  get sackedHighWater(): number { return this.sackedHigh; }
 
   /** Bytes the host may still write. In-flight bytes count: the C++ send_space()
    *  subtracts (queued - acked), and leaving them out let the host queue a full
@@ -220,7 +231,11 @@ export class Stream {
   consumed(n: number): void { this.deliveryPending = Math.max(0, this.deliveryPending - n); }
 
   write(data: Uint8Array, nowMs: number): number {
-    if (this.finPending || this.state === StreamState.Closed) return 0;
+    // Once our FIN has been emitted the byte stream ends at finOffset: new data
+    // would be sequenced *after* the fin pseudo-byte, reach the peer as bytes
+    // past its peerFinAt, and be thrown away as badSegs while the local side
+    // believed it had been queued. Refuse it instead.
+    if (this.finPending || this.finSent || this.state === StreamState.Closed) return 0;
     const room = this.sendSpace();
     const take = Math.min(data.length, room);
     if (take <= 0) return 0;
@@ -231,7 +246,12 @@ export class Stream {
   }
 
   closeWrite(nowMs: number): void {
-    if (this.finPending || this.state === StreamState.Closed) return;
+    // `finSent` matters: after the FIN was emitted once, finPending is false
+    // again, so a second closeWrite (an 'end' plus an error path, a host that
+    // calls it defensively) used to enqueue a *second* FIN one byte past the
+    // first. The peer rejects the new fin offset as a protocol violation and
+    // never acks it, so the stream hung in SendingFin until the idle timer.
+    if (this.finPending || this.finSent || this.state === StreamState.Closed) return;
     this.finPending = true;
     this.state = StreamState.SendingFin;
     this.pump(nowMs);
@@ -484,14 +504,14 @@ export class Stream {
     }
     let sackStart = cum, sackEnd = cum;
     if (this.oob.length) {
-      if (this.haveAckCum && cum === this.lastAckCum) ++this.sackRotate;
+      if (this.sackRotateHave && cum === this.sackRotateCum) ++this.sackRotate;
       else this.sackRotate = 0;
-      this.lastAckCum = cum; this.haveAckCum = true;
+      this.sackRotateCum = cum; this.sackRotateHave = true;
       const blk = this.oob[this.sackRotate % this.oob.length];
       sackStart = blk.offset;
       sackEnd = (blk.offset + blk.bytes.length) >>> 0;
     } else {
-      this.haveAckCum = false; this.sackRotate = 0;
+      this.sackRotateHave = false; this.sackRotate = 0;
     }
     this.cb.send(encodeAck(cum, rwnd, sackStart, sackEnd));
   }
@@ -499,7 +519,11 @@ export class Stream {
   private onAck(cum: number, rwnd: number, ranges: Array<{ start: number; end: number }>, nowMs: number): void {
     if (seqAfter(cum, this.sndMax)) { ++this.badSegs; return; }
     this.peerRwnd = rwnd;
-    this.sackRanges = ranges.filter((r) => seqAfter(r.end, r.start));
+    // A SACK block can never describe bytes this side has not sent. Ranges
+    // past sndMax are discarded instead of being trusted: an over-large range
+    // would raise sackedHigh and mark real in-flight segments sacked, which
+    // suppresses their retransmission and permanently loses them.
+    this.sackRanges = ranges.filter((r) => seqAfter(r.end, r.start) && seqAtOrAfter(this.sndMax, r.end));
     const prevUna = this.sndUna;
     // A cumulative point that does not move forward is a duplicate or a stale
     // ACK reordered behind a newer one. Moving sndUna backwards would inflate
@@ -549,8 +573,7 @@ export class Stream {
       // RTO repeatedly and recovery takes seconds.
       this.rtoMs = this.rtoFor();
     }
-    for (const r of ranges) {
-      if (!seqAfter(r.end, r.start)) continue;
+    for (const r of this.sackRanges) {
       if (seqAfter(r.end, this.sackedHigh)) this.sackedHigh = r.end;
       for (const s of this.tx) {
         if (s.acked) continue;

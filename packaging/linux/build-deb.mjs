@@ -91,10 +91,14 @@ process.stdout.write(`node ${NODE_VERSION}: sha256 ok (${got})\n`);
 const nodeRoot = `node-v${NODE_VERSION}-linux-x64`;
 const nodeExtract = join(stage, '.nodedist');
 mkdirSync(nodeExtract, { recursive: true });
-// --force-local: GNU tar treats "D:\..." as a remote host spec without it;
-// forward slashes also stop it from escaping the Windows path separators.
+// --force-local: GNU tar treats "D:\..." as a remote host spec without it.
+// bsdtar (the tar on Windows' PATH, and on macOS) rejects the option outright,
+// so probe the flavour instead of assuming GNU. Forward slashes keep either
+// tar from mangling the Windows path separators.
 const fwd = (x) => x.replaceAll('\\', '/');
-run('tar', ['--force-local', '-xzf', fwd(nodeTgz), '-C', fwd(nodeExtract),
+const gnuTar = (spawnSync('tar', ['--version'], { encoding: 'utf8' }).stdout ?? '')
+  .includes('GNU tar');
+run('tar', [...(gnuTar ? ['--force-local'] : []), '-xzf', fwd(nodeTgz), '-C', fwd(nodeExtract),
   '--strip-components=1', `${nodeRoot}/bin/node`, `${nodeRoot}/LICENSE`]);
 const binNode = join(stage, 'opt', 'fcp-node', 'node', 'bin', 'node');
 renameSync(join(nodeExtract, 'bin', 'node'), binNode);

@@ -330,17 +330,41 @@ try {
   add('wrong PSK rejected', badProbe.greeted && !badEstablished && !badProbe.replied,
     `local-entry=${badProbe.greeted} established=${badEstablished} socks5-success=${badProbe.replied}`);
 
-  const authNoise = [...logs.server, ...logs.client, ...logs.bad]
-    .filter((l) => /auth_fail|authentication failed|struct fail/i.test(l));
-  add('no auth/structure failures on the good path', authNoise.length === 0,
-    authNoise.length ? authNoise.slice(0, 3).join(' | ') : 'clean');
+  // Scope rejections to the *good* client's salt: the wrong-PSK probe's
+  // datagrams are deliberately rejected and would otherwise mask a real
+  // failure (and the old /auth_fail|authentication failed|struct fail/ regex
+  // matched nothing at all, so the check always passed).
+  const goodTag = (logs.client.find((l) => /session start/.test(l))?.match(/\[([0-9a-f]{8})\]/) ?? [])[1];
+  const scoped = [
+    ...logs.server.filter((l) => !goodTag || l.includes(`[${goodTag}]`)),
+    ...logs.client,
+  ];
+  const authNoise = scoped.filter((l) => /REJECT auth-fail/.test(l));
+  const structHigh = [...logs.server, ...logs.client]
+    .map((l) => /structFail=(\d+)/.exec(l))
+    .filter(Boolean)
+    .map((m) => Number(m[1]))
+    .filter((n) => n > 0);
+  add('no auth/structure failures on the good path',
+    authNoise.length === 0 && structHigh.length === 0,
+    authNoise.length ? authNoise.slice(0, 3).join(' | ')
+      : structHigh.length ? `structFail=${Math.max(...structHigh)}` : 'clean');
 
   // PMTUD must actually move the budget upward: a probe is sent, the peer
   // accepts it (its receive limit is decoupled from its own send budget) and
   // answers, and the sender raises payloadMax. Without the ACK this is dead.
   const pmtuAcks = [...logs.server, ...logs.client].filter((l) => /PMTU ack mtu=/.test(l));
-  add('PMTUD raises the datagram budget', pmtuAcks.length > 0,
-    pmtuAcks.length ? pmtuAcks[pmtuAcks.length - 1].trim() : 'no PMTU ack in either log');
+  // An ACK alone proves nothing: require payloadMax to actually grow from the
+  // session-start value (a no-op raiseLimits() used to pass this check).
+  const payloadMax = [...logs.client, ...logs.server]
+    .map((l) => /payloadMax=(\d+)/.exec(l))
+    .filter(Boolean)
+    .map((m) => Number(m[1]));
+  const grew = payloadMax.length >= 2 && Math.max(...payloadMax) > Math.min(...payloadMax);
+  add('PMTUD raises the datagram budget', pmtuAcks.length > 0 && grew,
+    pmtuAcks.length
+      ? `${pmtuAcks[pmtuAcks.length - 1].trim()} (payloadMax ${Math.min(...payloadMax)} -> ${Math.max(...payloadMax)})`
+      : 'no PMTU ack in either log');
 } catch (e) {
   add('probe itself', false, e.stack ?? e.message);
 } finally {

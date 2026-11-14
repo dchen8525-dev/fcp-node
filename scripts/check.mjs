@@ -46,7 +46,14 @@ const pass = m ? Number(m[1]) : 0;
 const fail = f ? Number(f[1]) : 1;
 const testOk = t.status === 0 && fail === 0;
 results.push(['node:test suite', testOk ? 'PASS' : 'FAIL', `${pass} passed / ${fail} failed`]);
-if (!testOk) { console.error(out.split('\n').filter((l) => /not ok|error:|# fail/.test(l)).join('\n')); ++failed; }
+if (!testOk) {
+  // The spec reporter marks failures with "✖" and "ℹ fail"; matching only TAP
+  // made a red gate print no failing-test line at all.
+  console.error(out.split('\n')
+    .filter((l) => /^\s*✖|^\s*not ok|^Error:|^\s*error:|ℹ fail|# fail/.test(l))
+    .join('\n'));
+  ++failed;
+}
 
 // 3. Acceptance line: two independent CLI processes, real UDP handshake +
 // traffic. Also covered by tests/self-interop.test.ts in the suite above;

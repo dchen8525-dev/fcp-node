@@ -8,7 +8,8 @@ C++ 源码只作为线格式参考；唯一验收线是 **Node 服务端与 Node
 
 ## 环境要求
 
-- Node.js **>= 22.6**（实测 v22.22.2），依赖其原生 TypeScript strip-types，直接 `node xxx.ts`
+- Node.js **>= 22.18**（实测 v22.22.2），依赖其原生 TypeScript strip-types，直接 `node xxx.ts`
+  （22.6–22.17 需要 `--experimental-strip-types`，本项目的脚本不传该参数）
 - **零运行时依赖、零构建步骤**：只用 `node:crypto` / `node:dgram` / `node:net` / `node:test` / `node:fs`
 - 不需要 `npm install`，不需要 `tsc`
 
@@ -41,7 +42,7 @@ PSK 在本项目的部署方式里是**直接内联**的（两端同一个值，
 密钥只有一个来源：`--key=HEX32`，必须显式给出，两端相同。
 `--key-env` / 隐式 `FCP_PSK` / `--key-file` / `--psk-file` / `-k` 全部删除 —— 环境变量与文件都只是把同一串 32 位十六进制绕一圈再交给 `--key`。
 
-**握手是按需触发的**：客户端在收到第一条本地代理连接时才为该连接创建会话（一个本地 TCP 连接 = 一个 salt = 一条 FCP 会话），所以刚启动进程时还没有握手；发起第一次 `curl` 后，两端日志会出现 `FCP established: ...`。
+**握手是按需触发的**：客户端在收到第一条本地代理连接时才创建会话，所以刚启动进程时还没有握手；发起第一次 `curl` 后，两端日志会出现 `FCP established: ...`。自 0.0.3 起默认开启 M1 多路复用：客户端维护最多 2 条共享会话池，每个本地 TCP 连接占用其中一条会话的一个 sid（每会话最多 255 条），因此**不再是一个本地连接对应一个 salt/会话**。
 
 ## 主要参数
 
@@ -121,7 +122,6 @@ src/
 tests/        bytes / protocol / golden / e2e / self-interop
 scripts/      check.mjs self-interop.mjs
 docs/         协议格式.md 移植对照与差异.md
-deploy/       psk.txt（该 PSK 的文本备份；脚本已改为内联 --key，不再读取它）
 scripts/      start-client.cmd（本机客户端一键启动）
 ```
 
@@ -163,13 +163,13 @@ node scripts/self-interop.mjs --log-dir=logs/smoke
 npm run pack:deb            # 首次会下载并校验 Node 22 到 packaging/.cache；deb 由 Node 直接生成
 npm run pack:client-exe     # 复用 desktop/node_modules 里的 esbuild
 npm --prefix desktop install
-npm --prefix desktop run pack   # -> desktop/dist/FCP-Node-*.exe
+npm --prefix desktop run pack   # -> desktop/dist/fcp-node-<ver>-portable.exe 与 fcp-node-setup-<ver>.exe
 ```
 
 服务端安装：
 
 ```bash
-sudo apt install ./fcp-server_0.0.2_amd64.deb
+sudo apt install ./fcp-server_<ver>_amd64.deb
 # 安装脚本会打印随机生成的 PSK；把同一个 key 填到客户端
 sudo systemctl enable --now fcp-node
 systemctl status fcp-node
@@ -182,7 +182,7 @@ tail -f /var/log/fcp-node/server.log
 客户端 exe 与桌面端参数一致：
 
 ```bat
-fcp-client-0.0.2.exe --key=<HEX32> --peer=<SERVER_IP>:4461 -b 127.0.0.1:1080
+fcp-client-<ver>.exe --key=<HEX32> --peer=<SERVER_IP>:4461 -b 127.0.0.1:1080
 ```
 
 ## 当前 VPS 部署（2026-11-11）

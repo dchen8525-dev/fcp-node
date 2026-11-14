@@ -29,3 +29,6 @@ dist/
 
 # literal-tilde dir from an unexpanded ~ path argument
 /~/
+
+# 另一会话的临时实验脚本与日志
+.tmp-test/

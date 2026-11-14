@@ -2,7 +2,7 @@
 // local proxy 1080, MTU 1400, FEC 10:4), same key sources, same long flags.
 // Zero runtime dependencies; run with `node src/app/cli.ts server|client ...`.
 
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createServer, connect } from 'node:net';
 import { randomBytes } from 'node:crypto';
@@ -13,6 +13,7 @@ import { TunnelClient, TunnelServer, type TunnelOptions } from './tunnel.ts';
 import {
   flushTraces, normaliseTracePrefix, resolveTraceFiles, summariseTrace,
 } from '../util/trace.ts';
+import { makeLogger } from '../util/log.ts';
 
 const USAGE = `FCP ${PRODUCT_VERSION} (Node.js port)
 Usage:
@@ -51,7 +52,8 @@ MTU (PMTUD is ON by default):
                         not a cap: the tunnel grows past it as the path proves it.
                         With --no-pmtud this becomes the fixed budget.
                         (--packet-size / --mtu / -m were removed; they are rejected)
-  --mtu-max=N           ceiling for the walk (default 1500; 128..9000, >= --mtu-min).
+  --mtu-max=N           ceiling for the walk (default 1500, raised to --mtu-min when
+                        that is higher; 128..9000, >= --mtu-min).
                         Probes step up by 100B until the path answers or this is hit.
   --no-pmtud            disable probing and pin the datagram budget at --mtu-min
                         (--pmtud is gone: probing is already the default)
@@ -248,56 +250,6 @@ function parseFec(v: string | undefined): { d: number; p: number } {
   return { d, p };
 }
 
-/** How long log lines may sit in memory before being written out. */
-const LOG_FLUSH_MS = 200;
-/** Force a flush once this much text is buffered, so a crash loses little. */
-const LOG_FLUSH_BYTES = 64 * 1024;
-
-function makeLogger(level: string, logFile?: string): (line: string) => void {
-  const rank: Record<string, number> = { debug: 10, info: 20, warn: 30, error: 40, off: 100 };
-  const threshold = rank[level] ?? 20;
-  if (threshold >= 100) return () => {};
-  if (logFile) mkdirSync(dirname(logFile), { recursive: true });
-
-  // Batched sink. One synchronous write per line costs ~0.5 ms on Windows
-  // (open+write+close per call), and at 2 000 segments/s that alone drops
-  // throughput from 2.3 MB/s to 100 KB/s - a 22x loss that has nothing to do
-  // with the protocol. Coalescing into LOG_FLUSH_MS / LOG_FLUSH_BYTES keeps
-  // debug logging usable on the data path.
-  let pending: string[] = [];
-  let pendingBytes = 0;
-  const flush = (): void => {
-    if (pending.length === 0) return;
-    const text = pending.join('');
-    pending = [];
-    pendingBytes = 0;
-    process.stderr.write(text);
-    if (logFile) appendFileSync(logFile, text);
-  };
-  const timer = setInterval(flush, LOG_FLUSH_MS);
-  timer.unref();
-  process.on('exit', flush);
-
-  return (line: string) => {
-    // Explicit prefixes ('DBG ' / 'WRN ' / 'ERR ') win over the keyword guess
-    // below, so CLI-level advisories are classified deterministically.
-    const isDbg = line.startsWith('DBG ');
-    const isWrn = line.startsWith('WRN ');
-    const isErr = line.startsWith('ERR ');
-    if (isDbg && threshold > 10) return;
-    const sev = isDbg ? 10 : isErr ? 40 : isWrn ? 30 :
-      /error|fail|refused|exhaust/i.test(line) ? 40 :
-      /warn|reset|stale|dead/i.test(line) ? 30 : 20;
-    if (sev < threshold) return;
-    const tag = isDbg ? 'DEBUG' : sev >= 40 ? 'ERROR' : sev >= 30 ? 'WARN' : 'INFO';
-    const body = isDbg || isWrn || isErr ? line.slice(4) : line;
-    const text = `[${new Date().toISOString()}] ${tag} ${body}\n`;
-    pending.push(text);
-    pendingBytes += text.length;
-    if (pendingBytes >= LOG_FLUSH_BYTES) flush();
-  };
-}
-
 async function speedtest(base: TunnelOptions, seconds: number): Promise<void> {
   // In-process loopback: a real FCP tunnel (handshake + envelope + FEC +
   // FCP-STREAM) carrying a local TCP echo, measured over the proxy port.
@@ -340,6 +292,9 @@ async function speedtest(base: TunnelOptions, seconds: number): Promise<void> {
   sock.on('error', () => resolveDone());
   sock.on('close', () => resolveDone());
   await Promise.race([done, new Promise<void>((r) => setTimeout(r, (seconds + 5) * 1000))]);
+  // The timeout branch used to leave this socket open, which kept the event
+  // loop alive after the report and made `speedtest` hang until killed.
+  sock.destroy();
   const elapsed = Math.max(1, Date.now() - start) / 1000;
   process.stdout.write(
     `FCP speedtest (in-process loopback, ${seconds}s):\n` +
@@ -416,7 +371,11 @@ async function main(): Promise<void> {
   const fecGeo = parseFec(opts.get('fec'));
   const debugLog = logLevel === 'debug' ? (l: string) => log(`DBG ${l}`) : undefined;
   const mtuMin = intOpt(opts, 'mtu-min', DEFAULT_MTU_MIN, 128, 9000);
-  const mtuMax = intOpt(opts, 'mtu-max', DEFAULT_PMTU_MAX_MTU, 128, 9000);
+  // A floor above the default ceiling is a legal configuration, not an error:
+  // default the ceiling to the floor instead of demanding a redundant
+  // --mtu-max on the command line. An explicit --mtu-max below the floor is
+  // still rejected below.
+  const mtuMax = intOpt(opts, 'mtu-max', Math.max(DEFAULT_PMTU_MAX_MTU, mtuMin), 128, 9000);
   if (mtuMax < mtuMin) {
     throw new Error(`--mtu-max=${mtuMax} is below --mtu-min=${mtuMin}; the probe walk needs a ceiling at or above its floor`);
   }

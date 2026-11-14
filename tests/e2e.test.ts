@@ -5,8 +5,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, connect, type Server } from 'node:net';
+import { createSocket } from 'node:dgram';
 import { randomBytes } from 'node:crypto';
 import { TunnelClient, TunnelServer } from '../src/app/tunnel.ts';
+import { DATA_WIRE_OVERHEAD } from '../src/constants.ts';
 
 const PSK = randomBytes(16);
 const MARKER = 'FCP-NODE-E2E-OK';
@@ -205,6 +207,53 @@ test('e2e: wrong PSK cannot establish a tunnel', async (t) => {
   assert.equal(server.sessionCount, 0,
     'an unauthenticated datagram is answered with #86 reset and leaves no session behind');
   sock.destroy();
+});
+
+test('e2e: sealed bootstrap datagrams are remembered so replays expire', () => {
+  // Replaying a captured HELLO after its session is gone authenticates under
+  // the static bootstrap key and would create a fresh session (and reflect a
+  // HELLO_ACK). The per-session nonce window cannot see this, so the server
+  // keeps a bounded global salt|nonce cache.
+  const srv = new TunnelServer({ psk: PSK, port: 0, log: () => {} });
+  const api = srv as unknown as {
+    bootstrapId(b: Buffer): string | null;
+    isBootstrapReplay(id: string, now: number): boolean;
+    rememberBootstrap(id: string, now: number): void;
+  };
+  const wire = Buffer.concat([randomBytes(8), Buffer.alloc(8), Buffer.alloc(40)]);
+  const id = api.bootstrapId(wire);
+  assert.ok(id, 'salt+nonce identifies the datagram');
+  assert.equal(api.isBootstrapReplay(id!, 1000), false, 'unseen');
+  api.rememberBootstrap(id!, 1000);
+  assert.equal(api.isBootstrapReplay(id!, 1000 + 179_000), true, 'still inside the TTL');
+  assert.equal(api.isBootstrapReplay(id!, 1000 + 180_001), false, 'forgotten after the TTL');
+});
+
+test('e2e: an unauthenticated datagram never produces more bytes than it carried', async (t) => {
+  // Creating the session used to tick it once before authenticating anything,
+  // so one well-formed 36-byte datagram with a random salt made the server
+  // emit its own HELLO (~70 B) *plus* the stateless reset (36 B) to the source
+  // address - a ~3x UDP reflector for a spoofed source. A reset is still
+  // allowed: it is at most as large as the request.
+  const udpPort = freePort();
+  const server = new TunnelServer({ psk: PSK, port: udpPort, log: () => {} });
+  await server.start();
+  t.after(() => server.stop());
+  const sock = createSocket('udp4');
+  await new Promise<void>((r) => sock.bind(0, '127.0.0.1', () => r()));
+  t.after(() => sock.close());
+  const replies: Buffer[] = [];
+  sock.on('message', (m) => replies.push(Buffer.from(m)));
+
+  const req = Buffer.concat([randomBytes(8), Buffer.alloc(DATA_WIRE_OVERHEAD - 8, 0x41)]);
+  assert.equal(req.length, DATA_WIRE_OVERHEAD, 'shaped like the smallest FCP datagram');
+  sock.send(req, udpPort, '127.0.0.1');
+  await new Promise((r) => setTimeout(r, 250));
+
+  const replyBytes = replies.reduce((n, b) => n + b.length, 0);
+  assert.ok(replyBytes <= req.length,
+    `replied ${replyBytes}B to a ${req.length}B unauthenticated datagram (amplification)`);
+  assert.equal(server.sessionCount, 0, 'an unauthenticated datagram leaves no session behind');
 });
 
 test('e2e: window-pressure integrity — bursty upload + paced download stay byte-exact', async (t) => {

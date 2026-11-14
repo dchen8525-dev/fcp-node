@@ -155,6 +155,11 @@ export class Session {
   private notifyClosed(reason: string): void {
     if (this.closeNotified) return;
     this.closeNotified = true;
+    // The session is terminal from here: hosts stop ticking it and remove it.
+    // Wiping the key material now bounds how long the derived keys outlive the
+    // connection instead of leaving them in the heap until GC.
+    this.env.destroy();
+    this.hsEnv.destroy();
     this.cb.closed(reason);
   }
 
@@ -281,6 +286,11 @@ export class Session {
   /** Feed one UDP datagram. Returns false when authentication failed. */
   onWire(wire: Uint8Array, nowMs: number): boolean {
     this.nowMs = nowMs;
+    // A closed session must not keep decrypting, dispatching or emitting: the
+    // host removes it on its next tick, and anything arriving in between used
+    // to be processed as if the session were alive (including sending data on
+    // a stream the peer already considers gone).
+    if (this.closeNotified) return false;
     // Stateless reset first, by shape. A reset is sealed under the *bootstrap*
     // key, so it is also a valid bootstrap envelope. Detecting it only after
     // env.open() misses the case where the envelope layer can still decrypt it
@@ -376,7 +386,7 @@ export class Session {
     }
     if (this.dispatchHandshake(payload, nowMs)) return;
     if (this.isPmtuFrame(payload) && this.pmtuHandle(payload, nowMs)) return;
-    this.handleFecstat(payload);
+    this.handleFecstat(payload, nowMs);
   }
 
   private dispatchHandshake(payload: Buffer, nowMs: number): boolean {
@@ -438,10 +448,16 @@ export class Session {
     this.cb.log?.(`FCP established: D=${np.d} P=${np.p} tlv=${this.hs.tlvNegotiated()} ackv2=${this.hs.tlvAgreed(TLV_TYPE_ACK_V2)} ` +
       `mtu=${this.pmtuMtu}${this.cfg.pmtud ? `->${this.pmtuMaxMtu} (pmtud)` : ' (fixed)'} payloadMax=${this.limits.payloadMax}`);
     this.dbg(`[${this.tag()}] ESTABLISHED D=${np.d} P=${np.p} tlv=${this.hs.tlvNegotiated()} ackv2=${this.hs.tlvAgreed(TLV_TYPE_ACK_V2)} k=${this.strategy.currentK()} keyUpdate=${this.env.keyUpdate} srtt=${this.bbr.srttMs}ms`);
-    for (const seg of this.hs.takeCachedData()) this.tx.onSegment(seg, nowMs);
+    // Data queued before the handshake was cached unframed, because mux was not
+    // known yet. Replaying it raw put the stream type at offset 0; a mux peer
+    // read it as the sid byte, routed it to a phantom sid and never ACKed the
+    // default stream, so the bytes were retransmitted until the idle timeout.
+    for (const seg of this.hs.takeCachedData()) {
+      this.tx.onSegment(this.mux ? this.frameSid(0, seg) : seg, nowMs);
+    }
   }
 
-  private handleFecstat(payload: Buffer): void {
+  private handleFecstat(payload: Buffer, nowMs: number): void {
     const r = this.validator.validate(payload, this.salt);
     if (r.status === FecstatStatus.Duplicate) { ++this.fecstatDup; return; }
     if (r.status !== FecstatStatus.Ok || !r.packet) {
@@ -449,7 +465,7 @@ export class Session {
       if (r.status === FecstatStatus.Stale) ++this.fecstatStale;
       return;
     }
-    this.strategy.onFecstat(r.packet);
+    this.strategy.onFecstat(r.packet, nowMs);
     this.tx?.setK(this.strategy.currentK());
   }
 
@@ -595,9 +611,15 @@ export class Session {
 
   private onStreamSegment(seg: Buffer): void {
     if (!this.hs.established) { this.hs.cacheData(seg); return; }
-    if (this.hs.failed) return;
+    if (this.hs.failed || this.closeNotified) return;
     if (!this.tx) return;
-    const kind = seg.length > 0 ? seg[0] : 0;
+    // In mux mode every segment (control included) is prefixed with its 1-byte
+    // sid, so the stream type is at offset 1. Reading seg[0] there returned the
+    // sid instead: sid 1..3 looked like DATA/ACK/RST and sid 0 like nothing, so
+    // no ACK ever took the fast-flush path. Every ack then waited for D symbols
+    // or the ≈srtt flush timer, which delays SACK evidence by a whole round and
+    // capped recovery in the one mode the client actually uses.
+    const kind = this.mux ? (seg.length > 1 ? seg[1] : 0) : (seg.length > 0 ? seg[0] : 0);
     this.dbg(`[${this.tag()}] stream seg tx len=${seg.length} cumAcked=${this.stream.cumAcked}`);
     this.tx.onSegment(seg, this.nowMs);
     ++this.dataTx;
@@ -619,7 +641,15 @@ export class Session {
 
   private makeStream(sid: number, cb: StreamCallbacks): Stream {
     const stream = new Stream(
-      { maxSegment: this.limits.payloadMax - (this.mux ? 1 : 0), initialSrttMs: this.cfg.initialSrttMs ?? DEFAULT_SRTT_MS },
+      {
+        maxSegment: this.limits.payloadMax - (this.mux ? 1 : 0),
+        initialSrttMs: this.cfg.initialSrttMs ?? DEFAULT_SRTT_MS,
+        // The default stream gets this in configure(); sid streams are created
+        // later and used to fall back to the classic single-block ACK even when
+        // ACK v2 was negotiated, silently halving SACK coverage on every
+        // multiplexed connection.
+        ackV2: this.hs.tlvAgreed(TLV_TYPE_ACK_V2),
+      },
       {
         ...cb,
         send: (seg) => this.sendStreamSegment(sid, seg),
@@ -649,6 +679,11 @@ export class Session {
    *  fresh stream) is created through the host, or dropped when refused. */
   private deliverStreamFrame(bytes: Buffer): void {
     if (!this.mux) { this.stream.onSegment(bytes, this.nowMs); return; }
+    // A zero-length symbol cannot carry the sid byte. FrameRx can legitimately
+    // produce one (a repaired symbol whose declared length is 2), and reading
+    // bytes[0] of it yielded `undefined`, which the server then used as a map
+    // key and a stream id.
+    if (bytes.length === 0) { ++this.structFail; return; }
     const sid = bytes[0];
     let stream = sid === 0 ? this.stream : this.streams.get(sid);
     if (!stream) {
@@ -748,6 +783,7 @@ export class Session {
 
   onTick(nowMs: number): void {
     this.nowMs = nowMs;
+    if (this.closeNotified) return;
     if (!this.hs.established) this.hs.onTick(nowMs);
     if (this.hs.established && !this.configured) this.configure(nowMs);
     if (this.hs.failed) { this.notifyClosed('handshake_failure'); return; }

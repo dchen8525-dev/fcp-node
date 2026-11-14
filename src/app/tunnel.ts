@@ -89,6 +89,12 @@ const MAX_NEW_SESSIONS_PER_IP = 64;
 const RATE_WINDOW_MS = 1000;
 /** Bound the bookkeeping maps: a spoofed-source flood must not grow them. */
 const RATE_MAP_MAX = 4096;
+/** How long one sealed bootstrap datagram is remembered. A replay of a captured
+ *  HELLO authenticates (the bootstrap key is static per PSK+salt) and would
+ *  otherwise create a fresh server session every time it is replayed from a new
+ *  spoofed source. Legitimate HELLO retries seal a fresh nonce each attempt, so
+ *  exact duplicates are replays or network duplicates, never retries. */
+const BOOT_REPLAY_TTL_MS = 180_000;
 
 function nowMs(): number { return Date.now(); }
 
@@ -440,7 +446,8 @@ export class TunnelClient {
           `retxSplit=${b.session.retxSplit} k=${st.k} loss=${(b.session.fecLoss * 100).toFixed(1)}% srtt=${st.srttMs}ms ` +
           `sendBw=${(b.session.sendRateBytesPerMs * 1000 / 1048576).toFixed(2)}MB/s ` +
           `recvNext=${b.session.recvNext} ` +
-          `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B`);
+          `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B ` +
+          `authFail=${st.authFail} structFail=${st.structFail}`);
       }
       // Session-level isClosed only: on a shared mux session the default
       // stream may idle out while sid streams live — that must not tear the
@@ -778,6 +785,9 @@ export class TunnelServer {
   private dbg: (line: string) => void;
   private newSessionsByIp = new Map<string, { count: number; windowStart: number }>();
   private resetReplyByIp = new Map<string, number>();
+  /** salt|nonce of bootstrap datagrams already accepted, with their arrival
+   *  time. Bounded; see rememberBootstrap(). */
+  private seenBootstrap = new Map<string, number>();
 
   constructor(opts: TunnelOptions) {
     this.opts = opts;
@@ -846,6 +856,45 @@ export class TunnelServer {
     for (const [ip, t] of this.resetReplyByIp) {
       if (now - t >= RATE_WINDOW_MS * 10) this.resetReplyByIp.delete(ip);
     }
+    // Time-based pruning cannot bound a flood of *fresh* spoofed IPs (nothing
+    // is old enough to expire), so the map used to grow with the spoofable
+    // address space. Evict from the front — Map iterates in insertion order —
+    // down to half the cap so the next eviction is amortised.
+    while (this.newSessionsByIp.size > RATE_MAP_MAX / 2) {
+      const oldest = this.newSessionsByIp.keys().next().value;
+      if (oldest === undefined) break;
+      this.newSessionsByIp.delete(oldest);
+    }
+    while (this.resetReplyByIp.size > RATE_MAP_MAX / 2) {
+      const oldest = this.resetReplyByIp.keys().next().value;
+      if (oldest === undefined) break;
+      this.resetReplyByIp.delete(oldest);
+    }
+  }
+
+  /** Identity of one sealed bootstrap datagram: salt (8) | nonce (8). */
+  private bootstrapId(msg: Buffer): string | null {
+    if (msg.length < SALT_LEN + 8) return null;
+    return msg.subarray(0, SALT_LEN + 8).toString('hex');
+  }
+
+  private isBootstrapReplay(id: string, now: number): boolean {
+    const seen = this.seenBootstrap.get(id);
+    return seen !== undefined && now - seen < BOOT_REPLAY_TTL_MS;
+  }
+
+  private rememberBootstrap(id: string, now: number): void {
+    if (this.seenBootstrap.size >= RATE_MAP_MAX) {
+      for (const [k, t] of this.seenBootstrap) {
+        if (now - t >= BOOT_REPLAY_TTL_MS) this.seenBootstrap.delete(k);
+      }
+      while (this.seenBootstrap.size >= RATE_MAP_MAX) {
+        const oldest = this.seenBootstrap.keys().next().value;
+        if (oldest === undefined) break;
+        this.seenBootstrap.delete(oldest);
+      }
+    }
+    this.seenBootstrap.set(id, now);
   }
 
   private onUdp(msg: Buffer, rinfo: RemoteInfo): void {
@@ -871,6 +920,16 @@ export class TunnelServer {
       return;
     }
     if (this.sessions.size >= MAX_TUNNEL_SESSIONS) return;
+    // A sealed bootstrap datagram (normally a HELLO) carries its salt and nonce
+    // in the clear. One recorded by an on-path observer authenticates forever,
+    // and each replay from a spoofed source would create a fresh session and
+    // reflect a HELLO_ACK to that victim. The replay window is per session, so
+    // it cannot catch this; drop exact duplicate datagrams globally instead.
+    const bootId = this.bootstrapId(msg);
+    if (bootId && this.isBootstrapReplay(bootId, nowMs())) {
+      this.dbg(`[${key.slice(0, 8)}] bootstrap replay dropped (${rinfo.address}:${rinfo.port})`);
+      return;
+    }
     if (!this.allowNewSession(rinfo.address, nowMs())) return;
     const created = this.createSession(msg.subarray(0, SALT_LEN), rinfo);
     if (!created) return;
@@ -897,6 +956,7 @@ export class TunnelServer {
       created.trace?.close();
       return;
     }
+    if (bootId) this.rememberBootstrap(bootId, nowMs());
     this.sessions.set(key, created);
   }
 
@@ -911,7 +971,8 @@ export class TunnelServer {
           `retxSplit=${b.session.retxSplit} k=${st.k} loss=${(b.session.fecLoss * 100).toFixed(1)}% srtt=${st.srttMs}ms ` +
           `sendBw=${(b.session.sendRateBytesPerMs * 1000 / 1048576).toFixed(2)}MB/s ` +
           `recvNext=${b.session.recvNext} ` +
-          `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B`);
+          `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B ` +
+          `authFail=${st.authFail} structFail=${st.structFail}`);
       }
       if (b.session.isClosed) {
         this.sessions.delete(key);
@@ -1030,7 +1091,12 @@ export class TunnelServer {
     });
     if (!session.start(nowMs())) { trace?.close(); return null; }
     this.dbg(`[${key.slice(0, 8)}] session+ from ${rinfo.address}:${rinfo.port}`);
-    session.onTick(nowMs());
+    // Deliberately no onTick() here. Ticking before the first datagram has been
+    // authenticated made the server emit its own HELLO in response to *any*
+    // well-formed 36-byte garbage, i.e. ~3x amplification to a spoofed source.
+    // A real client's HELLO is answered by onWire() -> onHello() -> ACK; any
+    // other authenticated first packet is followed by a server HELLO on the
+    // normal 10 ms tick, after the session has been published.
     return { session, addr, sidTunnels, cleanup, trace };
   }
 
@@ -1076,9 +1142,12 @@ export class TunnelServer {
     const sock = t.targetSock;
     if (!sock || sock.destroyed || !t.openOkSent) return;
     while (t.pendingToTarget.length) {
-      const b = t.pendingToTarget[0]!;
+      // write() returning false means "queued, but above the high-water mark",
+      // not "rejected". Keeping the chunk and writing it again on 'drain'
+      // duplicated every upload chunk that crossed the 16 KB buffer: the target
+      // received the same bytes twice and the request stream was corrupted.
+      const b = t.pendingToTarget.shift()!;
       if (!sock.write(b)) break;
-      t.pendingToTarget.shift();
     }
   }
 

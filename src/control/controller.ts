@@ -64,8 +64,11 @@ export class AdaptiveFec {
   private lossRate = 0;
   /** True once a usable FECSTAT has arrived. The local ledger is then only a
    *  fallback: it describes the *inbound* direction, and using it to size
-   *  outbound parity is wrong on an asymmetric link. */
+   *  outbound parity is wrong on an asymmetric link. Expires: a peer that
+   *  silently stops reporting (one-way loss, a wedged reporter) must not
+   *  disable the local fallback for the rest of the session. */
   private peerReports = false;
+  private lastPeerReportMs = 0;
   /** Below-threshold accumulation: a slow path (< FEC_LOSS_MIN_SHARDS per
    *  report) used to be a permanent blind spot — k never moved on it. Samples
    *  from consecutive reports are summed until the noise floor is crossed,
@@ -124,7 +127,16 @@ export class AdaptiveFec {
    * our k governs the outbound one, which is why it is only a fallback.
    */
   noteLocalCounters(expectedShards: number, rxOrig: number, nowMs: number): void {
-    if (this.pinnedK > 0 || this.peerReports) return;
+    if (this.pinnedK > 0) return;
+    if (this.peerReports) {
+      // Three missed FECSTAT intervals means the peer's fast path is gone, not
+      // that the link is clean. Hand control back to the local ledger.
+      if (this.lastPeerReportMs > 0 &&
+          nowMs - this.lastPeerReportMs >= FECSTAT_INTERVAL_MS * 3) {
+        this.peerReports = false;
+      }
+      return;
+    }
     if (!this.lastLocalMs) { this.lastLocalMs = nowMs; return; }
     if (nowMs - this.lastLocalMs < FECSTAT_INTERVAL_MS) return;
     this.lastLocalMs = nowMs;
@@ -149,8 +161,9 @@ export class AdaptiveFec {
    *  - Deltas between reports, not lifetime counters, so a burst of loss moves
    *    k within one 2 s interval instead of being averaged away.
    */
-  onFecstat(stat: FecstatPacket): void {
+  onFecstat(stat: FecstatPacket, nowMs = 0): void {
     if (this.pinnedK > 0) return;
+    if (nowMs > 0) this.lastPeerReportMs = nowMs;
     // FECSTAT counters are per interval (the reporter emits deltas), exactly
     // like the C++ settlement view. `data_expected` is Σ n_used over the sets
     // settled in this interval, so short flush groups cannot inflate the

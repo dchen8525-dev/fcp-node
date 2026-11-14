@@ -22,6 +22,10 @@ let trayHintShown = false;
 let child = null;
 let childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
 let speedJob = null;
+// Every run gets a sequence number: destroying a superseded job makes its
+// close handler fire later, and it must not report a result for the new run.
+let speedSeq = 0;
+let speedCancelRequested = false;
 
 // ---------------------------------------------------------------- settings
 
@@ -179,7 +183,11 @@ function startTunnel(cfg) {
     return { ok: false, error: 'missing tunnel bundle' };
   }
   const args = [CLI_PATH, ...statsArgs(cfg)];
-  child = spawn(process.execPath, args, {
+  // Keep a local handle: a restarted tunnel's predecessor exits asynchronously,
+  // and its handlers must not clear the new process or overwrite its state.
+  // (The exit of the old child used to null out `child` after the new one was
+  // already spawned, so Stop did nothing while the UI showed "stopped".)
+  const proc = spawn(process.execPath, args, {
     // Electron's own binary doubles as the Node runtime: one exe, no sidecar
     // node.exe to ship. --experimental-strip-types is not needed because the
     // bundle is plain ESM.
@@ -187,14 +195,15 @@ function startTunnel(cfg) {
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  childState = { running: true, pid: child.pid || 0, startedAt: Date.now(),
+  child = proc;
+  childState = { running: true, pid: proc.pid || 0, startedAt: Date.now(),
     peer: `${cfg.host}:${cfg.port}`, listen: `${cfg.listenHost}:${cfg.listenPort}` };
   send('fcp:state', childState);
   rebuildTrayMenu();
 
   let buf = '';
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (chunk) => {
+  proc.stdout.setEncoding('utf8');
+  proc.stdout.on('data', (chunk) => {
     buf += chunk;
     let idx;
     while ((idx = buf.indexOf('\n')) >= 0) {
@@ -213,15 +222,16 @@ function startTunnel(cfg) {
       }
     }
   });
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', (chunk) => {
+  proc.stderr.setEncoding('utf8');
+  proc.stderr.on('data', (chunk) => {
     for (const raw of chunk.split('\n')) {
       const line = raw.trimEnd();
       if (!line) continue;
       send('fcp:log', { level: classify(line), line });
     }
   });
-  child.on('exit', (code, signal) => {
+  proc.on('exit', (code, signal) => {
+    if (child !== proc) return; // a superseded process: leave the live state alone
     const wasRunning = childState.running;
     child = null;
     childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
@@ -232,14 +242,15 @@ function startTunnel(cfg) {
         line: `tunnel exited: code=${code} signal=${signal || 'none'}` });
     }
   });
-  child.on('error', (e) => {
+  proc.on('error', (e) => {
+    if (child !== proc) return;
     send('fcp:log', { level: 'error', line: `tunnel spawn failed: ${e.message}` });
     child = null;
     childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
     send('fcp:state', childState);
     rebuildTrayMenu();
   });
-  return { ok: true, pid: child.pid };
+  return { ok: true, pid: proc.pid };
 }
 
 function stopTunnel() {
@@ -316,22 +327,28 @@ async function runSpeedTest(cfg, onDone) {
 }
 
 async function speedTestInner(cfg, onDone) {
+  const seq = ++speedSeq;
   const started = Date.now();
   const target = new URL(cfg.url);
   const host = target.hostname;
   const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
   const tlsTarget = target.protocol === 'https:';
   let total = 0, headerBytes = 0, ended = false;
+  let headerBuf = '', bodySeen = false, contentLength = -1, hardTimer = null;
 
   const finish = (message) => {
-    if (ended) return;
+    if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
+    if (ended || seq !== speedSeq) return; // superseded by a newer run
     ended = true;
+    // A user-requested stop is not a measurement: close/destroy used to report
+    // the partial byte count as a successful run.
+    const reason = message || (speedCancelRequested ? '已停止' : '');
     const elapsed = Math.max(0.2, (Date.now() - started) / 1000);
     const body = Math.max(0, total - headerBytes);
     const result = {
-      ok: !message, bytes: body, seconds: elapsed,
+      ok: !reason, bytes: body, seconds: elapsed,
       mbps: body * 8 / elapsed / 1e6, mbPerSec: body / elapsed / 1048576,
-      error: message || '', url: cfg.url,
+      error: reason, url: cfg.url,
     };
     send('fcp:speed', { done: true, ...result });
     if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
@@ -348,32 +365,64 @@ async function speedTestInner(cfg, onDone) {
   speedJob = sock;
   if (tlsTarget) {
     sock = tls.connect({ socket: sock, servername: host },
-      () => sock.write(buildRequest(target, host)));
+      () => sock.write(buildRequest(target, host, port)));
     sock.on('error', (e) => finish(`TLS: ${e.message}`));
   } else {
-    sock.write(buildRequest(target, host));
+    sock.write(buildRequest(target, host, port));
     sock.on('error', (e) => finish(`HTTP: ${e.message}`));
   }
   sock.on('data', (b) => {
     total += b.length;
-    if (headerBytes === 0) {
-      const text = b.subarray(0, Math.min(b.length, 2048)).toString('latin1');
-      const idx = text.indexOf('\r\n\r\n');
-      if (idx >= 0) headerBytes = Math.min(b.length, idx + 4);
+    if (!bodySeen) {
+      // Accumulate across reads: a header split over two TCP segments used to
+      // leave its first part counted as body, and a >2048 B header was never
+      // recognised at all.
+      headerBuf += b.toString('latin1');
+      const idx = headerBuf.indexOf('\r\n\r\n');
+      if (idx >= 0) {
+        headerBytes = idx + 4;
+        const statusMatch = /^HTTP\/\d\.\d\s+(\d{3})/.exec(headerBuf);
+        if (!statusMatch) {
+          finish('HTTP: malformed status line');
+          try { sock.destroy(); } catch { /* closed */ }
+          return;
+        }
+        const status = Number(statusMatch[1]);
+        if (status < 200 || status >= 300) {
+          // A 403/404/301 body is not a throughput measurement.
+          finish(`HTTP ${status}`);
+          try { sock.destroy(); } catch { /* closed */ }
+          return;
+        }
+        const cl = /content-length:\s*(\d+)/i.exec(headerBuf.slice(0, idx));
+        if (cl) contentLength = Number(cl[1]);
+        bodySeen = true;
+      } else if (headerBuf.length > 8192) {
+        finish('HTTP: response headers too large');
+        try { sock.destroy(); } catch { /* closed */ }
+        return;
+      }
+    }
+    if (bodySeen && contentLength >= 0 && total - headerBytes >= contentLength) {
+      finish('');
+      try { sock.destroy(); } catch { /* closed */ }
+      return;
     }
     if (Date.now() - started > (cfg.seconds || 10) * 1000) finish('');
   });
   sock.on('close', () => { if (!ended) finish(''); });
   sock.on('end', () => { if (!ended) finish(''); });
-  setTimeout(() => finish(''), (cfg.seconds || 10) * 1000 + 250);
+  hardTimer = setTimeout(() => finish(''), (cfg.seconds || 10) * 1000 + 250);
   send('fcp:speed', { done: false, url: cfg.url, seconds: (cfg.seconds || 10) });
 }
 
-function buildRequest(target, host) {
+function buildRequest(target, host, port) {
   const pathAndQuery = `${target.pathname || '/'}${target.search || ''}`;
+  const defaultPort = target.protocol === 'https:' ? 443 : 80;
+  const hostHeader = port === defaultPort ? host : `${host}:${port}`;
   return `GET ${pathAndQuery} HTTP/1.1\r\n` +
-    `Host: ${host}\r\n` +
-    'User-Agent: fcp-desktop/0.0.2\r\n' +
+    `Host: ${hostHeader}\r\n` +
+    `User-Agent: fcp-desktop/${app.getVersion()}\r\n` +
     'Accept: */*\r\n' +
     'Accept-Encoding: identity\r\n' +
     'Connection: close\r\n\r\n';
@@ -393,7 +442,10 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      // The preload only uses contextBridge/ipcRenderer, both available in a
+      // sandboxed renderer. Leaving the sandbox off removed the last defence
+      // for a window that only ever shows local content.
+      sandbox: true,
     },
   });
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
@@ -420,10 +472,12 @@ ipcMain.handle('fcp:stop', () => stopTunnel());
 ipcMain.handle('fcp:state', () => childState);
 ipcMain.handle('fcp:speed:start', (_e, cfg) => {
   if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
+  speedCancelRequested = false;
   runSpeedTest(cfg || {});
   return { ok: true };
 });
 ipcMain.handle('fcp:speed:stop', () => {
+  speedCancelRequested = true;
   if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
   return { ok: true };
 });

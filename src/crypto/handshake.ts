@@ -183,7 +183,6 @@ export class Handshake {
   private peerTlvs: HandshakeTlv[] = [];
   private peerTlvHello = false;
   private tlvOffered = false;
-  private tlvDowngraded = false;
 
   state: number = HandshakeState.Idle;
   error: HandshakeErrorValue = HandshakeError.None;
@@ -249,15 +248,20 @@ export class Handshake {
   onTick(nowMs: number): void {
     if (this.state !== HandshakeState.HelloSent || nowMs < this.nextRetryMs) return;
     if (this.retries >= HANDSHAKE_MAX_RETRIES) { this.fail(HandshakeError.NoAck); return; }
-    // #77: two unanswered TLV HELLOs -> plain v7 shape for the rest of the schedule.
-    if (this.localTlvs.length && !this.tlvDowngraded && this.retries >= 2) this.tlvDowngraded = true;
+    // The #77 plain-v7 downgrade used to fire after two unanswered HELLOs. It
+    // was removed: this proxy's data path is multiplexed and the server only
+    // serves sid streams (its default stream is intentionally unwired), so a
+    // downgraded session can never carry a connection. Worse, on the client it
+    // poisons the shared session pool: after one lossy handshake the entry is
+    // established without mux and every later connection is refused. A session
+    // with no TLVs of its own still sends the plain shape (see sendHello).
     this.sendHello();
     ++this.retries;
     this.nextRetryMs = nowMs + Math.min(this.firstGapMs * (2 ** (this.retries - 1)), HANDSHAKE_RETRY_CAP_MS);
   }
 
   private sendHello(): void {
-    const offer = this.localTlvs.length > 0 && !this.tlvDowngraded;
+    const offer = this.localTlvs.length > 0;
     const flags = offer ? (this.localFlags | CAP_TLV) & 0xff : (this.localFlags & ~CAP_TLV) & 0xff;
     const caps: HandshakeCaps = { ver: CAPS_VERSION, data: this.localD, parity: this.localP, flags };
     if (offer) this.tlvOffered = true;

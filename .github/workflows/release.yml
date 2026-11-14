@@ -43,12 +43,16 @@ jobs:
           fi
           TAG="${REF#v}"
           PKG="$(node -p "require('./package.json').version")"
-          if [ "$TAG" != "$PKG" ]; then
-            echo "::error::tag $REF does not match package.json version $PKG"
+          DESK="$(node -p "require('./desktop/package.json').version")"
+          CONST="$(node -e "const s=require('node:fs').readFileSync('src/constants.ts','utf8'); const m=s.match(/PRODUCT_VERSION = '([0-9.]+)'/); process.stdout.write(m ? m[1] : '')")"
+          if [ "$TAG" != "$PKG" ] || [ "$TAG" != "$DESK" ] || [ "$TAG" != "$CONST" ]; then
+            echo "::error::tag $REF != package.json $PKG / desktop/package.json $DESK / PRODUCT_VERSION $CONST"
             echo "::error::bump all three together: package.json, src/constants.ts PRODUCT_VERSION, desktop/package.json"
             exit 1
           fi
-          echo "tag $REF == package.json $PKG"
+          echo "tag $REF == $PKG (package.json, desktop, PRODUCT_VERSION)"
+      - name: gate (imports + full suite + self-interop)
+        run: npm run check
 
   deb:
     needs: verify
@@ -118,7 +122,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REF: ${{ github.ref_name }}
         run: |
-          TAG="${REF#v}"
+          # Publish to the pushed tag exactly (v0.0.4 or 0.0.4). Stripping the
+          # "v" made a v-prefixed push create a second, empty 0.0.4 tag/release
+          # and leave the pushed tag without assets.
+          TAG="$REF"
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \

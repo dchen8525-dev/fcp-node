@@ -168,6 +168,12 @@ test('wire: uvarint, LE/BE, modular sequence', () => {
   assert.equal(getUvarint(b, off, st), 128);
   assert.equal(getUvarint(b, off, st), 0xffffffff);
   assert.equal(st.off, off);
+  // A fifth byte may carry only 4 bits of a u32. The accumulator used to wrap
+  // silently and turn overflow encodings into small, non-canonical values.
+  const overflow = Buffer.from([0xff, 0xff, 0xff, 0xff, 0x1f]);
+  assert.equal(getUvarint(overflow, overflow.length, { off: 0 }), null);
+  const max = Buffer.from([0xff, 0xff, 0xff, 0xff, 0x0f]);
+  assert.equal(getUvarint(max, max.length, { off: 0 }), 0xffffffff);
   // C++ seq.h: seq_after(a,b) means "a is strictly after b".
   assert.equal(seqAfter(2, 0xfffffffe), true);
   assert.equal(seqAfter(0xfffffffe, 2), false);
