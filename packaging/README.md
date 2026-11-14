@@ -34,7 +34,7 @@ npm run pack:deb
 | `FCP_KEY` | 首次安装随机生成 |
 | `FCP_BIND` | `0.0.0.0:4461` |
 | `FCP_MTU_MIN` / `FCP_MTU_MAX` | `1040` / `1500` |
-| `FCP_FEC` | `10:6` |
+| `FCP_FEC` | `10:4` |
 | `FCP_LOG_LEVEL` / `FCP_LOG_FILE` | `info` / `/var/log/fcp-node/server.log` |
 
 可覆盖的构建变量：`FCP_NODE_VERSION`（默认 `22.22.2`）。
@@ -70,3 +70,12 @@ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-
 
 版本号唯一来源是根 `package.json`；`src/constants.ts` 的 `PRODUCT_VERSION`、
 `desktop/package.json` 与安装包文件名都应与它一致。
+
+## GitHub Actions 自动发布
+
+`.github/workflows/release.yml`：推 tag（`0.0.3` 或 `v0.0.3`）时，ubuntu 构建
+deb、windows 构建 client exe 与桌面安装包，自动创建同名 Release（已存在则复用）
+并上传 4 个资产 + `sha256sums.txt`（`--clobber`，重跑可覆盖）。`workflow_dispatch`
+手动触发只构建不发布，产物在 Actions 页面下载检查。`verify` 作业会先校验 tag
+与根 `package.json` 版本一致。首次手工发 0.0.3 后旧资产不会自动删除，如需替换
+请在 Release 页面处理。

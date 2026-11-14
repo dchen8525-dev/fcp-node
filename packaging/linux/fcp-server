@@ -13,7 +13,7 @@ exec /opt/fcp-node/node/bin/node /opt/fcp-node/fcp-server.mjs \
   -b "${FCP_BIND:-0.0.0.0:4461}" \
   --mtu-min="${FCP_MTU_MIN:-1040}" \
   --mtu-max="${FCP_MTU_MAX:-1500}" \
-  --fec="${FCP_FEC:-10:6}" \
+  --fec="${FCP_FEC:-10:4}" \
   --log-level="${FCP_LOG_LEVEL:-info}" \
   --log-file="${FCP_LOG_FILE:-/var/log/fcp-node/server.log}" \
   "$@"

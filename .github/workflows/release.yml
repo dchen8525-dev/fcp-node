@@ -1,0 +1,124 @@
+# 发布流水线:推 tag(0.0.3 或 v0.0.3)自动构建并上传全部 4 个资产到同名
+# GitHub Release;workflow_dispatch 只构建产物供检查,不发布。
+#
+# 资产与平台(deb 必须在 linux 打包,SEA/electron-builder 必须在 windows):
+#   ubuntu  -> fcp-server_<ver>_amd64.deb
+#   windows -> fcp-client-<ver>.exe (Node SEA)、fcp-node-<ver>-portable.exe、
+#              fcp-node-setup-<ver>.exe (electron-builder)
+# 脚本自带 esbuild/postject 的 npx 回退,仓库零依赖,无需 npm install 根目录。
+# 版本号以根 package.json 为唯一来源,tag 必须一致(见 verify)。
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: tag must match package.json version
+        env:
+          REF: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "manual dispatch on $REF: skipping tag/version check"
+            exit 0
+          fi
+          TAG="${REF#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag $REF does not match package.json version $PKG"
+            echo "::error::bump all three together: package.json, src/constants.ts PRODUCT_VERSION, desktop/package.json"
+            exit 1
+          fi
+          echo "tag $REF == package.json $PKG"
+
+  deb:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: build fcp-server deb (bundles the tunnel with esbuild)
+        run: npm run pack:deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fcp-server-deb
+          path: dist/fcp-server_*.deb
+          if-no-files-found: error
+
+  windows:
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: install desktop toolchain (esbuild, electron-builder)
+        run: npm --prefix desktop ci
+      - name: build fcp-client SEA exe
+        run: npm run pack:client-exe
+      - name: build desktop portable + setup installers
+        run: npm --prefix desktop run pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fcp-client-exe
+          path: dist/fcp-client-*.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fcp-desktop
+          path: |
+            desktop/dist/fcp-node-*-portable.exe
+            desktop/dist/fcp-node-setup-*.exe
+          if-no-files-found: error
+
+  publish:
+    needs: [deb, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: sha256sums.txt (same format as the manual releases)
+        run: |
+          cd dist
+          sha256sum -b fcp-server_*.deb fcp-client-*.exe fcp-node-setup-*.exe fcp-node-*-portable.exe > sha256sums.txt
+          cat sha256sums.txt
+      - name: create release if missing and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ github.ref_name }}
+        run: |
+          TAG="${REF#v}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            dist/fcp-server_*.deb \
+            dist/fcp-client-*.exe \
+            dist/fcp-node-setup-*.exe \
+            dist/fcp-node-*-portable.exe \
+            dist/sha256sums.txt
+          echo "uploaded to release $TAG"
