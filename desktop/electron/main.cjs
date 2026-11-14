@@ -477,6 +477,7 @@ ipcMain.handle('fcp:settings:save', (_e, patch) => writeSettings(patch || {}));
 ipcMain.handle('fcp:start', (_e, cfg) => startTunnel(cfg || {}));
 ipcMain.handle('fcp:stop', () => stopTunnel());
 ipcMain.handle('fcp:state', () => childState);
+ipcMain.handle('fcp:version', () => app.getVersion());
 ipcMain.handle('fcp:speed:start', (_e, cfg) => {
   if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
   speedCancelRequested = false;

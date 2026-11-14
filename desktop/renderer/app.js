@@ -5,6 +5,7 @@
 const $ = (id) => document.getElementById(id);
 const el = {
   nav: $('nav'),
+  appVersion: $('appVersion'),
   pages: document.querySelectorAll('.page'),
   host: $('host'), port: $('port'), listenHost: $('listenHost'), listenPort: $('listenPort'),
   key: $('key'), keyToggle: $('keyToggle'), keyState: $('keyState'), remember: $('remember'),
@@ -512,6 +513,11 @@ window.fcp.onSpeed((p) => {
 // ---------------------------------------------------------------- boot
 
 (async () => {
+  // 版本号取自主进程 package.json(与安装包同源),启动即固定,失败时保持占位符
+  try {
+    const v = await window.fcp.version();
+    if (v) el.appVersion.textContent = `v${v}`;
+  } catch { /* 老版本主进程没有该 IPC,保持 v— */ }
   const s = await window.fcp.loadSettings();
   applySettings(s);
   refreshKeyState();

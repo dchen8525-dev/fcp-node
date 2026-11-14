@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('fcp', {
   start: (cfg) => ipcRenderer.invoke('fcp:start', cfg),
   stop: () => ipcRenderer.invoke('fcp:stop'),
   state: () => ipcRenderer.invoke('fcp:state'),
+  version: () => ipcRenderer.invoke('fcp:version'),
   loadSettings: () => ipcRenderer.invoke('fcp:settings:load'),
   saveSettings: (patch) => ipcRenderer.invoke('fcp:settings:save', patch),
   speedStart: (cfg) => ipcRenderer.invoke('fcp:speed:start', cfg),
