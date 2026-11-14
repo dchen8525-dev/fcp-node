@@ -17,7 +17,7 @@ const el = {
   chart: $('chart'), chartPeak: $('chartPeak'),
   kSessions: $('kSessions'), kUp: $('kUp'), kUptime: $('kUptime'), kListen: $('kListen'),
   speedUrl: $('speedUrl'), speedSeconds: $('speedSeconds'), speedPort: $('speedPort'),
-  speedBtn: $('speedBtn'), speedStopBtn: $('speedStopBtn'), speedNote: $('speedNote'),
+  speedBtn: $('speedBtn'), speedNote: $('speedNote'),
   speedMbps: $('speedMbps'), speedBytes: $('speedBytes'), speedElapsed: $('speedElapsed'),
   speedMiB: $('speedMiB'), speedMeter: $('speedMeter'),
   logView: $('logView'), logFilter: $('logFilter'), logClear: $('logClear'), logDir: $('logDir'),
@@ -33,6 +33,7 @@ const state = {
   logs: [],                         // { level, line, ts }
   filter: 'all',
   startedAt: 0,
+  speedTesting: false,
 };
 
 function fmtBytes(n) {
@@ -426,12 +427,25 @@ el.logDir.addEventListener('click', async () => {
 
 let speedTimer = null;
 
+// 与主开关同一套"一按钮双向"模式:标签与颜色跟随测速状态
+function setSpeedTesting(on) {
+  state.speedTesting = on;
+  el.speedBtn.textContent = on ? '停止' : '开始测速';
+  el.speedBtn.classList.toggle('is-stop', on);
+}
+
 el.speedBtn.addEventListener('click', async () => {
+  if (state.speedTesting) {
+    await window.fcp.speedStop();
+    clearInterval(speedTimer);
+    setSpeedTesting(false);
+    el.speedNote.textContent = '已停止';
+    return;
+  }
   const url = el.speedUrl.value.trim();
   if (!/^https?:\/\//i.test(url)) { el.speedNote.textContent = 'URL 需以 http:// 或 https:// 开头'; return; }
   if (!state.running) { el.speedNote.textContent = '请先启动代理'; return; }
-  el.speedBtn.disabled = true;
-  el.speedStopBtn.disabled = false;
+  setSpeedTesting(true);
   el.speedMbps.parentElement.classList.remove('is-empty');
   el.speedMbps.textContent = '0.00';
   el.speedBytes.textContent = '—';
@@ -458,19 +472,10 @@ el.speedBtn.addEventListener('click', async () => {
   });
 });
 
-el.speedStopBtn.addEventListener('click', async () => {
-  await window.fcp.speedStop();
-  clearInterval(speedTimer);
-  el.speedBtn.disabled = false;
-  el.speedStopBtn.disabled = true;
-  el.speedNote.textContent = '已停止';
-});
-
 window.fcp.onSpeed((p) => {
   if (!p.done) return;
   clearInterval(speedTimer);
-  el.speedBtn.disabled = false;
-  el.speedStopBtn.disabled = true;
+  setSpeedTesting(false);
   el.speedMeter.style.width = '100%';
   if (p.error) {
     el.speedNote.textContent = p.error;
