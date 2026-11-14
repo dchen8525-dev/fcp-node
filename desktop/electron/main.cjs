@@ -159,7 +159,7 @@ function statsArgs(cfg) {
     `--bind=${cfg.listenHost}:${cfg.listenPort}`];
   if (cfg.mtu) args.push(`--mtu-min=${cfg.mtu}`);
   if (cfg.pmtud === false) args.push('--no-pmtud');
-  args.push(`--fec=${cfg.fec || '10:4'}`);
+  args.push(`--fec=${cfg.fec || '10:6'}`);
   args.push(`--log-level=${cfg.logLevel || 'info'}`);
   if (cfg.logFile) args.push(`--log-file=${cfg.logFile}`);
   return args;

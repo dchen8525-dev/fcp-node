@@ -426,7 +426,7 @@ test('e2e: concurrent connections multiplex over a single session', async (t) =>
   });
 
   await Promise.all([0, 1, 2, 3, 4].map((n) => oneConn(n)));
-  // M1 round-robin pool: 5 connections disperse across the 2-session cap,
-  // each session an independent window and loss domain.
-  assert.equal(client.sessionCount, 2, `round-robin pool disperses connections across 2 sessions (got ${client.sessionCount})`);
+  // M1 round-robin pool: 5 connections grow the pool to its cap (4) and
+  // disperse across it, each session an independent window and loss domain.
+  assert.equal(client.sessionCount, 4, `round-robin pool disperses connections across the 4-session cap (got ${client.sessionCount})`);
 });

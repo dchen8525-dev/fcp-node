@@ -34,7 +34,7 @@ npm run pack:deb
 | `FCP_KEY` | 首次安装随机生成 |
 | `FCP_BIND` | `0.0.0.0:4461` |
 | `FCP_MTU_MIN` / `FCP_MTU_MAX` | `1040` / `1500` |
-| `FCP_FEC` | `10:4` |
+| `FCP_FEC` | `10:6` |
 | `FCP_LOG_LEVEL` / `FCP_LOG_FILE` | `info` / `/var/log/fcp-node/server.log` |
 
 可覆盖的构建变量：`FCP_NODE_VERSION`（默认 `22.22.2`）。

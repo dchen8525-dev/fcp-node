@@ -1,5 +1,5 @@
 // FCP Node CLI. Mirrors apps/cli/cli.cc Usage: same defaults (UDP 4460,
-// local proxy 1080, MTU 1400, FEC 10:4), same key sources, same long flags.
+// local proxy 1080, MTU 1400, FEC 10:6), same key sources, same long flags.
 // Zero runtime dependencies; run with `node src/app/cli.ts server|client ...`.
 
 import { mkdirSync } from 'node:fs';
@@ -59,7 +59,7 @@ MTU (PMTUD is ON by default):
                         (--pmtud is gone: probing is already the default)
 
 Common:
-  --fec=D:P             frame geometry (default 10:4); P is the per-set parity
+  --fec=D:P             frame geometry (default 10:6); P is the per-set parity
                         CEILING, and it is also the ceiling the adaptive
                         controller may raise k to. The sender starts at
                         min(3,P) and adjusts k itself from loss feedback, so

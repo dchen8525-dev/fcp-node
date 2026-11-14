@@ -95,8 +95,8 @@ test('FEC: the local fallback samples at the FECSTAT cadence, not per tick', () 
   assert.equal(fec.currentK(), 3);
   fec.noteLocalCounters(1000, 700, 0);   // 30% missing, but first call only arms
   fec.noteLocalCounters(1000, 700, 500);
-  fec.noteLocalCounters(1000, 700, 1500);
-  assert.equal(fec.currentK(), 3, 'no sample before FECSTAT_INTERVAL_MS');
+  fec.noteLocalCounters(1000, 700, 999);
+  assert.equal(fec.currentK(), 3, 'no sample inside one FECSTAT_INTERVAL_MS (1 s)');
   fec.noteLocalCounters(2000, 1400, 2600);
   assert.ok(fec.currentLoss() > 0.29, `sampled after the interval (${fec.currentLoss()})`);
 });
