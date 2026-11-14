@@ -155,7 +155,7 @@ function statsArgs(cfg) {
     `--bind=${cfg.listenHost}:${cfg.listenPort}`];
   if (cfg.mtu) args.push(`--mtu-min=${cfg.mtu}`);
   if (cfg.pmtud === false) args.push('--no-pmtud');
-  args.push(`--fec=${cfg.fec || '10:6'}`);
+  args.push(`--fec=${cfg.fec || '10:4'}`);
   args.push(`--log-level=${cfg.logLevel || 'info'}`);
   if (cfg.logFile) args.push(`--log-file=${cfg.logFile}`);
   return args;
@@ -304,6 +304,18 @@ function socksConnect(socksHost, socksPort, host, port, timeoutMs = 8000) {
 }
 
 async function runSpeedTest(cfg, onDone) {
+  // An invalid URL used to escape as an unhandled promise rejection, which the
+  // Node runtime treats as fatal in the main process. Every failure must land
+  // in finish() so the renderer gets a result instead of a dead app.
+  try {
+    await speedTestInner(cfg, onDone);
+  } catch (e) {
+    send('fcp:speed', { done: true, ok: false, bytes: 0, seconds: 0,
+      mbps: 0, mbPerSec: 0, error: e.message || String(e), url: cfg && cfg.url });
+  }
+}
+
+async function speedTestInner(cfg, onDone) {
   const started = Date.now();
   const target = new URL(cfg.url);
   const host = target.hostname;

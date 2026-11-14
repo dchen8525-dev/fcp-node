@@ -1,6 +1,6 @@
 {
   "name": "fcp-desktop",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "description": "FCP v7 tunnel desktop shell (Electron) - drives the Node tunnel port",
   "main": "electron/main.cjs",
@@ -32,6 +32,11 @@
       "resources/**/*",
       "package.json"
     ],
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ],
+    "afterPack": "scripts/after-pack.cjs",
     "win": {
       "icon": "build/icon.ico",
       "target": [

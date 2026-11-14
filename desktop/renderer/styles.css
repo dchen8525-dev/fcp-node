@@ -385,6 +385,19 @@ select option { background: #101915; color: var(--ink); }
   cursor: default;
 }
 
+/* Running state of the single start/stop toggle: a quiet danger outline, so
+   the only bright CTA on the page is still "start". */
+.primary.is-stop {
+  background: rgba(251, 113, 133, 0.12);
+  color: #fda4af;
+  box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.38) inset;
+}
+.primary.is-stop:hover:not(:disabled) {
+  background: rgba(251, 113, 133, 0.20);
+  filter: none;
+  box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.58) inset;
+}
+
 .ghost {
   height: 40px; padding: 0 19px;
   border: 1px solid var(--line-strong); border-radius: 11px;
@@ -548,6 +561,25 @@ select option { background: #101915; color: var(--ink); }
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover { background: rgba(52, 211, 153, 0.45); background-clip: content-box; }
+
+/* ---------------------------------------------------------------- connect fit */
+
+/* The connect form is the first screen users see; keep the collapsed form
+   inside one viewport at the default 980x700 window so the stage never shows
+   a scrollbar. The scrollbar stays hidden on this tab even when the advanced
+   panel is open (wheel/trackpad scrolling still works). */
+.stage:has(.page[data-page="connect"].is-active) {
+  padding-top: 20px;
+  padding-bottom: 20px;
+  scrollbar-width: none;
+}
+.stage:has(.page[data-page="connect"].is-active)::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+.page[data-page="connect"] .page-head { margin-bottom: 16px; }
+.page[data-page="connect"] .card { padding: 15px 18px; margin-bottom: 12px; }
+.page[data-page="connect"] .actions { margin-top: 4px; }
 
 /* ---------------------------------------------------------------- motion */
 

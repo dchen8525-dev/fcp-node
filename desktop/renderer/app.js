@@ -10,7 +10,7 @@ const el = {
   key: $('key'), keyToggle: $('keyToggle'), keyState: $('keyState'), remember: $('remember'),
   mtu: $('mtu'), fec: $('fec'), logLevel: $('logLevel'), logFile: $('logFile'), pmtud: $('pmtud'),
   advToggle: $('advToggle'), advBody: $('advBody'),
-  startBtn: $('startBtn'), stopBtn: $('stopBtn'), actionNote: $('actionNote'),
+  toggleBtn: $('toggleBtn'), actionNote: $('actionNote'),
   stateDot: $('stateDot'), stateText: $('stateText'), stateAddr: $('stateAddr'), stateUptime: $('stateUptime'),
   rxRate: $('rxRate'), rxTotal: $('rxTotal'), txRate: $('txRate'), txTotal: $('txTotal'),
   chart: $('chart'), chartPeak: $('chartPeak'),
@@ -185,8 +185,8 @@ document.querySelectorAll('input, select').forEach((node) => {
 
 function setRunning(on) {
   state.running = on;
-  el.startBtn.disabled = on;
-  el.stopBtn.disabled = !on;
+  el.toggleBtn.textContent = on ? '停止代理' : '启动代理';
+  el.toggleBtn.classList.toggle('is-stop', on);
   el.stateDot.classList.toggle('on', on);
   el.stateText.textContent = on ? '运行中' : '未启动';
   if (!on) {
@@ -215,18 +215,33 @@ async function start() {
   if (!HEX32.test(key)) return flashNote('密钥需为 32 位十六进制', 'error');
   if (!/^\d+:\d+$/.test(cfg.fec)) return flashNote('FEC 需形如 10:6', 'error');
 
-  const r = await window.fcp.start({ ...cfg, key });
-  if (!r || r.ok === false) return flashNote(r && r.error ? r.error : '启动失败', 'error');
-  setRunning(true);
-  el.speedPort.value = cfg.listenPort;
-  flashNote('已启动');
+  el.toggleBtn.disabled = true;
+  try {
+    const r = await window.fcp.start({ ...cfg, key });
+    if (!r || r.ok === false) return flashNote(r && r.error ? r.error : '启动失败', 'error');
+    setRunning(true);
+    el.speedPort.value = cfg.listenPort;
+    flashNote('已启动');
+  } finally {
+    el.toggleBtn.disabled = false;
+  }
 }
 
-el.startBtn.addEventListener('click', start);
-el.stopBtn.addEventListener('click', async () => {
-  await window.fcp.stop();
-  setRunning(false);
-  flashNote('已停止');
+async function stop() {
+  el.toggleBtn.disabled = true;
+  try {
+    await window.fcp.stop();
+    setRunning(false);
+    flashNote('已停止');
+  } finally {
+    el.toggleBtn.disabled = false;
+  }
+}
+
+// One button drives both directions: its label and colour follow the tunnel
+// state, so there is no second control that can disagree with it.
+el.toggleBtn.addEventListener('click', () => {
+  if (state.running) void stop(); else void start();
 });
 
 // ---------------------------------------------------------------- stats + chart
