@@ -27,6 +27,33 @@ let speedJob = null;
 let speedSeq = 0;
 let speedCancelRequested = false;
 
+// ---------------------------------------------------------------- theme
+
+// Mirrors renderer/app.js THEMES. The main process only needs two facts per
+// theme: the native frame's light/dark mode and the window background, which
+// is what shows through during resize and before the first paint. Keeping the
+// list here avoids an IPC round trip at window-creation time.
+const THEMES = {
+  ink:    { dark: true,  bg: '#080d0b' },
+  indigo: { dark: true,  bg: '#080a11' },
+  ember:  { dark: true,  bg: '#100e0d' },
+  paper:  { dark: false, bg: '#f5f2ec' },
+  mist:   { dark: false, bg: '#eef1f6' },
+};
+let themeId = 'ink';
+
+const themeMeta = (id) => THEMES[id] || THEMES.ink;
+const normaliseTheme = (id) => (Object.prototype.hasOwnProperty.call(THEMES, id) ? id : 'ink');
+
+/** Applies a theme to everything the renderer cannot reach: the native title
+ *  bar (nativeTheme) and the window's own background. */
+function applyNativeTheme(id) {
+  themeId = normaliseTheme(id);
+  const meta = themeMeta(themeId);
+  nativeTheme.themeSource = meta.dark ? 'dark' : 'light';
+  if (win && !win.isDestroyed()) win.setBackgroundColor(meta.bg);
+}
+
 // ---------------------------------------------------------------- settings
 
 function readSettings() {
@@ -440,7 +467,7 @@ function buildRequest(target, host, port) {
 function createWindow() {
   win = new BrowserWindow({
     width: 980, height: 700, minWidth: 820, minHeight: 600,
-    backgroundColor: '#080d0b',
+    backgroundColor: themeMeta(themeId).bg,
     title: 'FCP Node',
     icon: ICON_PATH,
     show: false,
@@ -474,6 +501,13 @@ function createWindow() {
 
 ipcMain.handle('fcp:settings:load', () => readSettings());
 ipcMain.handle('fcp:settings:save', (_e, patch) => writeSettings(patch || {}));
+// Synchronous on purpose: the preload reads it while the document is still
+// empty, so the stored palette is on <html> before the first paint.
+ipcMain.on('fcp:theme:boot', (e) => { e.returnValue = themeId; });
+ipcMain.handle('fcp:theme:set', (_e, t) => {
+  applyNativeTheme(t && t.id);
+  return themeId;
+});
 ipcMain.handle('fcp:start', (_e, cfg) => startTunnel(cfg || {}));
 ipcMain.handle('fcp:stop', () => stopTunnel());
 ipcMain.handle('fcp:state', () => childState);
@@ -507,9 +541,10 @@ if (!gotLock) {
   app.quit();
 } else {
   app.whenReady().then(() => {
-    // The renderer is a dark console; a light native title bar on top of it
-    // looks like two different applications.
-    nativeTheme.themeSource = 'dark';
+    // The stored theme decides the native title bar and the window background.
+    // Doing it before createWindow() is what keeps a light theme from opening
+    // with a dark frame for the first frame.
+    applyNativeTheme(readSettings().theme);
     createWindow();
     createTray();
   });

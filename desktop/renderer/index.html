@@ -5,6 +5,8 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
   <title>FCP Node</title>
+  <!-- Runs before the sheet paints so a light theme never flashes dark first. -->
+  <script src="theme-boot.js"></script>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -12,23 +14,37 @@
     <!-- ------------------------------------------------------- rail -->
     <aside class="rail">
       <div class="brand">
-        <div class="mark" aria-hidden="true">
-          <svg viewBox="0 0 32 32" width="32" height="32">
-            <defs>
-              <linearGradient id="mk" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0" stop-color="#16b98c" />
-                <stop offset="1" stop-color="#0b8563" />
-              </linearGradient>
-            </defs>
-            <rect x="1" y="1" width="30" height="30" rx="9" fill="url(#mk)" />
-            <path d="M9.5 21.5V10.5h7.2c2.6 0 4.3 1.5 4.3 3.9 0 2.5-1.8 4-4.4 4h-3.9v3.1z"
-                  fill="#ffffff" opacity=".95" />
-            <circle cx="22.4" cy="21.3" r="1.7" fill="#f0b46a" />
-          </svg>
+        <div class="brand-lockup">
+          <div class="mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" width="32" height="32">
+              <defs>
+                <linearGradient id="mk" x1="0" y1="0" x2="1" y2="1">
+                  <stop class="mk-a" offset="0" stop-color="#16b98c" />
+                  <stop class="mk-b" offset="1" stop-color="#0b8563" />
+                </linearGradient>
+              </defs>
+              <rect x="1" y="1" width="30" height="30" rx="9" fill="url(#mk)" />
+              <path class="mk-glyph" d="M9.5 21.5V10.5h7.2c2.6 0 4.3 1.5 4.3 3.9 0 2.5-1.8 4-4.4 4h-3.9v3.1z"
+                    fill="#ffffff" opacity=".95" />
+              <circle class="mk-dot" cx="22.4" cy="21.3" r="1.7" fill="#f0b46a" />
+            </svg>
+          </div>
+          <div class="brand-text">
+            <div class="brand-name">FCP Node</div>
+            <div class="brand-sub" id="appVersion">v—</div>
+          </div>
         </div>
-        <div class="brand-text">
-          <div class="brand-name">FCP Node</div>
-          <div class="brand-sub" id="appVersion">v—</div>
+
+        <!-- Theme switch: the dot is the current palette in miniature, so the
+             control needs no label. Sits in the brand row rather than the rail
+             foot; a full-width button down there read as a second nav item. -->
+        <div class="theme-dock">
+          <button class="theme-btn" id="themeBtn" type="button"
+                  aria-haspopup="menu" aria-expanded="false"
+                  aria-label="切换主题" title="切换主题">
+            <span class="theme-pill" id="themePill" aria-hidden="true"></span>
+          </button>
+          <div class="theme-menu" id="themeMenu" role="menu" aria-label="主题" hidden></div>
         </div>
       </div>
 

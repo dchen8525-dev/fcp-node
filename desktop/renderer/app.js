@@ -21,6 +21,7 @@ const el = {
   speedMbps: $('speedMbps'), speedBytes: $('speedBytes'), speedElapsed: $('speedElapsed'),
   speedMiB: $('speedMiB'), speedMeter: $('speedMeter'),
   logView: $('logView'), logFilter: $('logFilter'), logClear: $('logClear'), logDir: $('logDir'),
+  themeBtn: $('themeBtn'), themeMenu: $('themeMenu'),
 };
 
 // ---------------------------------------------------------------- helpers
@@ -94,6 +95,111 @@ el.keyToggle.addEventListener('click', () => {
 // ---------------------------------------------------------------- key state
 
 const HEX32 = /^[0-9a-fA-F]{32}$/;
+
+// ---------------------------------------------------------------- theme
+
+// Palettes live in styles.css; this table is only the picker's identity + the
+// preview chip. The chip colours cannot come from CSS variables because each
+// swatch has to show a theme it is not currently rendered in, so they are the
+// accent/background pair of each palette written out once.
+const THEMES = [
+  { id: 'ink',    name: '墨绿', dark: true,  swatch: ['#34d399', '#0b1210'] },
+  { id: 'indigo', name: '靛蓝', dark: true,  swatch: ['#7aa2ff', '#0b0e18'] },
+  { id: 'ember',  name: '炭火', dark: true,  swatch: ['#f59e0b', '#141110'] },
+  { id: 'paper',  name: '暖白', dark: false, swatch: ['#1c8a63', '#f5f2ec'] },
+  { id: 'mist',   name: '雾灰', dark: false, swatch: ['#3b6df6', '#eef1f6'] },
+];
+const THEME_BY_ID = new Map(THEMES.map((t) => [t.id, t]));
+const DEFAULT_THEME = 'ink';
+
+let themeId = document.documentElement.dataset.theme || DEFAULT_THEME;
+// Resolved once per theme instead of per frame: drawChart() runs every 500 ms
+// and getComputedStyle in that loop is avoidable work on the UI thread.
+let chartColors = null;
+
+const swatchCss = (t) =>
+  `linear-gradient(135deg, ${t.swatch[0]} 0 54%, ${t.swatch[1]} 54% 100%)`;
+
+function buildThemeMenu() {
+  const frag = document.createDocumentFragment();
+  for (const t of THEMES) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'theme-item';
+    item.dataset.theme = t.id;
+    item.setAttribute('role', 'menuitemradio');
+    item.setAttribute('aria-checked', 'false');
+    const sw = document.createElement('span');
+    sw.className = 'sw';
+    sw.style.background = swatchCss(t);
+    const label = document.createElement('span');
+    label.textContent = t.name;
+    const mode = document.createElement('span');
+    mode.className = 'mode';
+    mode.textContent = t.dark ? '深色' : '浅色';
+    item.append(sw, label, mode);
+    frag.appendChild(item);
+  }
+  el.themeMenu.textContent = '';
+  el.themeMenu.appendChild(frag);
+}
+
+/**
+ * Puts a palette on screen. `persist` is separate from `notifyMain` because the
+ * two have different callers: a click has to survive a restart and has to
+ * repaint the native frame, a boot restore has already done both.
+ */
+function applyTheme(id, opts = {}) {
+  const t = THEME_BY_ID.get(id) || THEME_BY_ID.get(DEFAULT_THEME);
+  themeId = t.id;
+  document.documentElement.dataset.theme = t.id;
+  // The pill is styled by CSS (accent ring + half fill), so it follows the
+  // palette without help. The button carries no visible label, so the name goes
+  // where assistive tech and the tooltip will find it.
+  el.themeBtn.title = `主题：${t.name}`;
+  el.themeBtn.setAttribute('aria-label', `主题：${t.name}`);
+  for (const item of el.themeMenu.querySelectorAll('.theme-item')) {
+    item.setAttribute('aria-checked', String(item.dataset.theme === t.id));
+  }
+  chartColors = null;
+  drawChart();
+  if (opts.notifyMain !== false && window.fcp.setTheme) {
+    window.fcp.setTheme({ id: t.id, dark: t.dark });
+  }
+  if (opts.persist) window.fcp.saveSettings({ theme: t.id });
+}
+
+function setThemeMenuOpen(open) {
+  el.themeMenu.hidden = !open;
+  el.themeBtn.setAttribute('aria-expanded', String(open));
+  if (open) {
+    const active = el.themeMenu.querySelector('.theme-item[aria-checked="true"]');
+    if (active) active.focus();
+  }
+}
+
+buildThemeMenu();
+
+el.themeBtn.addEventListener('click', () => setThemeMenuOpen(el.themeMenu.hidden));
+
+el.themeMenu.addEventListener('click', (e) => {
+  const item = e.target.closest('.theme-item');
+  if (!item) return;
+  applyTheme(item.dataset.theme, { persist: true });
+  setThemeMenuOpen(false);
+  el.themeBtn.focus();
+});
+
+document.addEventListener('click', (e) => {
+  if (el.themeMenu.hidden) return;
+  if (!e.target.closest('.theme-dock')) setThemeMenuOpen(false);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || el.themeMenu.hidden) return;
+  setThemeMenuOpen(false);
+  el.themeBtn.focus();
+});
 
 // ---------------------------------------------------------------- settings
 
@@ -272,9 +378,31 @@ window.fcp.onStats((s) => {
   drawChart();
 });
 
+// The canvas cannot inherit CSS: colours are read from the active palette
+// once per theme change and cached (see applyTheme).
+function readChartColors() {
+  const cs = getComputedStyle(document.documentElement);
+  const v = (name, fallback) => (cs.getPropertyValue(name) || '').trim() || fallback;
+  return {
+    grid: v('--chart-grid', 'rgba(127, 127, 127, 0.12)'),
+    accent: v('--accent', '#34d399'),
+    sand: v('--sand', '#fbbf24'),
+    label: v('--muted-2', '#5b6f66'),
+  };
+}
+
+function withAlpha(hex, a) {
+  const m = /^#([0-9a-f]{6})$/i.exec(String(hex).trim());
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+}
+
 function drawChart() {
   const c = el.chart;
   if (!c) return;
+  if (!chartColors) chartColors = readChartColors();
+  const cc = chartColors;
   const dpr = window.devicePixelRatio || 1;
   const w = c.clientWidth;
   const h = c.clientHeight || 150;
@@ -291,7 +419,7 @@ function drawChart() {
   const plotH = h - padT - padB;
 
   // horizontal grid
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.055)';
+  ctx.strokeStyle = cc.grid;
   ctx.lineWidth = 1;
   for (let i = 0; i <= 3; i += 1) {
     const y = padT + (plotH * i) / 3;
@@ -330,16 +458,16 @@ function drawChart() {
     ctx.closePath();
     const g = ctx.createLinearGradient(0, padT, 0, padT + plotH);
     g.addColorStop(0, fillTop);
-    g.addColorStop(1, 'rgba(8, 13, 11, 0)');
+    g.addColorStop(1, 'transparent');
     ctx.fillStyle = g;
     ctx.fill();
   };
 
-  drawSeries('tx', '#fbbf24', 'rgba(251, 191, 36, 0.20)');
-  drawSeries('rx', '#34d399', 'rgba(52, 211, 153, 0.22)');
+  drawSeries('tx', cc.sand, withAlpha(cc.sand, 0.20));
+  drawSeries('rx', cc.accent, withAlpha(cc.accent, 0.22));
 
   // baseline labels
-  ctx.fillStyle = '#5b6f66';
+  ctx.fillStyle = cc.label;
   ctx.font = '10px "Cascadia Mono", Consolas, monospace';
   ctx.textBaseline = 'top';
   const peak = data.length ? data.reduce((m, p) => Math.max(m, p.rx, p.tx), 0) : 0;
@@ -504,6 +632,10 @@ window.fcp.onSpeed((p) => {
   } catch { /* 老版本主进程没有该 IPC,保持 v— */ }
   const s = await window.fcp.loadSettings();
   applySettings(s);
+  // theme-boot.js has already painted the stored palette; applying it again is
+  // what labels the picker and marks the active row. No IPC: the main process
+  // is the one that told us which theme to boot with.
+  applyTheme((s && s.theme) || themeId, { notifyMain: false });
   const st = await window.fcp.state();
   setRunning(!!st.running);
   if (st.running) {

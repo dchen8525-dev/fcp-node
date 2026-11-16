@@ -363,4 +363,4 @@ export const TARGET_RECOVERY = 0.80;
 export const FECSTAT_INTERVAL_MS = 1000;
 export const FECSTAT_MAX_INTERVAL_MS = 60000;
 
-export const PRODUCT_VERSION = '0.0.11';
+export const PRODUCT_VERSION = '0.0.12';

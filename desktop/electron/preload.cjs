@@ -2,6 +2,12 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('fcp', {
+  // Read synchronously, before any page script runs: theme-boot.js needs the
+  // answer to set data-theme ahead of the first paint (see renderer/theme-boot.js).
+  bootTheme: (() => {
+    try { return ipcRenderer.sendSync('fcp:theme:boot'); } catch { return 'ink'; }
+  })(),
+  setTheme: (t) => ipcRenderer.invoke('fcp:theme:set', t),
   start: (cfg) => ipcRenderer.invoke('fcp:start', cfg),
   stop: () => ipcRenderer.invoke('fcp:stop'),
   state: () => ipcRenderer.invoke('fcp:state'),
