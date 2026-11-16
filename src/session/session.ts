@@ -112,6 +112,10 @@ export class Session {
   private validator = new FecstatValidator();
   private configured = false;
   private nowMs = 0;
+  /** Group size the wire settled on. Only used to estimate how long filling one
+   *  repair group takes, which bounds how long a partial group may sit before
+   *  its parity goes out. */
+  private groupD = DEFAULT_D;
   private bootstrapWindowMs = -1;
   private bootstrapProbes = 0;
   private lastWireOutMs = 0;
@@ -423,6 +427,7 @@ export class Session {
     // lower P, and anything above it is dropped as IndexPastS on arrival.
     this.strategy.setParityCeiling(np.p);
     this.strategy.setGroupSize(np.d);
+    this.groupD = np.d;
     this.tx.setK(this.strategy.currentK());
     this.rx = new FrameRx({
       d: np.d, p: np.p,
@@ -763,6 +768,21 @@ export class Session {
   get retxSplit(): string {
     return `${this.stream.retxFast}/${this.stream.retxRto}/${this.stream.fastRounds}`;
   }
+  /** Recovery latency for segments that needed retransmission: first send to
+   *  the confirmation of a later copy. The acceptance measure for anything that
+   *  claims to make recovery faster. */
+  get retxLatencyP50Ms(): number { return this.retxLatencyPct(50); }
+  get retxLatencyP95Ms(): number { return this.retxLatencyPct(95); }
+  get retxLatencyCount(): number { return this.eachStream((s) => s.retxLatencyCount); }
+  /** Nearest-rank percentile over every stream's ring, pooled. */
+  private retxLatencyPct(pct: number): number {
+    const all = this.stream.retxLatencySamples();
+    for (const st of this.streams.values()) all.push(...st.retxLatencySamples());
+    if (all.length === 0) return 0;
+    all.sort((a, b) => a - b);
+    const rank = Math.min(all.length, Math.max(1, Math.ceil((pct / 100) * all.length)));
+    return all[rank - 1]!;
+  }
   /** Measured send-direction delivery rate, B/ms. Diagnostic only. */
   get sendRateBytesPerMs(): number { return this.sndBbr.bwBytesPerMs; }
   /** Path shard-loss rate as measured by the peer's FECSTAT. */
@@ -779,6 +799,42 @@ export class Session {
       this.strategy.noteLocalCounters(c.dataExpected, c.dataRxOrig, nowMs);
     }
     this.tx?.setK(this.strategy.currentK());
+    // Filling one group takes d x payloadMax bytes at the measured send rate.
+    // FrameTx caps the partial-group flush timer at a small multiple of that, so
+    // a group that would close in 14 ms stops waiting 200 ms for parity.
+    this.tx?.setGroupDrainMs(this.groupDrainMs());
+  }
+
+  /** Estimated time to put one full group on the wire, or -1 when unknown. */
+  private groupDrainMs(): number {
+    const bw = this.sndBbr.bwBytesPerMs;
+    if (bw <= 0 || this.groupD <= 0) return -1;
+    return (this.groupD * this.limits.payloadMax) / bw;
+  }
+
+  /**
+   * Milliseconds until the earliest self-driven deadline in this session, or -1.
+   *
+   * The host used to tick every 10 ms and that interval was the real resolution
+   * of every protocol timer: a delayed ack due in 4 ms left up to 10 ms late, a
+   * partial repair group waited for a tick boundary, an expired RTO was noticed
+   * on the next boundary. Feeding this value to a single rescheduling timeout
+   * costs nothing when no deadline is near (the host still falls back to its
+   * coarse interval) and removes the quantisation when one is.
+   */
+  nextTimerMs(nowMs: number): number {
+    if (this.closeNotified) return -1;
+    let best = -1;
+    const take = (ms: number): void => {
+      if (ms < 1) return;
+      if (best < 0 || ms < best) best = ms;
+    };
+    if (this.hs.established && this.tx) {
+      take(this.tx.nextTimerMs(nowMs));
+      take(this.stream.nextTimerMs(nowMs));
+      if (this.mux) for (const st of this.streams.values()) take(st.nextTimerMs(nowMs));
+    }
+    return best;
   }
 
   onTick(nowMs: number): void {

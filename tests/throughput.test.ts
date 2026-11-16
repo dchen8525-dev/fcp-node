@@ -8,13 +8,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { AdaptiveFec } from '../src/control/controller.ts';
+import { FrameTx } from '../src/fec/frame.ts';
 import { makeFecstatPacket } from '../src/fec/fecstat.ts';
 import { Stream } from '../src/stream/stream.ts';
 import { encodeData, encodeAck, encodeAckV2, parseSegment } from '../src/stream/segment.ts';
 import {
   STREAM_TYPE_DATA, STREAM_TYPE_ACK, STREAM_TYPE_ACK_V2, STREAM_FLAG_FIN,
-  ACK_EVERY_SEGMENTS, HOLE_DUP_ACK_MS, MIN_RETX_INTERVAL_MS, FAST_RETX_SEGMENTS,
-  ZERO_WINDOW_PROBE_MS,
+  ACK_EVERY_SEGMENTS, ACK_DELAY_MS, HOLE_DUP_ACK_MS, HOLE_DUP_ACK_MIN_MS,
+  MIN_RETX_INTERVAL_MS, FAST_RETX_SEGMENTS,
+  FAST_RETX_MIN_AGE_MS, MIN_FLUSH_MS, ZERO_WINDOW_PROBE_MS,
 } from '../src/constants.ts';
 
 function makeStream(over: Record<string, number> = {}) {
@@ -60,6 +62,25 @@ test('FEC: k never settles at 0, because a hole-free report does not prove a cle
   assert.equal(fec.currentK(), 3);
   feedLocal(fec, 1200, 0);
   assert.equal(fec.currentK(), 1);
+});
+
+test('FEC: a partial group closes on the drain estimate, not on a full sRTT', () => {
+  // Parity cannot leave until the group closes, so the flush timer IS the repair
+  // latency for whatever is already in the group. Waiting a full sRTT (200 ms on
+  // the VPS path) for a group that would have filled in 14 ms is pure delay.
+  const limits = { mtu: 1400, ipHdrLen: 20, payloadMax: 1200, symbolMax: 1200, mss: 1200, valid: true };
+  const tx = new FrameTx(10, limits, () => {});
+  tx.setK(1);
+  tx.setSrttMs(200);
+  tx.onSegment(Buffer.alloc(100), 0);
+  assert.equal(tx.nextTimerMs(0), 200, 'no rate estimate: the old sRTT wait');
+  tx.setGroupDrainMs(14);
+  assert.equal(tx.nextTimerMs(0), MIN_FLUSH_MS, 'floored, not 200');
+  tx.onTick(MIN_FLUSH_MS - 1);
+  assert.equal(tx.openN, 1, 'still open one ms before the deadline');
+  tx.onTick(MIN_FLUSH_MS);
+  assert.equal(tx.openN, 0, 'the parity went out with the drain estimate');
+  assert.equal(tx.closedIdle, 1);
 });
 
 test('FEC: with parity capped at 0 the controller still works', () => {
@@ -191,7 +212,48 @@ test('STREAM: a sequence gap makes the ack immediate', () => {
 
 // --- Fast retransmit ------------------------------------------------------
 
-test('STREAM: three duplicate acks resend FAST_RETX_SEGMENTS, not one', () => {
+test('STREAM: the host is told when the delayed ack is due, not when the next tick is', () => {
+  // The tick was a fixed 10 ms interval and every protocol timer was quantised
+  // by it: an ack due in 4 ms left at the next boundary. Reporting the deadline
+  // lets the host wake exactly when there is something to do.
+  const { s, acks } = makeStream();
+  s.onSegment(encodeData(0, 0, Buffer.alloc(94)), 0);
+  assert.equal(s.nextTimerMs(0), ACK_DELAY_MS, 'due in ACK_DELAY_MS, not a tick away');
+  s.onTick(ACK_DELAY_MS);
+  assert.equal(acks(), 1);
+  assert.equal(s.nextTimerMs(ACK_DELAY_MS), -1, 'nothing pending means no deadline to report');
+});
+
+test('STREAM: an open hole reports a repeat-ack deadline scaled to the path', () => {
+  // While the hole is open, the repeat ack is the sender's only clock. A fixed
+  // 50 ms is a fifth of an RTT on a 250 ms path and 2.5 RTTs on a 20 ms one.
+  const short = makeStream({ initialSrttMs: 50 });
+  short.s.onSegment(encodeData(0, 0, Buffer.alloc(94)), 0);
+  short.s.onSegment(encodeData(94 * 2, 0, Buffer.alloc(94)), 0);
+  assert.equal(short.s.nextTimerMs(0), HOLE_DUP_ACK_MIN_MS, 'short path: clamped at the floor');
+
+  const long = makeStream({ initialSrttMs: 200 });
+  long.s.onSegment(encodeData(0, 0, Buffer.alloc(94)), 0);
+  long.s.onSegment(encodeData(94 * 2, 0, Buffer.alloc(94)), 0);
+  assert.equal(long.s.nextTimerMs(0), 25, 'long path: srtt / HOLE_DUP_ACK_DIVISOR');
+});
+/** One fast-retransmit round with its evidence and its confirmation.
+ *
+ *  The hole is exactly FAST_RETX_SEGMENTS wide with a single sacked segment
+ *  behind it, which is the shape a real single burst produces: `beyond` is 1, so
+ *  the age gate is the only thing standing between the loss and its copy.
+ *  `confirmAfterMs` is measured from the moment the copies went out — shorter
+ *  than minRtt means the copy cannot possibly be the one that arrived. */
+function driveRound(s: Stream, st: { off: number }, t: number, confirmAfterMs: number): void {
+  const gate = s.retxAgeGateMs;
+  s.write(Buffer.alloc(94 * 7), t);
+  const sackedStart = st.off + 6 * 94;
+  s.onSegment(encodeAckV2(st.off, 65535, [{ start: sackedStart, end: sackedStart + 94 }]), t + gate + 1);
+  s.onSegment(encodeAckV2(st.off + 7 * 94, 65535, []), t + gate + 1 + confirmAfterMs);
+  st.off += 7 * 94;
+}
+
+test('STREAM: each duplicate ack releases at most FAST_RETX_SEGMENTS, not the whole hole', () => {
   const { s, sent, datas } = makeStream({ sendWindowBytes: 65536, ackV2: true });
   s.write(Buffer.alloc(94 * 10), 0);
   const before = datas();
@@ -199,9 +261,58 @@ test('STREAM: three duplicate acks resend FAST_RETX_SEGMENTS, not one', () => {
   // SACK reports only the last segment, so 0..8 are provably missing and the
   // burst cap is what has to hold them back.
   const blocks = [{ start: 94 * 9, end: 94 * 10 }];
-  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(0, 65535, blocks), 300);
-  assert.equal(datas() - before, FAST_RETX_SEGMENTS);
+  // The first ack only arms the duplicate counter: there is no duplicate yet,
+  // and with nothing proven missing the round must be a no-op.
+  s.onSegment(encodeAckV2(0, 65535, blocks), 300);
+  assert.equal(datas() - before, 0, 'the first ack proves nothing on its own');
+  // DUP_ACK_THRESH is 1: the SACK ranges already carry the evidence, the
+  // counter only exists to know that this is a repeat. One round, one burst.
+  s.onSegment(encodeAckV2(0, 65535, blocks), 310);
+  assert.equal(datas() - before, FAST_RETX_SEGMENTS, 'a round is capped at the burst size');
+  // The 6 copies just sent are still in flight and both firstAfter and
+  // repeatAfter keep them out of the next round; only the 3 untouched
+  // segments are fresh work.
+  s.onSegment(encodeAckV2(0, 65535, blocks), 320);
+  assert.equal(datas() - before, 9, 'the next round clears the rest of the hole');
+  s.onSegment(encodeAckV2(0, 65535, blocks), 330);
+  assert.equal(datas() - before, 9, 'and then the hole is empty, so a repeat costs nothing');
   assert.equal(sent.length > 0, true);
+});
+
+test('STREAM: the age gate narrows while every round keeps recovering real loss', () => {
+  // The gate started at a full RTT and never came back down, so a single-hole
+  // loss — the common case — was not even retransmitted until one RTT after the
+  // SACK evidence arrived, putting recovery at ~1.75 RTT. Tightening is only
+  // allowed while the confirmations keep arriving too late to be the copy's own
+  // round trip; that is what the next test pins down.
+  const { s } = makeStream({ sendWindowBytes: 65536, ackV2: true, initialSrttMs: 100 });
+  s.write(Buffer.alloc(94), 0);
+  s.onSegment(encodeAckV2(94, 65535, []), 100);
+  assert.equal(s.retxAgeGateMs, 100, 'one clean sample leaves the gate at a full RTT');
+  const st = { off: 94 };
+  const gates = [s.retxAgeGateMs];
+  for (let i = 0; i < 8; ++i) {
+    driveRound(s, st, 2000 + i * 1000, 400);
+    gates.push(s.retxAgeGateMs);
+  }
+  for (let i = 1; i < gates.length; ++i) {
+    assert.ok(gates[i]! < gates[i - 1]!, `round ${i} narrowed the gate: ${gates.join(' -> ')}`);
+  }
+  assert.equal(gates[gates.length - 1], FAST_RETX_MIN_AGE_MS, 'and it stops at the age floor');
+});
+
+test('STREAM: a copy that could not have arrived yet undoes the narrowing', () => {
+  const { s } = makeStream({ sendWindowBytes: 65536, ackV2: true, initialSrttMs: 100 });
+  s.write(Buffer.alloc(94), 0);
+  s.onSegment(encodeAckV2(94, 65535, []), 100);
+  const st = { off: 94 };
+  for (let i = 0; i < 4; ++i) driveRound(s, st, 2000 + i * 1000, 400);
+  assert.ok(s.retxAgeGateMs < 100, 'the gate is narrowed first');
+  // Confirmed 50 ms after the copy was sent on a 100 ms path: the copy was still
+  // in flight, so an earlier copy is what arrived and the round was reordering.
+  driveRound(s, st, 9000, 50);
+  assert.ok(s.spuriousFastRetx > 0, 'the round is recorded as a false positive');
+  assert.ok(s.retxAgeGateMs >= 100, `the gate is widened back: ${s.retxAgeGateMs}`);
 });
 
 test('STREAM: a duplicate ack with no SACK evidence does not start a retransmit', () => {
@@ -378,6 +489,25 @@ test('STREAM: a duplicate ack still pumps queued data', () => {
   const afterZero = datas();
   s.onSegment(encodeAck(94, 65535, 0, 0), 100); // same cum, rwnd reopened
   assert.ok(datas() > afterZero, 'the dup ack released part of the queue');
+});
+
+test('STREAM: a shrunken peer window still lets the tail be probed', () => {
+  // The old TLP guard required an empty send queue. A queue can be non-empty
+  // while the window is full in exactly one reachable way: the peer shrinks its
+  // window below what is already in flight (its app stopped reading). Then the
+  // queue cannot drain, the lost tail has no dup-ack source, and with the guard
+  // in place the only trigger left was the RTO chain.
+  const total = 94 * 3 + 6;
+  const { s, datas } = makeStream({ sendWindowBytes: total, initialSrttMs: 100 });
+  assert.equal(s.write(Buffer.alloc(total), 0), total);
+  const before = datas();
+  assert.equal(before, 3);
+  assert.equal(s.pendingQueueBytes, 6, 'the header needs more room than the window has left');
+  s.onSegment(encodeAck(0, 200, 0, 0), 1); // peer window now below the in-flight bytes
+  s.onTick(199);
+  assert.equal(datas(), before, 'nothing before the probe deadline');
+  s.onTick(200);
+  assert.equal(datas(), before + 1, 'the tail is probed at pto, not at the RTO');
 });
 
 test('STREAM: an unconfirmed tail is probed before the RTO', () => {

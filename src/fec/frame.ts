@@ -12,6 +12,7 @@ import {
   AHEAD_CONFIRM_TIMEOUT_MS, FRAME_ENVELOPE_OVERHEAD, DATA_WIRE_OVERHEAD,
   PARITY_WIRE_OVERHEAD, KCP_HEADER_RESERVE, MIN_FLUSH_MS, MAX_FLUSH_MS,
   DEFAULT_FLUSH_MS, DEFAULT_MTU, DEFAULT_IP_HEADER_LEN, MAX_RX_SYMBOL_BYTES,
+  FLUSH_DRAIN_FACTOR,
 } from '../constants.ts';
 import {
   getLe16, putLe16, getLe32, putLe32, bytesEqual, seqAfter,
@@ -53,6 +54,10 @@ export class FrameTx {
   private symbolMax = 0;
   private tLastMs = 0;
   private flushMs = DEFAULT_FLUSH_MS;
+  private srttMs = DEFAULT_FLUSH_MS;
+  /** Time the sender needs to put D symbols on the wire, or -1 when unknown.
+   *  -1 keeps the old behaviour (flush after sRTT). */
+  private drainMs = -1;
   private symbols: Buffer[] = [];
   closedFull = 0; closedIdle = 0; abortedSets = 0; dataSymbols = 0; paritySymbols = 0; mtuDrops = 0;
 
@@ -60,7 +65,33 @@ export class FrameTx {
     this.d = d; this.limits = limits; this.emitFn = emit;
   }
   setK(k: number): void { this.nextK = Math.min(k, 7); }
-  setSrttMs(srtt: number): void { this.flushMs = Math.min(Math.max(srtt, MIN_FLUSH_MS), MAX_FLUSH_MS); }
+  setSrttMs(srtt: number): void { this.srttMs = srtt; this.recomputeFlush(); }
+  /**
+   * How long this sender needs to fill a whole group at its current rate.
+   *
+   * A partial group's parity is the only repair that arrives without an ARQ
+   * round trip, and it cannot be emitted until the group closes — so the flush
+   * timer is a direct floor on repair latency for whatever is already in the
+   * group. Waiting sRTT (capped at 200 ms) for a group that would have closed
+   * in 14 ms is pure delay on a fast path. On a slow path the same formula is
+   * larger than sRTT and the cap collapses back to sRTT, so the set count and
+   * the parity overhead of a trickle are unchanged.
+   */
+  setGroupDrainMs(ms: number): void { this.drainMs = ms > 0 ? ms : -1; this.recomputeFlush(); }
+  private recomputeFlush(): void {
+    let ms = Math.min(Math.max(this.srttMs, MIN_FLUSH_MS), MAX_FLUSH_MS);
+    if (this.drainMs > 0) {
+      const byRate = Math.max(MIN_FLUSH_MS, Math.ceil(this.drainMs * FLUSH_DRAIN_FACTOR));
+      if (byRate < ms) ms = byRate;
+    }
+    this.flushMs = ms;
+  }
+  /** Milliseconds until the open group must be closed, or -1. */
+  nextTimerMs(nowMs: number): number {
+    if (this.n < 1) return -1;
+    const due = this.tLastMs + this.flushMs - nowMs;
+    return due < 1 ? 1 : due;
+  }
   raiseLimits(l: MtuLimits): void { if (l.valid && l.payloadMax > this.limits.payloadMax) this.limits = l; }
   lowerLimits(l: MtuLimits): void { if (l.valid && l.payloadMax < this.limits.payloadMax) this.limits = l; }
   get limitsValue(): MtuLimits { return this.limits; }

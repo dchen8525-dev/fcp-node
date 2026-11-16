@@ -200,6 +200,14 @@ export const PARITY_WIRE_OVERHEAD = 34; // 28 + 6
 export const KCP_HEADER_RESERVE = 24;   // legacy reserve, no KCP implementation exists
 export const MIN_FLUSH_MS = 25;
 export const MAX_FLUSH_MS = 200;
+/** A partial repair group may not sit longer than this multiple of the time it
+ *  needs to fill up. Waiting a full sRTT (the old fixed flushMs = srtt) for a
+ *  group that would have closed in 14 ms delays the parity for its tail by
+ *  ~190 ms on a fast path — and parity is the only thing that repairs that tail
+ *  without an ARQ round trip. On a slow path the same formula is *larger* than
+ *  sRTT, so the cap stays at sRTT and nothing changes there: this only ever
+ *  shortens the wait where waiting bought nothing. */
+export const FLUSH_DRAIN_FACTOR = 1.5;
 
 // FrameRx (frame_rx.h)
 export const MAX_ACTIVE_SETS = 256;
@@ -232,8 +240,17 @@ export const STREAM_RST_LEN = 2;
 export const STREAM_FLAG_FIN = 1 << 0;
 /** Duplicate acks required to arm the fast-retransmit pass. The SACK ranges
  *  already carry the loss evidence; the threshold only filters reordered ACK
- *  arrivals, and 2 fires one ack-cycle (~40 ms) sooner than 3. */
-export const DUP_ACK_THRESH = 2;
+ *  arrivals, and 2 fires one ack-cycle (~40 ms) sooner than 3.
+ *
+ *  1: on a stalled window the receiver has nothing left to send, so its only
+ *  duplicate acks come from the HOLE_DUP_ACK timer. Waiting for a second one
+ *  cost a full repeat interval (50 ms before, 10-50 ms now) *before* the age
+ *  gate was even consulted, and the gate then still had to be satisfied by a
+ *  later ack. fastRetransmit() re-arms on every duplicate ack and is idempotent
+ *  — the proof (sackedHigh past the segment), the age gate and the per-segment
+ *  repeat interval all still have to pass — so a lower threshold only makes the
+ *  evaluation happen sooner, it does not send more copies. */
+export const DUP_ACK_THRESH = 1;
 export const STREAM_RST_ABORT = 1;
 export const ACK_DELAY_MS = 4;
 /** Data segments per acknowledgement. One ack per segment turned the uplink
@@ -247,8 +264,16 @@ export const ACK_EVERY_SEGMENTS = 3;
  *  the sender sits on a full window waiting for an ack that will never come
  *  until its RTO expires (seconds). Repeated acks drive fast retransmit.
  *  50 ms: with DUP_ACK_THRESH at 2 the fast-retransmit trigger lands within
- *  ~1 RTT of the hole forming. Same ack, no extra wire state. */
+ *  ~1 RTT of the hole forming. Same ack, no extra wire state.
+ *
+ *  This is a *ceiling*: the live interval is clamp(srtt / HOLE_DUP_ACK_DIVISOR,
+ *  HOLE_DUP_ACK_MIN_MS, HOLE_DUP_ACK_MS). A fixed 50 ms is a fifth of a RTT on
+ *  a 250 ms path but two and a half RTTs on a 20 ms one, so the hole was
+ *  reported at wildly different rates depending on where the peer happened to
+ *  be. Scaling it to the path keeps the repeat inside the same round. */
 export const HOLE_DUP_ACK_MS = 50;
+export const HOLE_DUP_ACK_MIN_MS = 10;
+export const HOLE_DUP_ACK_DIVISOR = 8;
 /** Segments repaired per duplicate-ack round. Retransmitting only the oldest
  *  hole makes a 20-segment gap take 20 rounds; the rest are provably missing
  *  because they were sent before the sacked block that produced the dup ack.
@@ -258,6 +283,17 @@ export const FAST_RETX_SEGMENTS = 6;
  *  acks already prove the segment is missing, so this only guards against
  *  reordering, where "later data arrived" is not proof of loss. */
 export const FAST_RETX_MIN_AGE_MS = 30;
+/** The age gate above is `min(minRtt x 1.25, srtt)` — a full round trip — and it
+ *  was the dominant term in single-hole recovery: the hole was proven missing
+ *  one RTT after the evidence arrived, so the copy landed ~1.75 RTT after the
+ *  loss. Keeping the full RTT always was the reaction to reordering (rounds that
+ *  sent copies nobody needed). Both directions now exist: a round that recovers
+ *  real loss narrows the gate by TIGHTEN_STEP down to TIGHTEN_FLOOR, a round
+ *  that turns out to have been reordering snaps it back to 1.
+ *  0.25 of a 200 ms path leaves the 30 ms floor in charge, which is the smallest
+ *  wait that is still meaningful. */
+export const FAST_RETX_TIGHTEN_STEP = 0.85;
+export const FAST_RETX_TIGHTEN_FLOOR = 0.25;
 /** Do not resend a segment that went out less than this long ago. Duplicate
  *  acks arrive every ~100 ms; without the guard the same three segments were
  *  re-emitted every round, pushing the retransmit ratio past 80% while the
@@ -271,6 +307,10 @@ export const RETX_RTT_FACTOR = 1.0;
 export const MIN_RTT_EXPIRY_MS = 10000;
 export const TLP_MIN_PTO_MS = 60;
 export const TLP_MAX_PROBES = 2;
+/** Retransmit-recovery latency ring size. Bounded on purpose: a proxy runs
+ *  thousands of sessions and an unbounded sample list is a leak, while 256
+ *  samples give a p95 that is stable to a few ms. */
+export const RETX_LAT_SAMPLES = 256;
 /** Receive-side chunk-count ceiling (stream.h kMinOobChunks/kMaxOobChunks).
  *  The byte ceiling alone does not bound memory: a peer can put one byte in
  *  each run, so 256 KiB of reorder data becomes 128 k Buffer objects. */

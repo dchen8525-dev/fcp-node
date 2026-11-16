@@ -208,6 +208,10 @@ export class TunnelClient {
   /** One reset per second for unknown salts: the reply is cheap, but an
    *  unrelated flood must not turn the client into a packet reflector. */
   private lastResetMs = 0;
+  /** Cadence of the 2 s per-session stats line. Was `now % 2000 < TICK_MS`,
+   *  which only held while the tick was a fixed 10 ms interval; a
+   *  deadline-driven tick can straddle the window and skip a whole period. */
+  private lastStatsDbgMs = 0;
 
   constructor(opts: TunnelOptions) {
     this.opts = opts;
@@ -247,7 +251,7 @@ export class TunnelClient {
       });
     });
     this.running = true;
-    this.timer = setInterval(() => this.tick(), TICK_MS);
+    this.armTick();
     this.startedMs = nowMs();
     this.statsPrevMs = this.startedMs;
     if (this.opts.onStats) {
@@ -258,7 +262,7 @@ export class TunnelClient {
 
   stop(): void {
     this.running = false;
-    if (this.timer) clearInterval(this.timer);
+    if (this.timer) clearTimeout(this.timer);
     if (this.statsTimer) { clearInterval(this.statsTimer); this.statsTimer = null; }
     for (const b of this.sessions.values()) { b.cleanup(); b.trace?.close(); }
     this.sessions.clear();
@@ -449,11 +453,37 @@ export class TunnelClient {
     this.udp.send(reset, rinfo.port, rinfo.address);
   }
 
+  /**
+   * Arm the next tick.
+   *
+   * TICK_MS is the fallback cadence, not the resolution: every session reports
+   * its earliest self-driven deadline (delayed ack, partial repair group, TLP,
+   * RTO) and the tick is armed for whichever comes first. With nothing pending
+   * this collapses to a plain 10 ms interval, so idle sessions cost exactly what
+   * they did before.
+   */
+  private armTick(): void {
+    if (!this.running) return;
+    this.timer = setTimeout(() => this.tick(), this.nextTickDelayMs());
+  }
+
+  private nextTickDelayMs(): number {
+    const now = nowMs();
+    let delay = TICK_MS;
+    for (const b of this.sessions.values()) {
+      const d = b.session.nextTimerMs(now);
+      if (d > 0 && d < delay) delay = d;
+    }
+    return Math.max(1, delay);
+  }
+
   private tick(): void {
     const now = nowMs();
+    const statsDue = now - this.lastStatsDbgMs >= 2000;
+    if (statsDue) this.lastStatsDbgMs = now;
     for (const [key, b] of [...this.sessions]) {
       b.session.onTick(now);
-      if (b.session.established && now % 2000 < TICK_MS) {
+      if (b.session.established && statsDue) {
         const st = b.session.stats();
         this.dbg(`stats inflight=${b.session.inflightBytes}B rwnd=${b.session.peerWindowBytes}B ` +
           `queued=${b.session.queuedBytes}B retx=${b.session.segsRetransmitted}/${b.session.segsSent} ` +
@@ -461,6 +491,7 @@ export class TunnelClient {
           `sendBw=${(b.session.sendRateBytesPerMs * 1000 / 1048576).toFixed(2)}MB/s ` +
           `recvNext=${b.session.recvNext} ` +
           `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B ` +
+          `retxLat=${b.session.retxLatencyP50Ms}/${b.session.retxLatencyP95Ms}ms(n=${b.session.retxLatencyCount}) ` +
           `authFail=${st.authFail} structFail=${st.structFail}`);
       }
       // Session-level isClosed only: on a shared mux session the default
@@ -468,6 +499,10 @@ export class TunnelClient {
       // session down (the default stream's close callback already guards).
       if (b.session.isClosed) { this.sessions.delete(key); b.cleanup(); b.trace?.close(); }
     }
+    // Armed last: onTick is what creates most deadlines (delayed ack, repair
+    // group close, TLP), so computing the delay before the loop would always
+    // schedule against the previous round's state and miss them.
+    this.armTick();
   }
 
   private onLocalConnection(sock: TcpSocket): void {
@@ -809,6 +844,8 @@ export class TunnelServer {
   /** salt|nonce of bootstrap datagrams already accepted, with their arrival
    *  time. Bounded; see rememberBootstrap(). */
   private seenBootstrap = new Map<string, number>();
+  /** See TunnelClient.lastStatsDbgMs: elapsed-time cadence, not modulo. */
+  private lastStatsDbgMs = 0;
 
   constructor(opts: TunnelOptions) {
     this.opts = opts;
@@ -831,13 +868,13 @@ export class TunnelServer {
       });
     });
     this.running = true;
-    this.timer = setInterval(() => this.tick(), TICK_MS);
+    this.armTick();
     this.log(`server: udp 0.0.0.0:${this.opts.port ?? 4460}`);
   }
 
   stop(): void {
     this.running = false;
-    if (this.timer) clearInterval(this.timer);
+    if (this.timer) clearTimeout(this.timer);
     for (const b of this.sessions.values()) { b.cleanup(); b.trace?.close(); }
     this.sessions.clear();
     this.udp.close();
@@ -981,11 +1018,28 @@ export class TunnelServer {
     this.sessions.set(key, created);
   }
 
+  private armTick(): void {
+    if (!this.running) return;
+    this.timer = setTimeout(() => this.tick(), this.nextTickDelayMs());
+  }
+
+  private nextTickDelayMs(): number {
+    const now = nowMs();
+    let delay = TICK_MS;
+    for (const b of this.sessions.values()) {
+      const d = b.session.nextTimerMs(now);
+      if (d > 0 && d < delay) delay = d;
+    }
+    return Math.max(1, delay);
+  }
+
   private tick(): void {
     const now = nowMs();
+    const statsDue = now - this.lastStatsDbgMs >= 2000;
+    if (statsDue) this.lastStatsDbgMs = now;
     for (const [key, b] of [...this.sessions]) {
       b.session.onTick(now);
-      if (b.session.established && now % 2000 < TICK_MS) {
+      if (b.session.established && statsDue) {
         const st = b.session.stats();
         this.dbg(`stats inflight=${b.session.inflightBytes}B rwnd=${b.session.peerWindowBytes}B ` +
           `queued=${b.session.queuedBytes}B retx=${b.session.segsRetransmitted}/${b.session.segsSent} ` +
@@ -993,6 +1047,7 @@ export class TunnelServer {
           `sendBw=${(b.session.sendRateBytesPerMs * 1000 / 1048576).toFixed(2)}MB/s ` +
           `recvNext=${b.session.recvNext} ` +
           `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B ` +
+          `retxLat=${b.session.retxLatencyP50Ms}/${b.session.retxLatencyP95Ms}ms(n=${b.session.retxLatencyCount}) ` +
           `authFail=${st.authFail} structFail=${st.structFail}`);
       }
       if (b.session.isClosed) {
@@ -1007,6 +1062,8 @@ export class TunnelServer {
         if (t.pendingToTunnel.length || t.endFromTarget) this.pumpToTunnel(t);
       }
     }
+    // Armed last: see the client's tick().
+    this.armTick();
   }
 
   /**

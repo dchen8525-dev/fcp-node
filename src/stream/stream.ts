@@ -16,8 +16,10 @@ import {
   DEFAULT_IDLE_TIMEOUT_MS, PUMP_BURST_BYTES, ZERO_WINDOW_PROBE_MS, ACK_EVERY_SEGMENTS,
   HOLE_DUP_ACK_MS, FAST_RETX_SEGMENTS, MIN_RETX_INTERVAL_MS,
   FAST_RETX_MIN_AGE_MS, RETX_RTT_FACTOR,
+  FAST_RETX_TIGHTEN_STEP, FAST_RETX_TIGHTEN_FLOOR,
   MIN_OOB_CHUNKS, MAX_OOB_CHUNKS,
   TLP_MIN_PTO_MS, TLP_MAX_PROBES,
+  HOLE_DUP_ACK_MIN_MS, HOLE_DUP_ACK_DIVISOR, RETX_LAT_SAMPLES,
 } from '../constants.ts';
 import {
   seqAfter, seqAtOrAfter, seqDist, getLe32, putLe32,
@@ -53,6 +55,11 @@ export interface StreamCallbacks {
 interface SndSeg {
   offset: number; bytes: Buffer; fin: boolean; end: number;
   sentMs: number; acked: boolean; sacked: boolean; retransmits: number;
+  /** Send time of the FIRST copy, never rewritten by a retransmission. This is
+   *  the only honest denominator for "how long did this loss cost us": sentMs
+   *  moves forward with every copy, so measuring against it reported the
+   *  retransmit interval (tens of ms) instead of the recovery time. */
+  firstSentMs: number;
 }
 interface RcvChunk { offset: number; bytes: Buffer; }
 
@@ -69,6 +76,12 @@ export class Stream {
   /** Retransmits split by trigger, so a ratio can be attributed instead of
    *  guessed at. Not used for control flow. */
   retxFast = 0; retxRto = 0; fastRounds = 0;
+  /** Ring of recovery latencies (ms) for segments that needed at least one
+   *  retransmission: first send -> cum/sacked confirmation. FEC has had a
+   *  p50/p95 for a while; ARQ recovery was invisible, which made every change
+   *  to it unverifiable. */
+  private retxLat: number[] = [];
+  private retxLatNext = 0;
   srttMs: number;
 
   // Send side.
@@ -103,6 +116,16 @@ export class Stream {
    *  rounds that bought nothing (reordering), decayed after rounds that
    *  recovered real loss. */
   private retxRelax = 1;
+  /** Mirror of retxRelax: divides the age base after rounds that recovered real
+   *  loss. Without it the gate stayed at a full RTT for the whole session even
+   *  after a hundred rounds proved the losses were genuine, so every single-hole
+   *  recovery paid ~1.75 RTT. Snapped back to 1 as soon as a round turns out to
+   *  have been reordering (see noteSpurious(), which has the evidence). */
+  private retxTighten = 1;
+  /** Set when the current round's copy was not the one that got through. */
+  private fastRoundSpurious = false;
+  /** Diagnostic only: rounds that were reordering, not loss. */
+  spuriousFastRetx = 0;
   /** SACK ranges carried by the most recent ACK (v2: up to 64; v1: 0 or 1).
    *  Two or more ranges starting beyond a segment are decisive loss evidence:
    *  the receiver demonstrably holds several separate later arrivals, which
@@ -178,6 +201,7 @@ export class Stream {
           acked: false,
           sacked: s.sacked,
           retransmits: s.sacked ? s.retransmits : Math.max(1, s.retransmits),
+          firstSentMs: s.firstSentMs,
         };
         recut.push(part);
       }
@@ -217,6 +241,29 @@ export class Stream {
   /** Highest byte the peer has ever reported (cumulative or SACK). Diagnostic:
    *  a SACK range past sndMax must not raise it. */
   get sackedHighWater(): number { return this.sackedHigh; }
+
+  private recordRetxLatency(ms: number): void {
+    if (this.retxLat.length < RETX_LAT_SAMPLES) {
+      this.retxLat.push(ms);
+    } else {
+      this.retxLat[this.retxLatNext] = ms;
+      this.retxLatNext = (this.retxLatNext + 1) % RETX_LAT_SAMPLES;
+    }
+  }
+
+  /** Copy of the latency ring, for the session-level aggregate. */
+  retxLatencySamples(): number[] { return this.retxLat.slice(); }
+
+  /** Nearest-rank percentile over the ring, like the FEC reporter's. */
+  private retxLatPct(pct: number): number {
+    if (this.retxLat.length === 0) return 0;
+    const sorted = this.retxLat.slice().sort((a, b) => a - b);
+    const rank = Math.min(sorted.length, Math.max(1, Math.ceil((pct / 100) * sorted.length)));
+    return sorted[rank - 1]!;
+  }
+  get retxLatencyP50Ms(): number { return this.retxLatPct(50); }
+  get retxLatencyP95Ms(): number { return this.retxLatPct(95); }
+  get retxLatencyCount(): number { return this.retxLat.length; }
 
   /** Bytes the host may still write. In-flight bytes count: the C++ send_space()
    *  subtracts (queued - acked), and leaving them out let the host queue a full
@@ -292,6 +339,7 @@ export class Stream {
       const seg: SndSeg = {
         offset: this.sndNext, bytes: chunk, fin, end,
         sentMs: nowMs, acked: false, sacked: false, retransmits: 0,
+        firstSentMs: nowMs,
       };
       if (fin) this.finOffset = (this.sndNext + chunk.length) >>> 0;
       this.tx.push(seg);
@@ -542,6 +590,20 @@ export class Stream {
           // triggered yet more retransmits — the link ended up spending ~73% of
           // its bandwidth resending data the peer already had.
           if (sampleMs < 0 && s.retransmits === 0) sampleMs = Math.max(0, nowMs - s.sentMs);
+          // Recovery latency, the opposite question: for a segment that DID
+          // need retransmission, how long after its first copy did recovery
+          // finally happen. Counted separately from the RTT sample so the two
+          // cannot contaminate each other.
+          if (s.retransmits > 0) this.recordRetxLatency(Math.max(0, nowMs - s.firstSentMs));
+          // Was the last copy the one that arrived? A copy needs a full minRtt
+          // to make the round trip, so a confirmation that arrives sooner came
+          // from an earlier copy: the round that sent the copy was a reordering
+          // false positive. This is RACK's spurious-detection test and it is the
+          // only honest evidence for deciding whether the age gate may narrow.
+          if (s.retransmits > 0 && this.minRttMs > 0 && nowMs - s.sentMs < this.minRttMs) {
+            ++this.spuriousFastRetx;
+            this.fastRoundSpurious = true;
+          }
         }
       }
       this.sndUna = cum;
@@ -608,6 +670,33 @@ export class Stream {
     this.pump(nowMs);
   }
 
+  /** The age base the reorder gate is derived from.
+   *
+   *  minRtt when known, not srtt: under a deep queue srtt reads twice the path
+   *  delay, and waiting a queue-inflated RTT is exactly when recovery has to be
+   *  prompt. minRtt is the path's own floor, which is what RACK uses too. */
+  private get retxAgeBaseMs(): number {
+    const srtt = Math.max(1, this.srttMs);
+    return this.minRttMs > 0 ? Math.min(Math.round(this.minRttMs * 1.25), srtt) : srtt;
+  }
+
+  /** How long a segment must have been on the wire before it may be called
+   *  lost and retransmitted for the first time.
+   *
+   *  Do not call a segment lost before one RTT has actually passed: a copy still
+   *  in flight is indistinguishable from a lost one, and srtt/2 declared half of
+   *  every window's in-flight bytes lost — 43 retransmits per second against 4
+   *  lost segments per second. That is what retxRelax (up to 2x) is for.
+   *
+   *  The opposite mistake cost just as much: the gate never came back down, so
+   *  every genuine single-hole loss waited a full RTT before its copy even left,
+   *  putting recovery at ~1.75 RTT. retxTighten narrows it while the evidence
+   *  says the losses are real. Diagnostic as well as load-bearing. */
+  get retxAgeGateMs(): number {
+    return Math.max(FAST_RETX_MIN_AGE_MS,
+      Math.round(this.retxAgeBaseMs * this.retxRelax * this.retxTighten));
+  }
+
   /**
    * Replace the oldest holes, up to one burst worth per duplicate-ack round.
    *
@@ -617,8 +706,8 @@ export class Stream {
    * flight, and duplicate acks arrive fast enough to drive the loop far more
    * often than one round per RTT.
    *
-   * Now: a segment that has never been retransmitted goes out as soon as three
-   * duplicate acks prove it missing (plus a small age guard for reordering); a
+   * Now: a segment that has never been retransmitted goes out as soon as a
+   * duplicate ack proves it missing (plus the age gate for reordering); a
    * segment that *was* already retransmitted waits a full RTT, because until
    * then its copy is still in flight and a second copy is guaranteed waste.
    *
@@ -632,22 +721,9 @@ export class Stream {
    * because the window was full of copies.
    */
   private fastRetransmit(nowMs: number): void {
-    const srtt = Math.max(1, this.srttMs);
-    // Do not call a segment lost before one RTT has actually passed. A copy
-    // still in flight is indistinguishably "missing" from the SACK report, and
-    // srtt/2 declared half of every window's in-flight bytes lost: 43
-    // retransmits per second against 4 lost segments per second.
-    //
-    // The base is minRtt when known, not srtt: under a deep queue srtt reads
-    // twice the path delay, and waiting a queue-inflated RTT is exactly when
-    // recovery has to be prompt. minRtt is the path's own floor, which is what
-    // RACK uses for the same reason.
-    const base = this.minRttMs > 0 ? Math.min(Math.round(this.minRttMs * 1.25), srtt) : srtt;
-    const repeatAfter = Math.max(MIN_RETX_INTERVAL_MS, Math.round(base * RETX_RTT_FACTOR * 1.25));
-    // firstAfter adapts: a round that bought nothing (reordering) relaxes the
-    // RTT base, a round that recovered real loss decays the relaxation away.
-    const firstAfter = Math.max(FAST_RETX_MIN_AGE_MS, Math.round(base * this.retxRelax));
-    ++this.fastRounds;
+    const repeatAfter = Math.max(MIN_RETX_INTERVAL_MS,
+      Math.round(this.retxAgeBaseMs * RETX_RTT_FACTOR * 1.25));
+    const firstAfter = this.retxAgeGateMs;
     let sent = 0;
     let firstSeq = -1;
     for (const s of this.tx) {
@@ -671,21 +747,85 @@ export class Stream {
       s.sentMs = nowMs;
       if (++sent >= FAST_RETX_SEGMENTS) break;
     }
+    if (sent > 0) {
+      // Counted only when the round actually put copies on the wire: with
+      // DUP_ACK_THRESH at 1 this function runs on every duplicate ack, and
+      // counting the no-ops made `retxFast / fastRounds` read better than the
+      // link really was.
+      ++this.fastRounds;
+    }
     if (sent > 0 && this.fastRoundSeq < 0) {
       this.fastRoundMs = nowMs;
       this.fastRoundUna = this.sndUna;
       this.fastRoundSeq = firstSeq;
+      this.fastRoundSpurious = false;
     }
   }
 
-  /** A cumulative ack covering the round's first retransmitted segment proves
-   *  the path delivered: decay the reorder relaxation toward 1. */
+  /** A cumulative ack covering the round's first retransmitted segment resolves
+   *  it. Which way the gate moves depends on evidence, not on the fact that it
+   *  resolved: reordering (the copy never made it in time) widens it and resets
+   *  the tightening, genuine loss narrows it. */
   private resolveFastRound(cum: number): void {
     if (this.fastRoundSeq < 0) return;
-    if (seqAtOrAfter(cum, this.fastRoundSeq)) {
+    if (!seqAtOrAfter(cum, this.fastRoundSeq)) return;
+    if (this.fastRoundSpurious) {
+      this.retxRelax = Math.min(2, Math.round(this.retxRelax * 1.3 * 100) / 100);
+      this.retxTighten = 1;
+    } else {
+      this.retxTighten = Math.max(FAST_RETX_TIGHTEN_FLOOR,
+        Math.round(this.retxTighten * FAST_RETX_TIGHTEN_STEP * 1000) / 1000);
       this.retxRelax = Math.max(1, Math.round(this.retxRelax * 0.8 * 100) / 100);
-      this.fastRoundSeq = -1;
     }
+    this.fastRoundSeq = -1;
+    this.fastRoundSpurious = false;
+  }
+
+  /** Repeating an acknowledgement for an open hole. Scaled to the path so the
+   *  repeat lands inside the same round trip the hole was discovered in: a
+   *  fixed 50 ms was a fifth of an RTT on the long path and 2.5 RTTs on the
+   *  short one. */
+  private holeDupAckMs(): number {
+    const scaled = Math.round(this.srttMs / HOLE_DUP_ACK_DIVISOR);
+    return Math.max(HOLE_DUP_ACK_MIN_MS, Math.min(HOLE_DUP_ACK_MS, scaled));
+  }
+
+  /**
+   * Milliseconds until this stream next has something to do on its own, or -1.
+   *
+   * The host used to drive everything off a fixed 10 ms interval, which quantised
+   * every deadline in here: a delayed ack due in 4 ms went out at the next tick
+   * boundary (up to 10 ms late, and later still when the event loop was busy),
+   * a partial repair group due at flushMs waited for a boundary, and an RTO that
+   * had already expired was checked up to 10 ms late. None of that is a lot per
+   * event, but acks and repairs are exactly the events this protocol lives on.
+   *
+   * Only *future* deadlines are reported (>= 1 ms), so a host that reschedules
+   * on this value cannot spin: each wake-up has to clear its own deadline
+   * (onTick emits the ack, closes the group, resends the segment).
+   */
+  nextTimerMs(nowMs: number): number {
+    if (this.state === StreamState.Closed) return -1;
+    let best = -1;
+    const take = (dueMs: number): void => {
+      if (dueMs < 1) dueMs = 1;
+      if (best < 0 || dueMs < best) best = dueMs;
+    };
+    if (this.ackPending) take(this.lastAckMs + ACK_DELAY_MS - nowMs);
+    else if (this.oobBytes > 0) take(this.lastAckMs + this.holeDupAckMs() - nowMs);
+    if (this.pendingBytes > 0 && this.window() === 0) {
+      take(this.lastZeroWinProbeMs + ZERO_WINDOW_PROBE_MS - nowMs);
+    }
+    if (this.tx.length > 0 && this.tlpProbes < TLP_MAX_PROBES && this.window() > 0 &&
+        (this.pendingBytes === 0 || this.inflightBytes >= this.window())) {
+      take(this.lastSendMs + Math.max(TLP_MIN_PTO_MS, Math.round(this.srttMs + 2 * this.rttvarMs)) - nowMs);
+    }
+    for (const s of this.tx) {
+      if (s.acked || s.sacked) continue;
+      take(s.sentMs + this.rtoMs * (1 << Math.min(s.retransmits, 5)) - nowMs);
+      break; // the RTO loop only ever resends the oldest
+    }
+    return best;
   }
 
   onTick(nowMs: number): void {
@@ -697,14 +837,23 @@ export class Stream {
     // fires — the stalls observed on the VPS link lasted seconds. Repeating the
     // ack keeps the peer's duplicate-ack counter moving so the missing segment
     // is resent within one round trip. Same ack, no extra state on the wire.
-    else if (this.oobBytes > 0 && nowMs - this.lastAckMs >= HOLE_DUP_ACK_MS) this.emitAck(nowMs);
+    else if (this.oobBytes > 0 && nowMs - this.lastAckMs >= this.holeDupAckMs()) this.emitAck(nowMs);
     if (nowMs - this.lastInboundMs >= this.cfg.idleTimeoutMs) { this.finish('idle'); return; }
-    // Tail-loss probe: everything queued is on the wire and only the tail is
-    // unconfirmed. Nothing after it will ever produce a duplicate ack, so
-    // without a probe the tail waits out the full backed-off RTO. Resend the
-    // tail segment early — the duplicate makes the receiver answer at once,
-    // and the probe budget resets as soon as cum moves again.
-    if (this.tx.length > 0 && this.pendingBytes === 0 && !this.finPending &&
+    // Tail-loss probe: the tail is unconfirmed and nothing after it will ever
+    // produce a duplicate ack, so without a probe it waits out the full
+    // backed-off RTO. Resend the tail early — the duplicate makes the receiver
+    // answer at once, and the probe budget resets as soon as cum moves again.
+    //
+    // The guard used to be `pendingBytes === 0` alone, which covers the end of a
+    // flow but not a window that filled up: the queue can only be non-empty
+    // while the window is full if the peer shrank its window below the bytes
+    // already in flight (its app stopped reading). Then the queue cannot drain,
+    // pump() sends nothing, no later segment exists to dup-ack the lost tail,
+    // and the RTO chain (srtt + 4*rttvar, then 2^n) was the only trigger left.
+    // A stalled full window and an empty queue both mean "nothing else will
+    // move", so both allow the probe.
+    const stalled = this.pendingBytes === 0 || this.inflightBytes >= this.window();
+    if (this.tx.length > 0 && stalled && !this.finPending &&
         this.window() > 0 && this.tlpProbes < TLP_MAX_PROBES) {
       const pto = Math.max(TLP_MIN_PTO_MS, Math.round(this.srttMs + 2 * this.rttvarMs));
       if (nowMs - this.lastSendMs >= pto) {
@@ -717,14 +866,20 @@ export class Stream {
       }
     }
     // A fast-retransmit round that bought nothing within 1.5 sRTT points at
-    // reordering rather than loss: relax the next round's age base (up to 2x).
+    // reordering rather than loss: relax the next round's age base (up to 2x)
+    // and stop narrowing it, because the narrow gate was what produced the
+    // round in the first place.
     if (this.fastRoundSeq >= 0 && nowMs - this.fastRoundMs >= Math.round(1.5 * this.srttMs)) {
       if (this.sndUna === this.fastRoundUna) {
         this.retxRelax = Math.min(2, Math.round(this.retxRelax * 1.3 * 100) / 100);
+        this.retxTighten = 1;
       } else {
+        this.retxTighten = Math.max(FAST_RETX_TIGHTEN_FLOOR,
+          Math.round(this.retxTighten * FAST_RETX_TIGHTEN_STEP * 1000) / 1000);
         this.retxRelax = Math.max(1, Math.round(this.retxRelax * 0.8 * 100) / 100);
       }
       this.fastRoundSeq = -1;
+      this.fastRoundSpurious = false;
     }
     // Retransmission timeout: resend the oldest unacked, unsacked segment.
     // The per-segment 2^retransmits deadline IS the backoff; a global rtoMs
@@ -764,6 +919,7 @@ export class Stream {
     const seg: SndSeg = {
       offset: this.sndNext, bytes: chunk, fin: false, end,
       sentMs: nowMs, acked: false, sacked: false, retransmits: 0,
+      firstSentMs: nowMs,
     };
     this.tx.push(seg);
     this.sndNext = end;
