@@ -531,7 +531,7 @@ export class TunnelClient {
     let closeWriteConn: () => void = () => {};
     let rstConn: () => void = () => {};
     let connClosedNow = (): boolean => true;
-    const pendingLocal: Buffer[] = [];
+    let pendingLocal: Buffer[] = [];
     let pendingLocalBytes = 0;
     let localPaused = false;
     let drainTimer: NodeJS.Timeout | null = null;
@@ -566,8 +566,9 @@ export class TunnelClient {
     // at all. Queue them, but pause the socket once the backlog is a whole
     // window: a black-holed handshake used to accumulate this without bound.
     const LOCAL_BACKLOG_LIMIT = 1 << 20;
-    const queueLocal = (b: Buffer) => {
-      pendingLocal.push(Buffer.from(b));
+    const queueLocal = (b: Buffer, front = false) => {
+      if (front) pendingLocal.unshift(Buffer.from(b));
+      else pendingLocal.push(Buffer.from(b));
       pendingLocalBytes += b.length;
       if (!localPaused && pendingLocalBytes >= LOCAL_BACKLOG_LIMIT && !sock.destroyed) {
         localPaused = true;
@@ -635,10 +636,21 @@ export class TunnelClient {
       if (!open) { destroy(); return; }
       opened = true;
       this.dbg(`[${saltKey.slice(0, 8)}] OPEN tx ${open.length}B -> ${targetText(target)} (sid ${attachedShared ? connSid : 0})`);
-      // Queue rather than write: a short Stream.write must keep its remainder,
-      // and the first payload may not overtake the OPEN.
-      queueLocal(open);
-      if (firstPayload && firstPayload.length) queueLocal(firstPayload);
+      // The OPEN must be the FIRST byte of the tunnel stream. The local app can
+      // already have delivered its body while the handshake was still in
+      // flight — a client that pipelines greeting + request + body in one write
+      // does exactly that, and `pendingLocal` then holds the body before this
+      // function ever runs. Appending the OPEN behind it sent the peer a body
+      // with no OPEN in front: its PrefixParser failed, it answered OPEN_ERR
+      // NotSupported, and the upload was lost. Unshift instead of push so the
+      // OPEN stays first no matter what the backlog already contains.
+      queueLocal(open, true);
+      if (firstPayload && firstPayload.length) {
+        // Unshift in reverse: the OPEN is already at the front, so the first
+        // payload goes behind it, ahead of whatever the app had queued.
+        const rest = pendingLocal;
+        pendingLocal = [open, Buffer.from(firstPayload), ...rest];
+      }
       flushPending();
       this.log(`open sent -> ${targetText(target)}`);
     };
@@ -701,62 +713,73 @@ export class TunnelClient {
       sendOpen();
     };
 
-    const parseEntry = (): void => {
+    const parseEntry = (): boolean => {
       const kind = detectEntry(entryBuf);
-      if (kind === 'need_more') return;
-      if (kind === 'unknown') { destroy(); return; }
+      if (kind === 'need_more') return true;
+      if (kind === 'unknown') { destroy(); return false; }
       entryKind = kind;
       this.dbg(`entry detected kind=${kind} bytes=${entryBuf.length}`);
       if (kind === 'socks5') {
         if (!socksGreeted) {
           const g = socks5ParseGreeting(entryBuf);
-          if (g.status === 'need_more') return;
-          if (g.status !== 'ok' || !g.value?.noAuth) { destroy(); return; }
+          if (g.status === 'need_more') return true;
+          if (g.status !== 'ok' || !g.value?.noAuth) { destroy(); return false; }
           entryBuf = entryBuf.subarray(g.consumed);
           sock.write(socks5GreetingReply(true));
           socksGreeted = true;
-          if (!entryBuf.length) return;
+          if (!entryBuf.length) return true;
         }
         const r = socks5ParseRequest(entryBuf);
-        if (r.status === 'need_more') return;
+        if (r.status === 'need_more') return true;
         if (r.status !== 'ok' || !r.value) {
           destroy(socks5Reply(r.status === 'command_not_supported'
             ? Socks5Rep.CommandNotSupported : Socks5Rep.GeneralFailure));
-          return;
+          return false;
         }
         target = r.value; firstPayload = entryBuf.subarray(r.consumed);
         entryBuf = Buffer.alloc(0);
       } else if (kind === 'connect') {
         const r = httpParseConnect(entryBuf);
-        if (r.status === 'need_more') return;
+        if (r.status === 'need_more') return true;
         if (r.status !== 'ok' || !r.value) {
           destroy(r.status === 'head_too_large' ? HTTP_HEAD_TOO_LARGE :
             r.status === 'method_not_allowed' ? HTTP_METHOD_NOT_ALLOWED : HTTP_BAD_REQUEST);
-          return;
+          return false;
         }
         target = r.value; firstPayload = entryBuf.subarray(r.consumed);
         entryBuf = Buffer.alloc(0);
       } else {
         const r = httpParseForward(entryBuf);
-        if (r.status === 'need_more') return;
+        if (r.status === 'need_more') return true;
         if (r.status !== 'ok' || !r.value) {
           destroy(r.status === 'head_too_large' ? HTTP_HEAD_TOO_LARGE :
             r.status === 'method_not_allowed' ? HTTP_FORWARD_METHOD_NOT_ALLOWED : HTTP_BAD_REQUEST);
-          return;
+          return false;
         }
         target = r.value.target;
         firstPayload = Buffer.concat([r.value.rewrittenHead, entryBuf.subarray(r.consumed)]);
         entryBuf = Buffer.alloc(0);
       }
       openTunnel();
+      return false;
     };
 
     sock.on('data', (chunk: Buffer) => {
       if (dead) return;
       if (!target) {
         entryBuf = entryBuf.length ? Buffer.concat([entryBuf, chunk]) : chunk;
-        if (entryBuf.length > 16384) { destroy(HTTP_HEAD_TOO_LARGE); return; }
-        parseEntry();
+        // The head-length limits belong to the parsers: HTTP caps the head at
+        // 8 KiB and answers 'head_too_large' itself, SOCKS5 caps its request at
+        // 262 B. This guard used to cap the *whole first chunk* at 16 KiB,
+        // which is not the same thing — any client that pipelines request +
+        // body in one write (curl -T, nc with a here-doc, a browser POST whose
+        // body is already in the socket buffer) was killed with a bogus 431
+        // before the parser ever ran, and the upload never reached the target.
+        // Now the guard only fires when a parser is still asking for more after
+        // 16 KiB, which no valid head can do: a complete head always parses and
+        // everything after it becomes firstPayload.
+        const needMore = parseEntry();
+        if (needMore && entryBuf.length > 16384) { destroy(HTTP_HEAD_TOO_LARGE); return; }
         return;
       }
       this.dbg(`[${saltKey.slice(0, 8)}] local rx ${chunk.length}B opened=${opened}`);

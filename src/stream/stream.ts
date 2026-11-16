@@ -11,12 +11,13 @@
 
 import {
   STREAM_TYPE_DATA, STREAM_TYPE_ACK, STREAM_TYPE_ACK_V2, STREAM_TYPE_RST,
-  STREAM_FLAG_FIN, STREAM_DATA_HDR_LEN, DUP_ACK_THRESH, ACK_DELAY_MS,
+  STREAM_FLAG_FIN, STREAM_DATA_HDR_LEN, STREAM_ACK_LEN, DUP_ACK_THRESH, ACK_DELAY_MS,
   DEFAULT_SEND_WINDOW_BYTES, DEFAULT_RCV_BUF_BYTES, DEFAULT_SRTT_MS,
   DEFAULT_IDLE_TIMEOUT_MS, PUMP_BURST_BYTES, ZERO_WINDOW_PROBE_MS, ACK_EVERY_SEGMENTS,
   HOLE_DUP_ACK_MS, FAST_RETX_SEGMENTS, MIN_RETX_INTERVAL_MS,
   FAST_RETX_MIN_AGE_MS, RETX_RTT_FACTOR,
   FAST_RETX_TIGHTEN_STEP, FAST_RETX_TIGHTEN_FLOOR,
+  RTT_PEAK_DECAY_MS, RTT_PEAK_MAX_MS, RTTVAR_NOISE_FLOOR_MS,
   MIN_OOB_CHUNKS, MAX_OOB_CHUNKS,
   TLP_MIN_PTO_MS, TLP_MAX_PROBES,
   HOLE_DUP_ACK_MIN_MS, HOLE_DUP_ACK_DIVISOR, RETX_LAT_SAMPLES,
@@ -107,6 +108,17 @@ export class Stream {
   /** Best RTT ever observed. Anchors the estimator so hole-delayed segments
    *  (a segment that sat behind a gap for seconds) cannot inflate srtt. */
   private minRttMs = 0;
+  /** Largest RTT a single segment has legitimately taken, over a sliding
+   *  window. srtt is a *mean*, so on a path with real jitter the mean sits far
+   *  below the spread: a 20 ms path with 60 ms of reordering has srtt ~57 ms
+   *  while individual segments routinely take 80 ms. Deriving the reorder gate
+   *  from the mean therefore declared every late-but-fine segment lost —
+   *  measured on a zero-loss link at 27-43% retransmissions, almost all of them
+   *  spurious. The gate has to be bounded by what the path has actually been
+   *  observed to deliver, not by its average. */
+  private rttPeakMs = 0;
+  /** Decay for rttPeakMs so a one-off spike cannot pin the gate for a session. */
+  private rttPeakAtMs = 0;
   /** Tail-loss probing: 0 = no probe in flight, counts toward TLP_MAX_PROBES. */
   private tlpProbes = 0;
   /** Send time of the most recent data segment (TLP clock base). */
@@ -127,9 +139,9 @@ export class Stream {
   /** Diagnostic only: rounds that were reordering, not loss. */
   spuriousFastRetx = 0;
   /** SACK ranges carried by the most recent ACK (v2: up to 64; v1: 0 or 1).
-   *  Two or more ranges starting beyond a segment are decisive loss evidence:
-   *  the receiver demonstrably holds several separate later arrivals, which
-   *  reordering cannot produce for the hole in between. */
+   *  Kept for marking segments `sacked` and for diagnostics. It is deliberately
+   *  NOT used as loss evidence: see fastRetransmit() for why "ranges start
+   *  beyond this segment" cannot distinguish a lost segment from a late one. */
   private sackRanges: Array<{ start: number; end: number }> = [];
   private fastRoundMs = 0;
   private fastRoundUna = 0;
@@ -546,8 +558,26 @@ export class Stream {
     const cum = this.cumOut();
     const rwnd = this.rwndOut();
     if (this.cfg.ackV2) {
-      const blocks = this.oob.slice(0, 64).map((c) => ({ start: c.offset, end: (c.offset + c.bytes.length) >>> 0 }));
-      this.cb.send(encodeAckV2(cum, rwnd, blocks));
+      // An ACK is a stream segment and has to fit the same datagram budget as
+      // data. ACK v2 is variable length: 10 B fixed plus up to 2 x 5 B per
+      // range, so 64 ranges is 650 B worst case. FrameTx drops anything over
+      // payloadMax without a word (mtuDrops), so on a small MTU a wide ACK
+      // simply vanished — and an ACK that never arrives is indistinguishable
+      // from a lost one, which turns every wide hole into an RTO stall. Cap the
+      // range count at what the budget actually holds; the dropped tail is
+      // still covered by the next ACK, and cum/ rwnd always go out.
+      const budget = this.cfg.maxSegment;
+      const maxRanges = Math.max(0, Math.min(64, Math.floor((budget - 10) / 10)));
+      const blocks = this.oob.slice(0, maxRanges).map((c) => ({ start: c.offset, end: (c.offset + c.bytes.length) >>> 0 }));
+      let ack = encodeAckV2(cum, rwnd, blocks);
+      // The estimate above is an upper bound per range; shrink until it fits
+      // for real (a range can encode shorter than 5+5).
+      while (ack.length > budget && blocks.length > 0) {
+        blocks.pop();
+        ack = encodeAckV2(cum, rwnd, blocks);
+      }
+      if (ack.length > budget) return; // even an empty v2 ACK does not fit
+      this.cb.send(ack);
       return;
     }
     let sackStart = cum, sackEnd = cum;
@@ -560,6 +590,14 @@ export class Stream {
       sackEnd = (blk.offset + blk.bytes.length) >>> 0;
     } else {
       this.sackRotateHave = false; this.sackRotate = 0;
+    }
+    // A v1 ACK is a fixed 17 bytes. That is below every legal payloadMax except
+    // the very smallest budgets, and dropping it silently is worse than sending
+    // it without the SACK block (cum still advances the peer's window).
+    if (STREAM_ACK_LEN > this.cfg.maxSegment) {
+      if (10 > this.cfg.maxSegment) return;
+      this.cb.send(encodeAckV2(cum, rwnd, []));
+      return;
     }
     this.cb.send(encodeAck(cum, rwnd, sackStart, sackEnd));
   }
@@ -627,6 +665,16 @@ export class Stream {
         this.lastRttSampleMs = nowMs;
         this.cb.rtt?.(this.srttMs);
       }
+      // Track the worst *legitimate* delay, not just the mean. Only plausible
+      // samples qualify: a hole-delayed segment is exactly the delay this must
+      // not learn, or the gate would grow to the RTO. Decay keeps one spike
+      // from pinning it for the rest of the session.
+      if (plausible && sampleMs > 0) {
+        if (sampleMs >= this.rttPeakMs || nowMs - this.rttPeakAtMs >= RTT_PEAK_DECAY_MS) {
+          this.rttPeakMs = sampleMs;
+          this.rttPeakAtMs = nowMs;
+        }
+      }
       // Clamp drift: a single burst of hole-delayed samples must not leave the
       // estimator stuck at seconds for the rest of the session.
       if (this.minRttMs > 0 && this.srttMs > rttCeiling) this.srttMs = rttCeiling;
@@ -674,10 +722,34 @@ export class Stream {
    *
    *  minRtt when known, not srtt: under a deep queue srtt reads twice the path
    *  delay, and waiting a queue-inflated RTT is exactly when recovery has to be
-   *  prompt. minRtt is the path's own floor, which is what RACK uses too. */
+   *  prompt. minRtt is the path's own floor, which is what RACK uses too.
+   *
+   *  But minRtt is a *floor*, and a reorder gate needs a *ceiling*: it has to
+   *  cover how long a segment may legitimately take, not how fast one can go.
+   *  Bounding it by srtt (a mean) is what broke reordering: on a 20 ms path
+   *  with 60 ms of spread srtt reads ~57 ms while individual segments take
+   *  80 ms, so the gate called every late segment lost. Take the larger of
+   *  minRtt x 1.25 and the worst legitimate sample instead.
+   *
+   *  Until that worst sample has been observed the gate falls back to the
+   *  estimator's own idea of the spread. RTTVAR is the mean deviation, so
+   *  srtt + 2*rttvar covers roughly the 95th percentile of a jittery path —
+   *  but on a clean path rttvar is a couple of ms, so the fallback stays close
+   *  to srtt and genuine loss is still recovered promptly. The 1.25 floor on
+   *  minRtt is kept as the absolute lower bound. */
   private get retxAgeBaseMs(): number {
     const srtt = Math.max(1, this.srttMs);
-    return this.minRttMs > 0 ? Math.min(Math.round(this.minRttMs * 1.25), srtt) : srtt;
+    if (this.minRttMs <= 0) return srtt;
+    const floor = Math.round(this.minRttMs * 1.25);
+    // rttPeak is bounded by the plausibility filter in onAck (it never learns
+    // hole-delayed samples) and decayed by RTT_PEAK_DECAY_MS, so it cannot run
+    // away to the RTO.
+    const observed = this.rttPeakMs > 0 ? Math.min(this.rttPeakMs, RTT_PEAK_MAX_MS) : 0;
+    // Only trust the variance term when the path actually has variance. A
+    // sub-5 ms rttvar is measurement noise on a clean link, and letting it
+    // widen the gate would cost real recovery latency for no benefit.
+    const fromVar = this.rttvarMs >= RTTVAR_NOISE_FLOOR_MS ? srtt + 2 * this.rttvarMs : 0;
+    return Math.max(floor, observed, fromVar);
   }
 
   /** How long a segment must have been on the wire before it may be called
@@ -719,6 +791,15 @@ export class Stream {
    * already had: two consecutive stats samples showed 162 segments sent and
    * 162 of them retransmissions, with 300 KB of new data stuck in the queue
    * because the window was full of copies.
+   *
+   * SACK never removes the age wait. "Two ranges start beyond this segment"
+   * used to be treated as proof of loss that skipped the gate entirely, but a
+   * reordering path produces exactly that shape: one delayed datagram leaves
+   * the receiver holding the ranges on both sides of it, and the segment in
+   * front of the delayed one sees two ranges starting past its end while it is
+   * still in flight. Measured on a zero-loss link: 34% retransmissions. The
+   * gate is the only thing that distinguishes "late" from "lost", and no SACK
+   * pattern can make that distinction for it.
    */
   private fastRetransmit(nowMs: number): void {
     const repeatAfter = Math.max(MIN_RETX_INTERVAL_MS,
@@ -730,15 +811,7 @@ export class Stream {
       if (s.acked || s.sacked) continue;
       // Not proven missing: the peer has not reported anything past it yet.
       if (!seqAtOrAfter(this.sackedHigh, s.end)) continue;
-      // Strong SACK evidence: two or more distinct received ranges start
-      // beyond this segment — reordering cannot explain that pattern, so the
-      // segment is provably lost and the age wait is skipped. A single range
-      // (or a v1 rotating block) keeps the reorder guard.
-      let beyond = 0;
-      for (const r of this.sackRanges) {
-        if (seqAtOrAfter(r.start, s.end) && ++beyond >= 2) break;
-      }
-      const wait = s.retransmits !== 0 ? repeatAfter : beyond >= 2 ? 0 : firstAfter;
+      const wait = s.retransmits !== 0 ? repeatAfter : firstAfter;
       if (nowMs - s.sentMs < wait) continue;
       if (firstSeq < 0) firstSeq = s.offset;
       this.emitData(s, nowMs);
@@ -858,9 +931,15 @@ export class Stream {
       const pto = Math.max(TLP_MIN_PTO_MS, Math.round(this.srttMs + 2 * this.rttvarMs));
       if (nowMs - this.lastSendMs >= pto) {
         const tail = this.tx[this.tx.length - 1]!;
+        // A probe is not a retransmission. It carries no loss evidence — the
+        // tail is merely unconfirmed — so it must not consume the segment's
+        // retransmit budget. Counting it made the segment look "already resent"
+        // to fast retransmit, which then applied repeatAfter measured from the
+        // probe instead of the original send, and inflated the retransmit ratio
+        // that the ARQ stats are judged by. It still has to be a real copy on
+        // the wire (that is the whole point: it makes the peer answer), and it
+        // still restarts the probe clock.
         this.emitData(tail, nowMs);
-        ++tail.retransmits;
-        ++this.retransmits;
         tail.sentMs = nowMs;
         ++this.tlpProbes;
       }

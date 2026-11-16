@@ -180,9 +180,25 @@ export class Handshake {
   private peerNonce: Buffer = Buffer.alloc(HANDSHAKE_NONCE_LEN);
   private havePeer = false;
   private localTlvs: HandshakeTlv[];
+  /** Whether this end will put CAP_TLV on the wire. Derived from the TLV list,
+   *  not from "have we sent a HELLO yet": a server establishes from the client's
+   *  HELLO without ever sending one of its own, and asking "did I already send
+   *  it" made that path answer no. */
+  private get tlvOffered(): boolean { return this.localTlvs.length > 0; }
   private peerTlvs: HandshakeTlv[] = [];
-  private peerTlvHello = false;
-  private tlvOffered = false;
+  /** The peer's CAP_TLV bit, taken from whichever message carried the peer's
+   *  own caps. Both HELLO and HELLO_ACK put the *sender's* caps in the caps
+   *  field, so this is the same fact from either direction — which is exactly
+   *  what makes the negotiation symmetric.
+   *
+   *  It used to be `peerTlvHello` (set only in onHello), so a server that
+   *  established through onHelloAck — its own HELLO lost, the client's ACK
+   *  arriving first, or a crossed open — negotiated tlv=false while the client
+   *  negotiated tlv=true. Both ends reported ESTABLISHED, the client prefixed
+   *  every DATA symbol with a stream id, the server read that byte as the
+   *  stream type, and not one byte crossed: the two ends sat there until the
+   *  135 s peer_dead clock. One lost datagram was enough. */
+  private peerSupportsTlv = false;
 
   state: number = HandshakeState.Idle;
   error: HandshakeErrorValue = HandshakeError.None;
@@ -261,16 +277,15 @@ export class Handshake {
   }
 
   private sendHello(): void {
-    const offer = this.localTlvs.length > 0;
+    const offer = this.tlvOffered;
     const flags = offer ? (this.localFlags | CAP_TLV) & 0xff : (this.localFlags & ~CAP_TLV) & 0xff;
     const caps: HandshakeCaps = { ver: CAPS_VERSION, data: this.localD, parity: this.localP, flags };
-    if (offer) this.tlvOffered = true;
     this.sendFn(buildHello(caps, this.localNonce, offer ? this.localTlvs : []));
   }
 
   private sendHelloAck(): void {
     if (!this.havePeer) return;
-    const offer = this.peerTlvHello;
+    const offer = this.peerSupportsTlv;
     const flags = offer ? (this.localFlags | CAP_TLV) & 0xff : (this.localFlags & ~CAP_TLV) & 0xff;
     const caps: HandshakeCaps = { ver: CAPS_VERSION, data: this.localD, parity: this.localP, flags };
     this.sendFn(buildHelloAck(caps, this.clientNonce, this.serverNonce,
@@ -310,8 +325,12 @@ export class Handshake {
     const flags = (this.localFlags & peer.flags) & 0xff;
     const required = CAP_FRAMING | CAP_FECSTAT;
     if ((flags & required) !== required) { this.fail(HandshakeError.MissingCapability); return false; }
-    const bothTlv = (peer.flags & CAP_TLV) !== 0 &&
-      (this.role === HandshakeRole.Client ? this.tlvOffered : this.peerTlvHello);
+    // Both sides must reach the same answer about TLV. `this.tlvOffered` and
+    // `peerSupportsTlv` are each derived from one side's own caps, so the
+    // conjunction is symmetric: A offers && B offers is the same test whichever
+    // end evaluates it. The old code asked "did the peer's HELLO carry it"
+    // instead, which a server that established from the ACK could not answer.
+    const bothTlv = this.tlvOffered && this.peerSupportsTlv;
     this.params = {
       d: Math.min(this.localD, peer.data),
       p: Math.min(this.localP, peer.parity),
@@ -359,7 +378,7 @@ export class Handshake {
     } else {
       this.peerNonce = Buffer.from(senderNonce);
       this.havePeer = true;
-      this.peerTlvHello = knowsTlv;
+      this.peerSupportsTlv = knowsTlv;
       if (knowsTlv) this.peerTlvs = tlvs;
     }
     if (!this.negotiate(peer)) return HandshakeStatus.ProtocolFailure;
@@ -398,6 +417,11 @@ export class Handshake {
       this.peerNonce = Buffer.from(peerDraw);
       this.havePeer = true;
     }
+    // The caps field of a HELLO_ACK describes the sender exactly like a HELLO's
+    // does. Recording it here is what makes the ACK path negotiate the same
+    // answer as the HELLO path; without it a server whose HELLO was lost set
+    // tlv=false while the client set tlv=true (see peerSupportsTlv).
+    this.peerSupportsTlv = (peer.flags & CAP_TLV) !== 0;
     if (peer.flags & CAP_TLV) this.peerTlvs = tlvs;
     if (!this.negotiate(peer)) return HandshakeStatus.ProtocolFailure;
     return HandshakeStatus.Consumed;

@@ -430,3 +430,69 @@ test('e2e: concurrent connections multiplex over a single session', async (t) =>
   // disperse across it, each session an independent window and loss domain.
   assert.equal(client.sessionCount, 4, `round-robin pool disperses connections across the 4-session cap (got ${client.sessionCount})`);
 });
+
+test('e2e: a pipelined request + body in one write reaches the target intact', async (t) => {
+  // Two separate defects used to truncate this, both invisible to a client that
+  // writes the head and the body in separate turns:
+  //   * the entry path capped the whole first chunk at 16 KiB and answered a
+  //     bogus 431, so curl -T / nc-with-a-heredoc never got through;
+  //   * once past that, the body could already be queued in pendingLocal before
+  //     the handshake finished, and the OPEN was appended *behind* it — the
+  //     server's PrefixParser then read a body where the OPEN should be,
+  //     answered OPEN_ERR NotSupported, and the upload was lost.
+  let received = 0;
+  const origin = createServer((sock) => {
+    sock.on('data', (b: Buffer) => { received += b.length; });
+    sock.on('end', () => {
+      sock.write(Buffer.from('HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok', 'latin1'));
+      sock.end();
+    });
+  });
+  await listen(origin, 0);
+  const targetPort = portOf(origin);
+  const udpPort = freePort(), proxyPort = freePort();
+  const logs: string[] = [];
+  const log = (line: string) => logs.push(line);
+  const server = new TunnelServer({ psk: PSK, port: udpPort, log });
+  const client = new TunnelClient({ psk: PSK, host: '127.0.0.1', port: udpPort, listenPort: proxyPort, log });
+  await server.start();
+  await client.start();
+  t.after(() => { client.stop(); server.stop(); origin.close(); });
+
+  const BODY = Buffer.alloc(200 * 1024, 0x41); // well past the old 16 KiB guard
+  const head = Buffer.from(
+    `POST /upload HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: ${BODY.length}\r\n\r\n`, 'latin1');
+
+  const reply = await withTimeout(new Promise<string>((resolve, reject) => {
+    const sock = connect(proxyPort, '127.0.0.1');
+    let phase: 'greeting' | 'reply' | 'data' = 'greeting';
+    let out = '';
+    sock.setTimeout(15000, () => { sock.destroy(); reject(new Error('pipelined upload timeout')); });
+    sock.on('connect', () => {
+      // greeting, request and body go out together, exactly like a client that
+      // already had its body buffered.
+      sock.write(Buffer.from([5, 1, 0]));
+      sock.write(Buffer.concat([
+        Buffer.from([5, 1, 0, 1, 127, 0, 0, 1]),
+        Buffer.from([(targetPort >>> 8) & 0xff, targetPort & 0xff]),
+      ]));
+      sock.write(head);
+      sock.write(BODY);
+      sock.end(); // half-close with the body still queued
+    });
+    sock.on('error', reject);
+    sock.on('data', (b: Buffer) => {
+      out += b.toString('latin1');
+      if (phase === 'greeting') { phase = 'reply'; return; }
+      if (phase === 'reply') { phase = 'data'; }
+    });
+    sock.on('close', () => resolve(out));
+  }), 20000, 'pipelined upload');
+
+  assert.ok(!reply.includes('431'), 'the pipelined request was not rejected as too large');
+  assert.ok(received >= head.length + BODY.length,
+    `the target received ${received} B of ${head.length + BODY.length} B`);
+  assert.ok(reply.includes('200 OK'), `the target's response came back: ${JSON.stringify(reply.slice(0, 40))}`);
+  const hardErrors = logs.filter((l) => /OPEN_ERR|NotSupported|local conn killed/i.test(l));
+  assert.deepEqual(hardErrors, [], 'no OPEN was refused');
+});

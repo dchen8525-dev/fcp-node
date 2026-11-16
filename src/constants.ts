@@ -294,6 +294,19 @@ export const FAST_RETX_MIN_AGE_MS = 30;
  *  wait that is still meaningful. */
 export const FAST_RETX_TIGHTEN_STEP = 0.85;
 export const FAST_RETX_TIGHTEN_FLOOR = 0.25;
+/** How long the worst legitimate RTT sample stays in force before a smaller
+ *  one may replace it. The reorder gate is derived from that sample, so without
+ *  decay a single 400 ms blip would keep every later retransmit waiting 400 ms.
+ *  10 s outlives a burst of reordering and still forgets a one-off queue spike. */
+export const RTT_PEAK_DECAY_MS = 10000;
+/** Ceiling on the RTT peak the reorder gate may learn. Beyond this the sample
+ *  is a hole-delayed segment (already filtered in onAck) or a queue so deep
+ *  that one hole is not the problem worth optimising for. */
+export const RTT_PEAK_MAX_MS = 1000;
+/** rttvar below this is measurement noise, not path jitter: on a clean link the
+ *  estimator settles at 1-3 ms, and letting that widen the reorder gate would
+ *  trade real recovery latency for a spread that does not exist. */
+export const RTTVAR_NOISE_FLOOR_MS = 5;
 /** Do not resend a segment that went out less than this long ago. Duplicate
  *  acks arrive every ~100 ms; without the guard the same three segments were
  *  re-emitted every round, pushing the retransmit ratio past 80% while the

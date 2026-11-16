@@ -251,9 +251,16 @@ try {
 
   origin = createServer((sock) => {
     let head = Buffer.alloc(0);
+    // The request can arrive in several chunks (and a pipelined upload brings
+    // its body along), so 'data' fires more than once. Without this guard the
+    // second chunk wrote a second response into a socket that was already
+    // ended: ERR_STREAM_WRITE_AFTER_END took the whole probe down.
+    let answered = false;
     sock.on('data', (b) => {
+      if (answered) return;
       head = Buffer.concat([head, b]);
       if (!head.includes('\r\n\r\n')) return;
+      answered = true;
       const path = head.toString('latin1').split('\r\n')[0].split(' ')[1] ?? '/';
       const size = path.startsWith('/big') ? BIG : MARKER.length;
       const body = path.startsWith('/big')

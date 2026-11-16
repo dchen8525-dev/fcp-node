@@ -347,6 +347,25 @@ export class FrameRx {
     return true;
   }
 
+  /**
+   * Book a reconstructed symbol into the set AND into the byte budget.
+   *
+   * tryDecode() used to write recovered rows straight into set.data, so the
+   * rows were held on the heap but never added to symbolBytes. Retirement
+   * subtracts setBytes() — which does include them — so every repaired group
+   * drove the counter down by the bytes it had never added. Measured with
+   * d=10, k=6 and 2 KB symbols: 200 groups held 6.4 MB while the counter read
+   * 4.0 MB, and after the 2 s settle it read -2.4 MB. A negative counter can
+   * never trip MAX_RX_SYMBOL_BYTES again, so the only heap ceiling on FrameRx
+   * is gone for the rest of the session, on exactly the lossy path where
+   * recovery runs constantly.
+   */
+  private storeRecovered(set: RxSet, idx: number, symbol: Buffer): void {
+    const old = set.data.get(idx);
+    this.symbolBytes += symbol.length - (old ? old.length : 0);
+    set.data.set(idx, symbol);
+  }
+
   private setBytes(set: RxSet): number {
     let n = 0;
     for (const b of set.data.values()) n += b.length;
@@ -388,7 +407,7 @@ export class FrameRx {
       if (ok) for (let b = declared; b < size; ++b) if (s[b] !== 0) { ok = false; break; }
       if (!ok) { ++this.counters.badRecon; continue; }
       set.recov.add(i);
-      set.data.set(i, s);
+      this.storeRecovered(set, i, s);
       const repairMs = Math.min(0xffff, Math.max(0, nowMs - set.tFirstMs));
       const late = set.accounted;
       if (late) ++this.counters.recoveredLate; else ++this.counters.recovered;

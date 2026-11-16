@@ -16,7 +16,7 @@ import {
   STREAM_TYPE_DATA, STREAM_TYPE_ACK, STREAM_TYPE_ACK_V2, STREAM_FLAG_FIN,
   ACK_EVERY_SEGMENTS, ACK_DELAY_MS, HOLE_DUP_ACK_MS, HOLE_DUP_ACK_MIN_MS,
   MIN_RETX_INTERVAL_MS, FAST_RETX_SEGMENTS,
-  FAST_RETX_MIN_AGE_MS, MIN_FLUSH_MS, ZERO_WINDOW_PROBE_MS,
+  FAST_RETX_MIN_AGE_MS, MIN_FLUSH_MS, ZERO_WINDOW_PROBE_MS, TLP_MIN_PTO_MS,
 } from '../src/constants.ts';
 
 function makeStream(over: Record<string, number> = {}) {
@@ -288,7 +288,12 @@ test('STREAM: the age gate narrows while every round keeps recovering real loss'
   const { s } = makeStream({ sendWindowBytes: 65536, ackV2: true, initialSrttMs: 100 });
   s.write(Buffer.alloc(94), 0);
   s.onSegment(encodeAckV2(94, 65535, []), 100);
-  assert.equal(s.retxAgeGateMs, 100, 'one clean sample leaves the gate at a full RTT');
+  // The gate is derived from the *spread* of the path, not from srtt alone: a
+  // single sample cannot measure spread, so it falls back to srtt + 2*rttvar.
+  // Asserting a bare srtt here was pinning the very bug that made a reordering
+  // path retransmit a third of its traffic — the mean is below the spread.
+  assert.ok(s.retxAgeGateMs >= 100,
+    `one clean sample leaves the gate at least one RTT: ${s.retxAgeGateMs}`);
   const st = { off: 94 };
   const gates = [s.retxAgeGateMs];
   for (let i = 0; i < 8; ++i) {
@@ -298,7 +303,22 @@ test('STREAM: the age gate narrows while every round keeps recovering real loss'
   for (let i = 1; i < gates.length; ++i) {
     assert.ok(gates[i]! < gates[i - 1]!, `round ${i} narrowed the gate: ${gates.join(' -> ')}`);
   }
-  assert.equal(gates[gates.length - 1], FAST_RETX_MIN_AGE_MS, 'and it stops at the age floor');
+  // Keep tightening until it stops. The floor is FAST_RETX_TIGHTEN_FLOOR times
+  // the base (which now includes the path's spread), so it is not the raw
+  // FAST_RETX_MIN_AGE_MS: the point is that it stops moving, well below the
+  // starting gate, instead of sitting at a full RTT for the whole session.
+  const settled = gates[gates.length - 1]!;
+  assert.ok(settled < 100, `the gate ends well below one RTT: ${settled}`);
+  // A few more rounds: it may still be tightening, but it must converge to a
+  // fixed value and never drop below the hard floor.
+  const seen = new Set<number>();
+  for (let i = 0; i < 24; ++i) {
+    driveRound(s, st, 20000 + i * 1000, 400);
+    seen.add(s.retxAgeGateMs);
+  }
+  assert.equal(s.retxAgeGateMs, Math.min(...seen), 'it converged, not drifted');
+  assert.ok(s.retxAgeGateMs >= FAST_RETX_MIN_AGE_MS, 'never below the hard age floor');
+  assert.ok(s.retxAgeGateMs <= settled, 'and never wider than where it started');
 });
 
 test('STREAM: a copy that could not have arrived yet undoes the narrowing', () => {
@@ -534,7 +554,13 @@ test('STREAM: an unconfirmed tail is probed before the RTO', () => {
   s.onSegment(encodeAck(94 * 3, 65535, 0, 0), 402);
   s.onTick(600);
   assert.equal(datas(), after, 'budget was reset by the covering ack');
-  s.onTick(601);
+  // The probe deadline is srtt + 2*rttvar measured from the new tail's send
+  // time, and rttvar moves with every usable RTT sample. Assert against the
+  // estimator's own value instead of a hard-coded 200 ms: a fixed number here
+  // pinned a detail of the RTT filter that has nothing to do with TLP.
+  const pto = Math.max(TLP_MIN_PTO_MS, Math.round(s.srttMs + 2 * (s as unknown as { rttvarMs: number }).rttvarMs));
+  assert.equal(datas(), after, 'still before the new tail probe deadline');
+  s.onTick(401 + pto);
   assert.equal(datas(), after + 1, 'the new tail is probed on its own deadline');
 });
 
@@ -544,22 +570,30 @@ test('STREAM: a fast-retx round that bought nothing raises the age threshold', (
   // fresh candidates whose age sits between the old base and the relaxed base
   // stay put until they are genuinely old.
   const { s, datas } = makeStream({ sendWindowBytes: 65536, initialSrttMs: 50, ackV2: true });
-  s.write(Buffer.alloc(94 * 2), 0); // A1, offset 0 (age base = srtt = 50); A2 tail
+  s.write(Buffer.alloc(94 * 2), 0); // A1, offset 0; A2 tail
   const sackA1 = [{ start: 94, end: 188 }];
-  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(0, 65535, sackA1), 100);
+  const base1 = s.retxAgeGateMs;
+  // The gate is derived from the path's spread (srtt + 2*rttvar), so drive the
+  // round at that value rather than at a hard-coded age: the property under
+  // test is "a silent round relaxes the base", not "the base is exactly srtt".
+  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(0, 65535, sackA1), base1 + 50);
   const afterRound = datas();
-  assert.equal(afterRound, 3, 'A1 fast-retransmitted at age 100 >= base 50');
-  s.onTick(250); // silent for 1.5*srtt: relax 1.0 -> 1.3 (base 50 -> 65)
-  s.onSegment(encodeAck(188, 65535, 0, 0), 260); // A1+A2 delivered; tx empties
-  s.write(Buffer.alloc(94 * 2), 300); // fresh A3, offset 188; A4 tail at 282
+  assert.equal(afterRound, 3, `A1 fast-retransmitted at age >= base ${base1}`);
+  s.onTick(base1 + 200); // silent for 1.5*srtt: the base relaxes
+  const base2 = s.retxAgeGateMs;
+  assert.ok(base2 > base1, `the silent round widened the base: ${base1} -> ${base2}`);
+  s.onSegment(encodeAck(188, 65535, 0, 0), base1 + 210); // A1+A2 delivered
+  s.write(Buffer.alloc(94 * 2), base1 + 250); // fresh A3 at 188; A4 tail at 282
   const beforeRound2 = datas();
   const sackA2 = [{ start: 282, end: 376 }];
-  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(188, 65535, sackA2), 340);
-  assert.equal(datas(), beforeRound2, 'age 40 is below the old base 50');
-  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(188, 65535, sackA2), 355);
-  assert.equal(datas(), beforeRound2, 'age 55 crosses the old base but sits below relaxed 65');
-  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(188, 65535, sackA2), 370);
-  assert.equal(datas(), beforeRound2 + 1, 'age 70 crosses the relaxed base: round fires');
+  // Read the gate at the moment of the decision: the ACK above feeds the RTT
+  // estimator, so the value differs from the one sampled a moment earlier.
+  const gateNow = s.retxAgeGateMs;
+  const belowGate = Math.max(1, gateNow - 20);
+  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(188, 65535, sackA2), base1 + 250 + belowGate);
+  assert.equal(datas(), beforeRound2, `age ${belowGate} is below the live gate ${gateNow}`);
+  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(188, 65535, sackA2), base1 + 250 + gateNow + 5);
+  assert.equal(datas(), beforeRound2 + 1, 'age past the live gate: the round fires');
 });
 
 test('FEC: slow-path samples accumulate until the noise floor is crossed', () => {
@@ -575,11 +609,18 @@ test('FEC: slow-path samples accumulate until the noise floor is crossed', () =>
   assert.equal(fresh.currentK(), 3, 'a single tiny report alone stays at the start');
 });
 
-test('STREAM: two SACK ranges beyond a hole prove loss and skip the age wait', () => {
-  // Two distinct received ranges starting beyond the hole cannot be produced
-  // by reordering: the hole segment is provably lost. The age gate (which
-  // exists to protect against reordering) is skipped — the retransmit fires
-  // immediately even at age ~0.
+test('STREAM: SACK ranges alone never skip the reorder age gate', () => {
+  // This used to assert the opposite: "two ranges start beyond the hole" was
+  // taken as proof of loss and skipped the age gate entirely. It is not proof.
+  // A reordering path produces exactly that shape — one delayed datagram leaves
+  // the receiver holding the runs on both sides of it, so the segment in front
+  // of the delayed one sees two ranges starting past its end while it is still
+  // in flight. Measured on a zero-loss link with 10-60 ms of reordering: 34-36%
+  // of all segments were retransmitted, nearly all of them needlessly.
+  //
+  // The gate is the only thing that separates "late" from "lost"; no SACK
+  // pattern can make that distinction for it. What SACK still does is prove
+  // the segment is *not* at the peer, which is the precondition for a round.
   const { s, datas } = makeStream({ sendWindowBytes: 65536, initialSrttMs: 400, ackV2: true });
   s.write(Buffer.alloc(94 * 8), 0);
   const before = datas();
@@ -588,12 +629,17 @@ test('STREAM: two SACK ranges beyond a hole prove loss and skip the age wait', (
     { start: 94 * 2, end: 94 * 3 },
     { start: 94 * 5, end: 94 * 6 },
   ];
-  // fastRetransmit still needs the dup-ack trigger; the strong-evidence
-  // bypass removes the AGE wait on top of that.
+  // Four duplicate acks at age ~5 ms: far below the gate, so nothing goes out.
   for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(0, 65535, ranges), 5 + i);
-  // segs 2..5 are sacked (in-range) and skipped; segs 0..1 have two ranges
-  // beyond their end -> the dup-ack trigger fires them with no age wait.
-  assert.equal(datas() - before, 2, 'strong evidence fires at the 3rd dup-ack despite age 5ms');
+  assert.equal(datas() - before, 0, 'strong SACK evidence does not override the reorder gate');
+  // Past the gate the round proceeds normally. Everything the SACK ranges do
+  // not cover and that sits before the highest reported byte is resent, capped
+  // at one burst: offsets 0, 94, 282, 376 here (188 and 470 are sacked).
+  const gate = s.retxAgeGateMs;
+  for (let i = 0; i < 4; ++i) s.onSegment(encodeAckV2(0, 65535, ranges), gate + 10 + i);
+  const resent = datas() - before;
+  assert.ok(resent >= 2 && resent <= FAST_RETX_SEGMENTS,
+    `once the age gate is satisfied, the proven holes are resent (${resent} segments)`);
 });
 
 test('STREAM: receiving data does not erase duplicate-ACK evidence', () => {
