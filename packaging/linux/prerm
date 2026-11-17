@@ -2,6 +2,9 @@
 set -e
 
 if [ "$1" = "remove" ] && command -v systemctl >/dev/null 2>&1; then
+  systemctl stop fcp-server.service >/dev/null 2>&1 || true
+  systemctl disable fcp-server.service >/dev/null 2>&1 || true
+  # In case a legacy unit is somehow still loaded on a host upgraded by hand.
   systemctl stop fcp-node.service >/dev/null 2>&1 || true
   systemctl disable fcp-node.service >/dev/null 2>&1 || true
 fi

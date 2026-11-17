@@ -3,7 +3,7 @@
 // The package embeds the official Node.js linux-x64 runtime, because Debian 13
 // ships Node 20 while this project needs >= 22.6. That makes the deb
 // self-contained: `apt install ./fcp-server_x.y.z_amd64.deb` then
-// `systemctl enable --now fcp-node`.
+// `systemctl enable --now fcp-server`.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
@@ -59,7 +59,7 @@ function sha256(path) {
 // ---------------------------------------------------------------- inputs
 
 rmSync(stage, { recursive: true, force: true });
-mkdirSync(join(stage, 'opt', 'fcp-node', 'node', 'bin'), { recursive: true });
+mkdirSync(join(stage, 'opt', 'fcp-server', 'node', 'bin'), { recursive: true });
 mkdirSync(join(stage, 'usr', 'share', 'doc', 'fcp-server'), { recursive: true });
 mkdirSync(outDir, { recursive: true });
 
@@ -100,7 +100,7 @@ const gnuTar = (spawnSync('tar', ['--version'], { encoding: 'utf8' }).stdout ?? 
   .includes('GNU tar');
 run('tar', [...(gnuTar ? ['--force-local'] : []), '-xzf', fwd(nodeTgz), '-C', fwd(nodeExtract),
   '--strip-components=1', `${nodeRoot}/bin/node`, `${nodeRoot}/LICENSE`]);
-const binNode = join(stage, 'opt', 'fcp-node', 'node', 'bin', 'node');
+const binNode = join(stage, 'opt', 'fcp-server', 'node', 'bin', 'node');
 renameSync(join(nodeExtract, 'bin', 'node'), binNode);
 renameSync(join(nodeExtract, 'LICENSE'),
   join(stage, 'usr', 'share', 'doc', 'fcp-server', 'node-LICENSE'));
@@ -108,7 +108,7 @@ rmSync(nodeExtract, { recursive: true, force: true });
 
 // Bundle the tunnel: one ESM file, node builtins external.
 const serverEntry = join(root, 'src', 'app', 'server.ts');
-const serverBundle = join(stage, 'opt', 'fcp-node', 'fcp-server.mjs');
+const serverBundle = join(stage, 'opt', 'fcp-server', 'fcp-server.mjs');
 const esbuildJs = join(root, 'desktop', 'node_modules', 'esbuild', 'bin', 'esbuild');
 const esbuildArgs = [serverEntry, '--bundle', '--platform=node', '--format=esm',
   '--target=node22', '--packages=external', `--outfile=${serverBundle}`];
@@ -130,7 +130,7 @@ const deb = buildDeb({
   section: 'net',
   priority: 'optional',
   depends: ['libc6', 'libstdc++6', 'libgcc-s1'],
-  conffiles: ['/etc/fcp-node/server.conf'],
+  conffiles: ['/etc/fcp-server/server.conf'],
   scripts: {
     preinst: join(here, 'preinst'),
     postinst: join(here, 'postinst'),
@@ -141,17 +141,17 @@ const deb = buildDeb({
     'FCP v7 UDP tunnel server',
     ' FCP v7 UDP tunnel server (AES-128-GCM, Reed-Solomon FEC, ARQ, BBR-lite).',
     ` Ships a bundled Node.js ${NODE_VERSION} runtime, an fcp-server launcher, a`,
-    ' systemd unit and /etc/fcp-node/server.conf. The installer generates a random',
+    ' systemd unit and /etc/fcp-server/server.conf. The installer generates a random',
     ' PSK on first install and prints it once; both ends must use the same key.',
   ].join('\n'),
   files: [
-    { path: 'opt/fcp-node/node/bin/node', src: binNode, mode: 0o755 },
-    { path: 'opt/fcp-node/fcp-server.mjs', src: serverBundle, mode: 0o644 },
+    { path: 'opt/fcp-server/node/bin/node', src: binNode, mode: 0o755 },
+    { path: 'opt/fcp-server/fcp-server.mjs', src: serverBundle, mode: 0o644 },
     { path: 'usr/bin/fcp-server', src: join(here, 'fcp-server'), mode: 0o755 },
-    { path: 'usr/lib/systemd/system/fcp-node.service', src: join(here, 'fcp-node.service'), mode: 0o644 },
-    // uid/gid 0 here; postinst chowns to root:fcp-node because the service
+    { path: 'usr/lib/systemd/system/fcp-server.service', src: join(here, 'fcp-server.service'), mode: 0o644 },
+    // uid/gid 0 here; postinst chowns to root:fcp-server because the service
     // account's numeric gid is only known at install time.
-    { path: 'etc/fcp-node/server.conf', src: join(here, 'server.conf'), mode: 0o640 },
+    { path: 'etc/fcp-server/server.conf', src: join(here, 'server.conf'), mode: 0o640 },
     { path: 'usr/share/doc/fcp-server/README.md', src: join(root, 'README.md'), mode: 0o644 },
     { path: 'usr/share/doc/fcp-server/node-LICENSE',
       src: join(stage, 'usr', 'share', 'doc', 'fcp-server', 'node-LICENSE'), mode: 0o644 },

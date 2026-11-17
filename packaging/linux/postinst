@@ -1,18 +1,51 @@
 #!/bin/sh
 set -e
 
-CONF=/etc/fcp-node/server.conf
+CONF=/etc/fcp-server/server.conf
+OLD_CONF=/etc/fcp-node/server.conf
 GENERATED=0
+MIGRATED=0
 
-if [ "$1" = "configure" ] && [ -f "$CONF" ]; then
+if [ "$1" = "configure" ]; then
+  # Upgrade from the old fcp-node layout: carry the whole config (PSK, bind,
+  # FEC, MTU, log level) over to the new conffile. dpkg keeps the old conffile
+  # on disk, so read it here before removing it below. The log path changed
+  # with the service rename, so rewrite just that line.
+  if [ -f "$OLD_CONF" ] && [ -f "$CONF" ]; then
+    cp "$OLD_CONF" "$CONF"
+    sed -i 's#/var/log/fcp-node#/var/log/fcp-server#g' "$CONF"
+    MIGRATED=1
+  fi
+
   # The tar entry ships as root:root (the service account's gid is only known
   # at install time); fix ownership on every configure, including upgrades.
-  chown root:fcp-node "$CONF"
+  chown root:fcp-server "$CONF"
   chmod 0640 "$CONF"
+
   if grep -q '^FCP_KEY=CHANGE_ME_32_HEX_CHARS$' "$CONF"; then
     KEY=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
     sed -i "s|^FCP_KEY=CHANGE_ME_32_HEX_CHARS$|FCP_KEY=${KEY}|" "$CONF"
     GENERATED=1
+  fi
+
+  # Stop and disable the legacy unit before daemon-reload: systemd still has
+  # it loaded in memory here even though dpkg removed its unit file on unpack.
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop fcp-node.service >/dev/null 2>&1 || true
+    systemctl disable fcp-node.service >/dev/null 2>&1 || true
+  fi
+
+  # Clean up every legacy artifact. All are outside dpkg's file list (the old
+  # conffile, runtime/log/lib dirs, the old service account), so dpkg will not
+  # remove them for us.
+  rm -f "$OLD_CONF"
+  rmdir /etc/fcp-node >/dev/null 2>&1 || true
+  rm -rf /var/log/fcp-node /var/lib/fcp-node
+  if getent passwd fcp-node >/dev/null 2>&1; then
+    userdel fcp-node >/dev/null 2>&1 || true
+  fi
+  if getent group fcp-node >/dev/null 2>&1; then
+    groupdel fcp-node >/dev/null 2>&1 || true
   fi
 fi
 
@@ -23,11 +56,23 @@ fi
 if [ "$1" = "configure" ]; then
   # $2 is the previously installed version; non-empty means this is an upgrade.
   if [ -n "${2:-}" ]; then
-    cat <<'EOF'
-fcp-server upgraded. The existing /etc/fcp-node/server.conf was kept.
-Restart the service to run the new binary: systemctl restart fcp-node
+    if [ "$MIGRATED" = "1" ]; then
+      cat <<'EOF'
+fcp-server upgraded. The existing config (including the PSK) was migrated from
+/etc/fcp-node/server.conf to /etc/fcp-server/server.conf, and the old
+fcp-node.service was stopped and disabled. Restart the new service:
+  systemctl restart fcp-server
 EOF
+    else
+      cat <<'EOF'
+fcp-server upgraded. The existing /etc/fcp-server/server.conf was kept.
+Restart the service to run the new binary: systemctl restart fcp-server
+EOF
+    fi
   else
+    if [ "$MIGRATED" = "1" ]; then
+      printf '\nfcp-server: migrated existing config from %s\n' "$OLD_CONF"
+    fi
     if [ "$GENERATED" = "1" ]; then
       printf '\nfcp-server: generated a new PSK for this host:\n\n  %s\n\n' "$KEY"
       printf 'Use the same key on the client. It is stored in %s\n' "$CONF"
@@ -36,12 +81,12 @@ EOF
     cat <<'EOF'
 fcp-server installed (not started automatically).
 
-  config : /etc/fcp-node/server.conf   (0640 root:fcp-node, contains the PSK)
+  config : /etc/fcp-server/server.conf   (0640 root:fcp-server, contains the PSK)
   binary : /usr/bin/fcp-server
-  logs   : /var/log/fcp-node/server.log  (journalctl -u fcp-node -f)
+  logs   : /var/log/fcp-server/server.log  (journalctl -u fcp-server -f)
 
-  start  : systemctl enable --now fcp-node
-  status : systemctl status fcp-node
+  start  : systemctl enable --now fcp-server
+  status : systemctl status fcp-server
 EOF
   fi
 fi

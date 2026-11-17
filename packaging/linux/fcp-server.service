@@ -1,19 +1,19 @@
 [Unit]
-Description=FCP Node UDP tunnel server
+Description=FCP Server UDP tunnel server
 Documentation=https://github.com/dchen8525-dev/fcp-node
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=fcp-node
-Group=fcp-node
-EnvironmentFile=/etc/fcp-node/server.conf
+User=fcp-server
+Group=fcp-server
+EnvironmentFile=/etc/fcp-server/server.conf
 ExecStart=/usr/bin/fcp-server
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-LogsDirectory=fcp-node
+LogsDirectory=fcp-server
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

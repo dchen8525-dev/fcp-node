@@ -1,15 +1,16 @@
 #!/bin/sh
 # Create the service account before dpkg unpacks the conffile owned by
-# root:fcp-node; dpkg refuses to resolve an unknown group at unpack time.
+# root:fcp-server; dpkg refuses to resolve an unknown group at unpack time.
+# Upgrades from the old fcp-node package are migrated in postinst.
 set -e
 
-if ! getent group fcp-node >/dev/null 2>&1; then
-  groupadd --system fcp-node
+if ! getent group fcp-server >/dev/null 2>&1; then
+  groupadd --system fcp-server
 fi
-if ! getent passwd fcp-node >/dev/null 2>&1; then
-  useradd --system --gid fcp-node --home-dir /var/lib/fcp-node \
+if ! getent passwd fcp-server >/dev/null 2>&1; then
+  useradd --system --gid fcp-server --home-dir /var/lib/fcp-server \
     --no-create-home --shell /usr/sbin/nologin \
-    --comment "FCP Node tunnel" fcp-node
+    --comment "FCP Server tunnel" fcp-server
 fi
 
 exit 0

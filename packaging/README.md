@@ -17,15 +17,18 @@ npm run pack:deb
 - `.deb` 由 `packaging/linux/deb.mjs` 直接生成（ar + control/data.tar.gz），不依赖
   dpkg-deb、nfpm 或任何外部打包工具；唯一外部命令是解 Node tarball 用的 `tar`。
 - 文件布局：
-  - `/opt/fcp-node/node/bin/node`、`/opt/fcp-node/fcp-server.mjs`（esbuild 单文件 bundle）
+  - `/opt/fcp-server/node/bin/node`、`/opt/fcp-server/fcp-server.mjs`（esbuild 单文件 bundle）
   - `/usr/bin/fcp-server`（读取环境变量的启动器）
-  - `/usr/lib/systemd/system/fcp-node.service`
-  - `/etc/fcp-node/server.conf`（conffile，`0640 root:fcp-node`）
-  - `/var/log/fcp-node/server.log`（systemd `LogsDirectory=`）
-- `preinst` 建 `fcp-node` 系统用户；`postinst` 在仍是占位符时生成随机 PSK 并打印一次；
+  - `/usr/lib/systemd/system/fcp-server.service`
+  - `/etc/fcp-server/server.conf`（conffile，`0640 root:fcp-server`）
+  - `/var/log/fcp-server/server.log`（systemd `LogsDirectory=`）
+- `preinst` 建 `fcp-server` 系统用户；`postinst` 在仍是占位符时生成随机 PSK 并打印一次；
   `prerm` 停止并禁用服务；`postrm` 仅在 `purge` 时删用户、配置目录与日志。
-- 服务默认**不自动启动**：先改 `/etc/fcp-node/server.conf`，再
-  `systemctl enable --now fcp-node`。
+- 从旧版（服务名为 `fcp-node`）升级时，`postinst` 自动把 `/etc/fcp-node/server.conf`
+  的配置与 PSK 迁到 `/etc/fcp-server/server.conf`，停并禁用旧 `fcp-node.service`，
+  清理旧账号与旧目录；密钥不变，两端无需同步。
+- 服务默认**不自动启动**：先改 `/etc/fcp-server/server.conf`，再
+  `systemctl enable --now fcp-server`。
 
 环境变量（全部有默认值，通常只改 `FCP_KEY`）：
 
@@ -35,7 +38,7 @@ npm run pack:deb
 | `FCP_BIND` | `0.0.0.0:4461` |
 | `FCP_MTU_MIN` | `1040`（探测起点；上限固定 1500，起点高于它时跟随起点） |
 | `FCP_FEC` | `10:6` |
-| `FCP_LOG_LEVEL` / `FCP_LOG_FILE` | `info` / `/var/log/fcp-node/server.log` |
+| `FCP_LOG_LEVEL` / `FCP_LOG_FILE` | `info` / `/var/log/fcp-server/server.log` |
 
 可覆盖的构建变量：`FCP_NODE_VERSION`（默认 `22.22.2`）。
 

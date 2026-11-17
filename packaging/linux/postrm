@@ -2,15 +2,15 @@
 set -e
 
 if [ "$1" = "purge" ]; then
-  if getent passwd fcp-node >/dev/null 2>&1; then
-    userdel fcp-node >/dev/null 2>&1 || true
+  if getent passwd fcp-server >/dev/null 2>&1; then
+    userdel fcp-server >/dev/null 2>&1 || true
   fi
-  if getent group fcp-node >/dev/null 2>&1; then
-    groupdel fcp-node >/dev/null 2>&1 || true
+  if getent group fcp-server >/dev/null 2>&1; then
+    groupdel fcp-server >/dev/null 2>&1 || true
   fi
-  rm -rf /var/log/fcp-node /var/lib/fcp-node
+  rm -rf /var/log/fcp-server /var/lib/fcp-server
   # dpkg has already removed the conffile; drop the directory only if empty.
-  rmdir /etc/fcp-node >/dev/null 2>&1 || true
+  rmdir /etc/fcp-server >/dev/null 2>&1 || true
 fi
 
 if command -v systemctl >/dev/null 2>&1; then

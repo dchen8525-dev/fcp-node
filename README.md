@@ -151,7 +151,7 @@ node scripts/self-interop.mjs --log-dir=logs/smoke
 
 | 资产 | 平台 | 说明 |
 |---|---|---|
-| `fcp-server_<ver>_amd64.deb` | Debian/Ubuntu amd64 | 服务端。内嵌 Node 22 运行时，带 systemd unit 和 `/etc/fcp-node/server.conf`；首次安装自动生成 PSK 并只打印一次 |
+| `fcp-server_<ver>_amd64.deb` | Debian/Ubuntu amd64 | 服务端。内嵌 Node 22 运行时，带 systemd unit（`fcp-server.service`）和 `/etc/fcp-server/server.conf`；首次安装自动生成 PSK 并只打印一次 |
 | `fcp-node-setup-<ver>.exe` | Windows x64 | 桌面 GUI 客户端 NSIS 安装包（per-user，无需管理员） |
 | `fcp-node-<ver>-portable.exe` | Windows x64 | 桌面 GUI 客户端免安装单文件版 |
 | `fcp-client-<ver>.exe` | Windows x64 | 纯命令行客户端（Node SEA 单文件，不需要装 Node） |
@@ -171,12 +171,13 @@ npm --prefix desktop run pack   # -> desktop/dist/fcp-node-<ver>-portable.exe �
 ```bash
 sudo apt install ./fcp-server_<ver>_amd64.deb
 # 安装脚本会打印随机生成的 PSK；把同一个 key 填到客户端
-sudo systemctl enable --now fcp-node
-systemctl status fcp-node
-tail -f /var/log/fcp-node/server.log
+sudo systemctl enable --now fcp-server
+systemctl status fcp-server
+tail -f /var/log/fcp-server/server.log
 ```
 
-配置在 `/etc/fcp-node/server.conf`（`0640 root:fcp-node`），升级时作为 conffile 保留。
+配置在 `/etc/fcp-server/server.conf`（`0640 root:fcp-server`），升级时作为 conffile 保留。
+从旧版（`fcp-node.service`）升级时会自动迁移配置与 PSK、停掉旧服务并清理旧目录，密钥不变。
 卸载用 `apt remove fcp-server`；`apt purge` 会连同服务账号、配置和日志一起删除。
 
 客户端 exe 与桌面端参数一致：
@@ -191,9 +192,9 @@ fcp-client-<ver>.exe --key=<HEX32> --peer=<SERVER_IP>:4461 -b 127.0.0.1:1080
 |---|---|
 | VPS | `144.34.186.164`，Debian GNU/Linux 13 (trixie) x86_64（2026-11-11 系统重建后重新部署） |
 | Node 运行时 | `/opt/node-v22.22.2-linux-x64/bin/node`（软链 `/usr/local/bin/node`），无需额外 flag 直接跑 `.ts` |
-| 部署目录 | `/opt/fcp-node`（23 个 `.ts` + `package.json`，由本机 `src/` 同步） |
-| 服务端 | systemd `fcp-node.service`，UDP `0.0.0.0:4461`，开机自启，`Restart=always` |
-| 服务日志 | `/var/log/fcp-node/server.log`（`--log-level=debug`），另见 `journalctl -u fcp-node -f` |
+| 部署目录 | `/opt/fcp-server`（23 个 `.ts` + `package.json`，由本机 `src/` 同步） |
+| 服务端 | systemd `fcp-server.service`，UDP `0.0.0.0:4461`，开机自启，`Restart=always` |
+| 服务日志 | `/var/log/fcp-server/server.log`（`--log-level=debug`），另见 `journalctl -u fcp-server -f` |
 | PSK | 两端**内联同一个** `--key=00112233445566778899aabbccddeeff`（示例占位密钥，部署时替换为你的真实 PSK）；VPS unit 现为 `chmod 600`（明文含密钥），旧 `/etc/fcp-node.env` 已删除 |
 | 本机客户端 | `127.0.0.1:1080`，日志 `logs/client.log`，一键启动 `scripts/start-client.cmd` |
 | 两端参数 | `--key=11c1…c9a --mtu=1040 --fec=10:3 --log-level=debug` |
@@ -202,10 +203,10 @@ fcp-client-<ver>.exe --key=<HEX32> --peer=<SERVER_IP>:4461 -b 127.0.0.1:1080
 服务端 `ExecStart`（唯一权威版本，改参数只改这里与本机 `start-client.cmd`）：
 
 ```
-/usr/local/bin/node /opt/fcp-node/src/app/server.ts \
+/usr/local/bin/node /opt/fcp-server/src/app/server.ts \
   --key=00112233445566778899aabbccddeeff \
   -b 0.0.0.0:4461 --mtu=1040 --fec=10:3 \
-  --log-level=debug --log-file=/var/log/fcp-node/server.log
+  --log-level=debug --log-file=/var/log/fcp-server/server.log
 ```
 
 `--mtu-min` 是**探测起点**：会话建立后两端各自以 100 B 为步长向上探，收到 ACK 就把发送预算抬上去，
@@ -225,17 +226,17 @@ fcp-client-<ver>.exe --key=<HEX32> --peer=<SERVER_IP>:4461 -b 127.0.0.1:1080
 
 ```bash
 # VPS
-systemctl status fcp-node.service
-systemctl restart fcp-node.service
-tail -f /var/log/fcp-node/server.log
-journalctl -u fcp-node -f
+systemctl status fcp-server.service
+systemctl restart fcp-server.service
+tail -f /var/log/fcp-server/server.log
+journalctl -u fcp-server -f
 
 # 本机：重启客户端（若 1080 断开）
 D:\work\fcp-node\scripts\start-client.cmd
 # 停止：taskkill /PID <node进程PID> /F
 ```
 
-改参数时必须**两端同时改**（`/etc/systemd/system/fcp-node.service` 的 `ExecStart` 与
+改参数时必须**两端同时改**（`/etc/systemd/system/fcp-server.service` 的 `ExecStart` 与
 `scripts/start-client.cmd`），然后重启服务端和客户端，否则 FEC 几何或 MTU 不匹配。
 
 ### 公网实测（2026-11-11 历史基线，修复前）
@@ -262,7 +263,7 @@ D:\work\fcp-node\scripts\start-client.cmd
 
 | 检查 | 结果 |
 |---|---|
-| 线上服务 | `fcp-node.service` active（2026-11-12 06:41 UTC 重启）、UDP 4461 监听；`cli.ts` / `tunnel.ts` / `session.ts` / `controller.ts` / `stream.ts` / `constants.ts` 六个核心文件本地与 VPS sha256 **全一致** |
+| 线上服务 | `fcp-server.service` active、UDP 4461 监听；`cli.ts` / `tunnel.ts` / `session.ts` / `controller.ts` / `stream.ts` / `constants.ts` 六个核心文件本地与 VPS sha256 **全一致** |
 | 公网下载冒烟（`claude.exe`，SOCKS5 → VPS） | **1.99 MB/s**、**1.90 MB/s**（两杆，各 37–39 MiB） |
 | 客户端观测 | loss `0.0%`、k `3→2→1`、重传率约 `2.2%`（修复前 58%） |
 | 跨实现同窗口 A/B（本机环回，Node client → C++ server） | 修复组 **4.44–5.25 MB/s**（均值 4.65 MB/s）；把 `session.cc` 反编译回「单方面滚键」的对照组 **10.47 KiB/s**（四杆标准差 0.8 B/s）——**455×**，详见 `docs/移植对照与差异.md` §3.7.2 |
