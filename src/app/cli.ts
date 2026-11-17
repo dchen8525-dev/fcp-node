@@ -422,8 +422,19 @@ async function main(): Promise<void> {
   } else if (mode === 'speedtest') {
     // --speedtest used to be advertised as a client flag, but the client branch
     // matched first so the flag was unreachable: the subcommand is the only way.
-    const raw = opts.get('seconds') ?? opts.get('speedtest-seconds') ?? '8';
-    const seconds = Math.min(30, Math.max(3, Number(raw) || 8));
+    // Unlike the other numeric options, --seconds used to clamp/silently
+    // default (Number(raw)||8): "abc", 2 and 100 all ran with exit 0, breaking
+    // the same fail-loudly contract intOpt enforces elsewhere. Validate both
+    // spellings with the same strict integer-range rule.
+    const raw = opts.get('seconds') ?? opts.get('speedtest-seconds');
+    let seconds = 8;
+    if (raw !== undefined) {
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 3 || n > 30) {
+        throw new Error(`--seconds expects an integer in 3..30, got "${raw}"`);
+      }
+      seconds = n;
+    }
     await speedtest(common, seconds);
     return;
   } else if (mode === 'replay') {

@@ -877,7 +877,7 @@ export class Session {
 function emptyCounters() {
   return {
     structFail: 0, stale: 0, lateDup: 0, recovered: 0, recoveredLate: 0,
-    dataRxOrig: 0, parityRx: 0, dataDelivered: 0, retiredDropped: 0,
+    dataRxOrig: 0, parityRx: 0, dataDelivered: 0, dataLateRx: 0, retiredDropped: 0,
     aheadDropped: 0, setsPartial: 0, setsFull: 0, setsTailDropped: 0,
     decodeAttempts: 0, badRecon: 0, symbolBudgetDrops: 0,
     setsExpected: 0, dataExpected: 0, parityExpected: 0, setsKUnknown: 0,

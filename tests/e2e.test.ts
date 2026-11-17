@@ -496,3 +496,54 @@ test('e2e: a pipelined request + body in one write reaches the target intact', a
   const hardErrors = logs.filter((l) => /OPEN_ERR|NotSupported|local conn killed/i.test(l));
   assert.deepEqual(hardErrors, [], 'no OPEN was refused');
 });
+
+test('e2e: a SOCKS5 request coalesced with its first payload emits OPEN exactly once', async (t) => {
+  // REGRESSION: sendOpen queued the OPEN at the front, then rebuilt
+  // pendingLocal as [open, firstPayload, ...rest] while `rest` already contained
+  // the OPEN. That emitted a second FCPO OPEN into the tunnel stream; the
+  // server's PrefixParser consumed the first but forwarded the second raw OPEN
+  // to the origin, corrupting the application byte stream. Splitting the
+  // greeting/request/body across writes (as the older test did) left
+  // firstPayload empty and hid this completely.
+  const received: Buffer[] = [];
+  const origin = createServer((sock) => {
+    sock.on('data', (b: Buffer) => received.push(Buffer.from(b)));
+    sock.on('end', () => sock.end());
+  });
+  await listen(origin, 0);
+  const targetPort = portOf(origin);
+  const udpPort = freePort(), proxyPort = freePort();
+  const logs: string[] = [];
+  const log = (line: string) => logs.push(line);
+  const server = new TunnelServer({ psk: PSK, port: udpPort, log });
+  const client = new TunnelClient({ psk: PSK, host: '127.0.0.1', port: udpPort, listenPort: proxyPort, log });
+  await server.start();
+  await client.start();
+  t.after(() => { client.stop(); server.stop(); origin.close(); });
+
+  const PAYLOAD = Buffer.from('HELLO_WORLD_PIPELINED', 'latin1');
+  await withTimeout(new Promise<void>((resolve, reject) => {
+    const sock = connect(proxyPort, '127.0.0.1');
+    // greeting + SOCKS5 request + first application bytes in ONE write.
+    const all = Buffer.concat([
+      Buffer.from([5, 1, 0]),
+      Buffer.from([5, 1, 0, 1, 127, 0, 0, 1]),
+      Buffer.from([(targetPort >>> 8) & 0xff, targetPort & 0xff]),
+      PAYLOAD,
+    ]);
+    sock.setTimeout(8000, () => { sock.destroy(); reject(new Error('coalesced OPEN test timeout')); });
+    sock.on('connect', () => sock.write(all));
+    sock.on('error', () => {});
+    sock.on('data', () => {});
+    sock.on('close', () => resolve());
+    // Give the tunnel time to establish and flush, then close from our side.
+    setTimeout(() => sock.destroy(), 1500);
+  }), 10000, 'coalesced OPEN');
+
+  const originBytes = Buffer.concat(received);
+  const openFrames = (originBytes.toString('latin1').match(/FCPO/g) ?? []).length;
+  assert.equal(openFrames, 0,
+    `the origin must never receive a tunnel OPEN frame; got ${openFrames}, bytes=${JSON.stringify(originBytes.toString('latin1'))}`);
+  assert.ok(originBytes.includes(PAYLOAD),
+    `the first payload must reach the origin intact: ${JSON.stringify(originBytes.toString('latin1'))}`);
+});

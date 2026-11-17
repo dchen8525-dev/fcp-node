@@ -56,6 +56,13 @@ export interface StreamCallbacks {
 interface SndSeg {
   offset: number; bytes: Buffer; fin: boolean; end: number;
   sentMs: number; acked: boolean; sacked: boolean; retransmits: number;
+  /** A TLP probe re-sent this segment without counting as a loss
+   *  (retransmits stays 0, so fast-retransmit's ratio is unaffected). Multiple
+   *  copies are then in flight, so an ACK can no longer be attributed to one
+   *  of them — the same ambiguity Karn's guard handles for real retransmits.
+   *  The RTT sampler must skip probed segments rather than sample against the
+   *  probe's rewritten sentMs. */
+  probed: boolean;
   /** Send time of the FIRST copy, never rewritten by a retransmission. This is
    *  the only honest denominator for "how long did this loss cost us": sentMs
    *  moves forward with every copy, so measuring against it reported the
@@ -213,6 +220,7 @@ export class Stream {
           acked: false,
           sacked: s.sacked,
           retransmits: s.sacked ? s.retransmits : Math.max(1, s.retransmits),
+          probed: s.probed,
           firstSentMs: s.firstSentMs,
         };
         recut.push(part);
@@ -350,7 +358,7 @@ export class Stream {
       const end = (this.sndNext + chunk.length + (fin ? 1 : 0)) >>> 0;
       const seg: SndSeg = {
         offset: this.sndNext, bytes: chunk, fin, end,
-        sentMs: nowMs, acked: false, sacked: false, retransmits: 0,
+        sentMs: nowMs, acked: false, sacked: false, retransmits: 0, probed: false,
         firstSentMs: nowMs,
       };
       if (fin) this.finOffset = (this.sndNext + chunk.length) >>> 0;
@@ -627,7 +635,10 @@ export class Stream {
           // instead of the path RTT (220 ms), which shrank RTO to rtoMin, which
           // triggered yet more retransmits — the link ended up spending ~73% of
           // its bandwidth resending data the peer already had.
-          if (sampleMs < 0 && s.retransmits === 0) sampleMs = Math.max(0, nowMs - s.sentMs);
+          // A probed segment has two copies in flight even though
+          // retransmits stayed 0: the ACK could be for either, so its timing
+          // is not a valid RTT sample (Karn). Skip it just like a retransmit.
+          if (sampleMs < 0 && s.retransmits === 0 && !s.probed) sampleMs = Math.max(0, nowMs - s.sentMs);
           // Recovery latency, the opposite question: for a segment that DID
           // need retransmission, how long after its first copy did recovery
           // finally happen. Counted separately from the RTT sample so the two
@@ -886,7 +897,13 @@ export class Stream {
     };
     if (this.ackPending) take(this.lastAckMs + ACK_DELAY_MS - nowMs);
     else if (this.oobBytes > 0) take(this.lastAckMs + this.holeDupAckMs() - nowMs);
-    if (this.pendingBytes > 0 && this.window() === 0) {
+    // Mirror probeZeroWindow's tx cap: once it refuses to probe (tx > 64), an
+    // expired lastZeroWinProbeMs deadline would be clamped by take() to 1 ms
+    // forever while onTick makes no progress — a peer advertising rwnd=0 could
+    // pin the host in a 1 ms busy loop. Above the cap the outstanding segments'
+    // RTO deadlines drive recovery instead.
+    if ((this.pendingBytes > 0 || (this.finPending && !this.finSent)) &&
+        this.window() === 0 && this.tx.length <= 64) {
       take(this.lastZeroWinProbeMs + ZERO_WINDOW_PROBE_MS - nowMs);
     }
     if (this.tx.length > 0 && this.tlpProbes < TLP_MAX_PROBES && this.window() > 0 &&
@@ -939,8 +956,17 @@ export class Stream {
         // that the ARQ stats are judged by. It still has to be a real copy on
         // the wire (that is the whole point: it makes the peer answer), and it
         // still restarts the probe clock.
+        //
+        // The probe still moves sentMs (it is a real copy on the wire, and the
+        // RTO pass must time from the latest copy). But with two copies in
+        // flight an ACK cannot be attributed to one of them, so flag `probed`
+        // and let the RTT sampler skip it — exactly the Karn ambiguity that
+        // `retransmits > 0` handles for real retransmits. Without the flag, a
+        // late ACK for the original measured against this probe's sentMs gave
+        // a few-ms fake RTT (srtt 100 -> 89).
         this.emitData(tail, nowMs);
         tail.sentMs = nowMs;
+        tail.probed = true;
         ++this.tlpProbes;
       }
     }
@@ -988,18 +1014,25 @@ export class Stream {
    * outstanding.
    */
   private probeZeroWindow(nowMs: number): void {
-    if (this.pendingBytes === 0) return;
+    const hasData = this.pendingBytes > 0;
+    // A pending FIN can itself be the one-byte persist probe (as in TCP): once
+    // all data is acknowledged, refusing to probe left the FIN stranded in
+    // SendingFin until the idle timeout, with both sides silent.
+    if (!hasData && !this.finPending) return;
     if (nowMs - this.lastZeroWinProbeMs < ZERO_WINDOW_PROBE_MS) return;
     if (this.tx.length > 64) return;
     this.lastZeroWinProbeMs = nowMs;
-    const chunk = this.takePending(1);
-    if (chunk.length === 0) return;
-    const end = (this.sndNext + chunk.length) >>> 0;
+    const chunk = hasData ? this.takePending(1) : Buffer.alloc(0);
+    const fin = !hasData && this.finPending;
+    if (chunk.length === 0 && !fin) return;
+    if (fin) { this.finSent = true; this.finPending = false; }
+    const end = (this.sndNext + chunk.length + (fin ? 1 : 0)) >>> 0;
     const seg: SndSeg = {
-      offset: this.sndNext, bytes: chunk, fin: false, end,
-      sentMs: nowMs, acked: false, sacked: false, retransmits: 0,
+      offset: this.sndNext, bytes: chunk, fin, end,
+      sentMs: nowMs, acked: false, sacked: false, retransmits: 0, probed: false,
       firstSentMs: nowMs,
     };
+    if (fin) this.finOffset = (this.sndNext + chunk.length) >>> 0;
     this.tx.push(seg);
     this.sndNext = end;
     if (seqAfter(end, this.sndMax)) this.sndMax = end;

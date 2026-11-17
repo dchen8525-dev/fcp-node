@@ -25,7 +25,7 @@ import {
   httpParseConnect, httpParseForward, openWriteRequest, openWriteOk, openWriteErr,
   openParseRequest, openParseReply, detectEntry, targetText,
 } from '../src/proxy/codec.ts';
-import { OPEN_OK_LEN, OPEN_ERR_LEN, ATYP_DOMAIN, ATYP_IPV4, OpenError } from '../src/constants.ts';
+import { OPEN_OK_LEN, OPEN_ERR_LEN, ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, OpenError } from '../src/constants.ts';
 import { bytesEqual, getLe16 } from '../src/wire.ts';
 
 const PSK = Buffer.from('00112233445566778899aabbccddeeff', 'hex');
@@ -650,4 +650,148 @@ test('M1: a zero-length mux symbol cannot fabricate a stream id', () => {
   const before = p.server.structFail;
   (p.server as unknown as { deliverStreamFrame: (b: Buffer) => void }).deliverStreamFrame(Buffer.alloc(0));
   assert.equal(p.server.structFail, before + 1, 'empty payload rejected as structFail');
+});
+
+test('FrameRx: evicting an accounted set retires its id (no late re-settle)', () => {
+  // REGRESSION: capacity eviction of an already-accounted set used to drop it
+  // from `sets` without adding the id to `retired`. A late symbol for that id
+  // then re-created the set and settled it a SECOND time (double-counted
+  // FECSTAT + duplicate delivery). C++ frame_rx.cc:415 explicitly inserts the
+  // evicted accounted id into retired_ here.
+  const delivered: Buffer[] = [];
+  const rx = new FrameRx({ d: 10, p: 3, deliver: (b) => delivered.push(b), oob: () => {} });
+  const dataFrame = (setId: number): Buffer => packTxFrame({
+    setId, index: 0, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
+  });
+  // Fill the set map to capacity with data symbols.
+  for (let id = 0; id < 256; ++id) rx.onDatagram(dataFrame(id), 0);
+  rx.onTick(1000); // every set becomes accounted (1 s gate), none yet retired (2 s)
+  const before = rx.counters.setsExpected;
+  assert.equal(before, 256);
+
+  // A new set id forces eviction of the first (accounted) set, id 0.
+  rx.onDatagram(dataFrame(256), 1000);
+  assert.equal(rx.view(0), undefined, 'set 0 was evicted');
+
+  // A late symbol for the evicted, accounted set must be rejected by the
+  // retired-id guard — it must NOT re-create the set.
+  rx.onDatagram(dataFrame(0), 1001);
+  assert.equal(rx.view(0), undefined, 'retired id must not be re-created by a late symbol');
+  assert.equal(rx.counters.retiredDropped, 1, 'late symbol counted as retiredDropped');
+  rx.onTick(2200);
+  assert.equal(rx.counters.setsExpected, before + 1,
+    'only set 256 settles; the evicted set 0 must not be counted twice');
+});
+
+test('FrameRx: a reconstructed symbol obeys the session byte budget', () => {
+  // REGRESSION: storeRecovered added bytes to symbolBytes without the
+  // MAX_RX_SYMBOL_BYTES ceiling that arriving symbols (and C++ store_symbol)
+  // enforce. Under sustained loss, recovery could push the counter past the
+  // only heap guard and leave it negative after settle.
+  const rx = new FrameRx({ d: 10, p: 3, deliver: () => {}, oob: () => {} });
+  const r = rx as unknown as {
+    symbolBytes: number;
+    storeRecovered: (set: { data: Map<number, Buffer> }, idx: number, symbol: Buffer) => void;
+  };
+  const CEILING = 8 * 1024 * 1024;
+  r.symbolBytes = CEILING - 10;
+  const fakeSet = { data: new Map<number, Buffer>() };
+  const big = Buffer.alloc(100, 0x7b);
+
+  r.storeRecovered(fakeSet, 0, big); // would exceed by 90 bytes
+  assert.equal(r.symbolBytes, CEILING - 10, 'budget refusal must not grow symbolBytes');
+  assert.equal(fakeSet.data.size, 0, 'budget refusal must not cache the row');
+  assert.equal(rx.counters.symbolBudgetDrops, 1, 'refusal is counted');
+
+  // A row that fits is still stored and counted.
+  const small = Buffer.alloc(8, 0x5a);
+  r.storeRecovered(fakeSet, 1, small);
+  assert.equal(r.symbolBytes, CEILING - 2);
+  assert.equal(fakeSet.data.get(1)?.length, 8);
+});
+
+test('HTTP CONNECT and forward accept a bracketed IPv6 literal target', () => {
+  // REGRESSION: parseAuthority stripped the brackets but httpParseConnect /
+  // httpParseForward always encoded the result as ATYP_DOMAIN. The peer's
+  // openParseRequest rejects ':' in a domain (hostCharOk), so every CONNECT
+  // [IPv6] and absolute-form GET http://[IPv6]/ failed with bad_address.
+  const con = httpParseConnect(Buffer.from(
+    'CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:443\r\n\r\n', 'latin1'));
+  assert.equal(con.status, 'ok');
+  const open = openWriteRequest(con.value!);
+  assert.ok(open);
+  assert.equal(openParseRequest(open!).status, 'ok', 'a CONNECT [IPv6] must produce a FCP OPEN the peer accepts');
+  assert.equal(con.value!.atyp, ATYP_IPV6, 'IPv6 literal encoded as ATYP_IPV6, not ATYP_DOMAIN');
+
+  const fwd = httpParseForward(Buffer.from(
+    'GET http://[2001:db8::1]:8080/x HTTP/1.1\r\nHost: [2001:db8::1]:8080\r\n\r\n', 'latin1'));
+  assert.equal(fwd.status, 'ok');
+  assert.equal(fwd.value!.target.atyp, ATYP_IPV6);
+  assert.equal(openParseRequest(openWriteRequest(fwd.value!.target)!).status, 'ok');
+
+  // Byte-level correctness of the expansion (compressed, mapped, mixed, full).
+  const bytesFor = (lit: string): string => {
+    const r = httpParseConnect(Buffer.from(
+      `CONNECT [${lit}]:443 HTTP/1.1\r\nHost: x\r\n\r\n`, 'latin1'));
+    assert.equal(r.status, 'ok', `${lit} must parse`);
+    return Buffer.from(r.value!.addr).toString('hex');
+  };
+  assert.equal(bytesFor('::1'), '00000000000000000000000000000001');
+  assert.equal(bytesFor('2001:db8::1'), '20010db8000000000000000000000001');
+  assert.equal(bytesFor('::ffff:192.0.2.1'), '00000000000000000000ffffc0000201');
+  assert.equal(bytesFor('::192.0.2.1'), '000000000000000000000000c0000201');
+  for (const bad of ['2001::1::2', 'gggg::1', 'fe80::1%eth0']) {
+    const r = httpParseConnect(Buffer.from(
+      `CONNECT [${bad}]:443 HTTP/1.1\r\nHost: x\r\n\r\n`, 'latin1'));
+    assert.equal(r.status, 'bad_request', `${bad} must be rejected`);
+  }
+});
+
+test('FrameRx: set-id gap placeholders count as setsKUnknown, not tailDropped', () => {
+  // C++ settle.cc:127-129 counts a fully-lost set (seen only as an id jump,
+  // no symbol ever arrived) as sets_k_unknown. The TS accountSet used to bump
+  // setsTailDropped instead, and setsKUnknown was never incremented at all —
+  // FECSTAT reported the wrong field and mis-set FLG_TAIL_DROPPED.
+  const rx = new FrameRx({ d: 10, p: 3, deliver: () => {}, oob: () => {} });
+  const dataFrame = (setId: number): Buffer => packTxFrame({
+    setId, index: 0, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
+  });
+  rx.onDatagram(dataFrame(0), 0);
+  rx.onDatagram(dataFrame(5), 0); // jump 0 -> 5 creates placeholders 1..4
+  rx.onTick(1000);
+  assert.equal(rx.counters.setsKUnknown, 4, 'four gap placeholders counted as kUnknown');
+  assert.equal(rx.counters.setsTailDropped, 0, 'gap placeholders are not tail drops');
+});
+
+test('FrameRx: a late in-bound original counts as dataLateRx, not lateDup', () => {
+  // FECSTAT dataLateRx must be a distinct signal from lateDup. It used to be
+  // wired to lateDup in snapshotCounters, so real late originals never showed
+  // up and the peer's data_lost() under-counted loss.
+  const rx = new FrameRx({ d: 5, p: 3, deliver: () => {}, oob: () => {} });
+  const dataFrame = (idx: number): Buffer => packTxFrame({
+    setId: 7, index: idx, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
+  });
+  rx.onDatagram(dataFrame(0), 0);
+  rx.onDatagram(dataFrame(2), 0); // maxDataIndex=2 -> nUsed/boundary=3, hole at 1
+  rx.onTick(1000);                // set 7 accounted
+  rx.onDatagram(dataFrame(1), 1001); // late original inside the boundary
+  assert.equal(rx.counters.dataLateRx, 1, 'late in-bound original counted');
+  assert.equal(rx.counters.lateDup, 0, 'not a duplicate');
+});
+
+test('FrameRx: a symbol with a conflicting k is rejected as structFail', () => {
+  // C++ note_k() (frame_rx.cc:435) is first-wins but returns false when a later
+  // symbol in the same set declares a different clamped k; the caller drops it
+  // with struct_fail. TS silently kept the first k, so a peer with a wrong k
+  // field could drive RS decode with mismatched geometry.
+  const rx = new FrameRx({ d: 5, p: 3, deliver: () => {}, oob: () => {} });
+  const frame = (k: number, idx: number): Buffer => packTxFrame({
+    setId: 9, index: idx, typeK: (k << 5) | 0, symbol: Buffer.from([3, 0, 0xab]),
+  });
+  rx.onDatagram(frame(1, 0), 0); // set 9 k=1 first-wins
+  assert.equal(rx.counters.structFail, 0);
+  const before = rx.view(9)!.orig.size;
+  rx.onDatagram(frame(2, 1), 0); // conflicting k=2 -> rejected
+  assert.equal(rx.counters.structFail, 1, 'conflicting k counted as structFail');
+  assert.equal(rx.view(9)!.orig.size, before, 'conflicting symbol not absorbed into the set');
 });

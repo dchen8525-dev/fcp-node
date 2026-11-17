@@ -142,7 +142,48 @@ function splitRequestLine(b: Buffer, lineLen: number): string[] {
 }
 function httpVersionOk(v: string): boolean { return /^HTTP\/1\.[01]$/.test(v); }
 
-function parseAuthority(text: string, defaultPort: number): { host: string; port: number } | null {
+/**
+ * Parse a bracketed IPv6 literal (e.g. "::1", "2001:db8::1",
+ * "::ffff:192.0.2.1") into its 16 network-order bytes. Returns null for any
+ * invalid form. `net.isIP` can classify but not convert, so the OPEN codec
+ * needs an explicit expansion to build an ATYP_IPV6 target.
+ */
+function parseIpv6Literal(text: string): Buffer | null {
+  if (!text || text.length > 45) return null;
+  let body = text;
+  // Normalise a trailing dotted-IPv4 into two hextets, then parse uniformly.
+  // "::ffff:192.0.2.1" -> "::ffff:c000:201"; "::192.0.2.1" -> "::c000:201".
+  const lastColon = text.lastIndexOf(':');
+  if (lastColon >= 0 && text.slice(lastColon + 1).includes('.')) {
+    const v4 = text.slice(lastColon + 1).split('.');
+    if (v4.length !== 4) return null;
+    const parts = v4.map((x) => (/^\d{1,3}$/.test(x) ? Number(x) : -1));
+    if (parts.some((n) => n < 0 || n > 255)) return null;
+    const hi = ((parts[0] << 8) | parts[1]).toString(16);
+    const lo = ((parts[2] << 8) | parts[3]).toString(16);
+    body = text.slice(0, lastColon + 1) + hi + ':' + lo;
+  }
+  const dbl = body.indexOf('::');
+  if (dbl >= 0 && body.indexOf('::', dbl + 2) >= 0) return null; // two "::"
+  const head = dbl >= 0 ? body.slice(0, dbl) : body;
+  const rear = dbl >= 0 ? body.slice(dbl + 2) : '';
+  const parsePart = (s: string): number => (/^[0-9a-fA-F]{1,4}$/.test(s) ? parseInt(s, 16) : -1);
+  const headParts = head ? head.split(':').map(parsePart) : [];
+  const rearParts = rear ? rear.split(':').map(parsePart) : [];
+  if (headParts.some((n) => n < 0) || rearParts.some((n) => n < 0)) return null;
+  // "::" must compress at least one group; without it we need exactly 8.
+  const zeros = dbl >= 0 ? 8 - headParts.length - rearParts.length : 0;
+  if (dbl >= 0 ? zeros < 1 : headParts.length + rearParts.length !== 8) return null;
+  const words = dbl >= 0
+    ? [...headParts, ...new Array(zeros).fill(0), ...rearParts]
+    : headParts;
+  if (words.length !== 8) return null;
+  const out = Buffer.allocUnsafe(16);
+  for (let i = 0; i < 8; ++i) out.writeUInt16BE(words[i]!, i * 2);
+  return out;
+}
+
+function parseAuthority(text: string, defaultPort: number): { host: string; port: number; ipv6?: Buffer } | null {
   if (!text) return null;
   for (let i = 0; i < text.length; ++i) {
     const c = text.charCodeAt(i);
@@ -160,6 +201,9 @@ function parseAuthority(text: string, defaultPort: number): { host: string; port
       port = p;
     }
     for (const ch of host) if (!ipv6CharOk(ch.charCodeAt(0))) return null;
+    const ipv6 = parseIpv6Literal(host);
+    if (!ipv6) return null;
+    return { host, port, ipv6 };
   } else {
     const colons = [...text].filter((c) => c === ':').length;
     if (colons > 1) return null;
@@ -195,6 +239,10 @@ export function httpParseConnect(buf: Buffer): ParseResult<ProxyTarget> {
   }
   const auth = parseAuthority(tok[1], 0);
   if (!auth || !auth.port) return { status: 'bad_request', consumed: 0 };
+  if (auth.ipv6) {
+    return { status: 'ok', consumed: headLen,
+      value: { atyp: ATYP_IPV6, addr: auth.ipv6, port: auth.port } };
+  }
   const addr = Buffer.from(auth.host, 'latin1');
   if (addr.length === 0 || addr.length > SOCKS5_MAX_DOMAIN_LEN) return { status: 'bad_request', consumed: 0 };
   return {
@@ -323,12 +371,12 @@ export function httpParseForward(buf: Buffer): ParseResult<HttpForwardValue> {
     out.push(l.text);
   }
   out.push(`Host: ${authority}`, 'Connection: close', '', '');
+  const target: ProxyTarget = auth.ipv6
+    ? { atyp: ATYP_IPV6, addr: auth.ipv6, port: auth.port }
+    : { atyp: ATYP_DOMAIN, addr, port: auth.port };
   return {
     status: 'ok', consumed: headLen,
-    value: {
-      target: { atyp: ATYP_DOMAIN, addr, port: auth.port },
-      rewrittenHead: Buffer.from(out.join('\r\n'), 'latin1'),
-    },
+    value: { target, rewrittenHead: Buffer.from(out.join('\r\n'), 'latin1') },
   };
 }
 

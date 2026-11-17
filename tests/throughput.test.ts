@@ -724,3 +724,83 @@ test('FEC: the local fallback resumes when the peer stops reporting', () => {
   fec.noteLocalCounters(2000, 1000, 10100);
   assert.equal(fec.currentK(), 6, 'local 50% loss drives k to the ceiling once the peer is silent');
 });
+
+test('TLP probe must not rewrite sentMs and bypass Karn RTT sampling', () => {
+  // REGRESSION: a TLP probe re-sent the tail and set sentMs=nowMs but left
+  // retransmits===0. A late ACK for the ORIGINAL copy then sampled
+  // now - probe_time (a few ms) as the path RTT, poisoning srtt/minRtt/rttvar.
+  // A probe carries no loss evidence; it must not move the RTT timestamp.
+  const rttSamples: number[] = [];
+  const sent: Buffer[] = [];
+  const s = new Stream(
+    { maxSegment: 100, initialSrttMs: 100, idleTimeoutMs: 100000 },
+    { send: (b) => sent.push(b), read: () => {}, closed: () => {}, rtt: (v) => rttSamples.push(v) },
+  );
+  s.write(Buffer.alloc(94), 0);            // one segment at t=0
+  s.onTick(200);                            // PTO = 100 + 2*50 = 200 -> TLP probe
+  assert.equal(sent.length, 2, 'one original + one probe');
+  s.onSegment(encodeAck(94, 65535, 0, 0), 210); // delayed ACK for the ORIGINAL copy
+  // Real path RTT is ~210 ms; the probe went out at 200 ms. A 10 ms sample is
+  // physically impossible and must never enter the estimator.
+  const last = rttSamples.at(-1);
+  assert.ok(last === undefined || last >= 100,
+    `the RTT estimator must not swallow a probe-relative sample; got ${last}`);
+});
+
+test('STREAM: zero-window probe cap must not leave a permanent 1ms timer', () => {
+  // REGRESSION: probeZeroWindow stops when tx grows past 64, but nextTimerMs
+  // kept advertising lastZeroWinProbeMs+50 as a deadline. Once that deadline
+  // expired, take() clamped it to 1ms forever while onTick made no progress —
+  // a host driven by nextTimerMs spun at 1ms, and a peer advertising rwnd=0
+  // could trigger it single-handedly.
+  const { s } = makeStream({ sendWindowBytes: 1000 });
+  const inner = s as unknown as {
+    tx: Array<{ sentMs: number; acked: boolean; sacked: boolean; retransmits: number; end: number }>;
+    pendingBytes: number; peerRwnd: number; lastZeroWinProbeMs: number; ackPending: boolean; oobBytes: number;
+  };
+  // Steady state: many outstanding (acked) segments, pending data, closed peer
+  // window, and the last probe deadline long expired.
+  inner.tx = Array.from({ length: 65 }, (_, i) => ({
+    sentMs: 1000, acked: true, sacked: false, retransmits: 0, end: (i * 100) >>> 0,
+  }));
+  inner.pendingBytes = 50;
+  inner.peerRwnd = 0;
+  inner.lastZeroWinProbeMs = 1000;
+  inner.ackPending = false;
+  inner.oobBytes = 0;
+
+  const d = s.nextTimerMs(5000);
+  assert.ok(d !== 1, `the expired probe deadline must not clamp to a 1ms spin; got ${d}`);
+});
+
+
+test('STREAM: a FIN pending on a zero window is emitted as a probe', () => {
+  // A FIN is a single sequence byte and can serve as the persist probe (as in
+  // TCP). probeZeroWindow returned early when pendingBytes===0 and nextTimerMs
+  // only advertised a probe deadline for pendingBytes>0, so a FIN waiting on a
+  // closed peer window stayed in SendingFin until the idle timeout.
+  const sent: Buffer[] = [];
+  const s = new Stream(
+    { maxSegment: 100, initialSrttMs: 50, sendWindowBytes: 1000, idleTimeoutMs: 100000 },
+    { send: (b) => sent.push(b), read: () => {}, closed: () => {} },
+  );
+  const inner = s as unknown as {
+    pendingBytes: number; finPending: boolean; finSent: boolean; peerRwnd: number;
+    tx: unknown[]; sndNext: number; sndMax: number; lastZeroWinProbeMs: number;
+  };
+  inner.pendingBytes = 0;
+  inner.finPending = true;
+  inner.finSent = false;
+  inner.peerRwnd = 0;            // window() === 0
+  inner.tx = [];
+  inner.lastZeroWinProbeMs = 0;
+
+  let now = 50;
+  for (let i = 0; i < 100; ++i) { s.onTick(now); now += 50; }
+  const fins = sent.filter((b) => {
+    const g = parseSegment(b);
+    return g?.type === STREAM_TYPE_DATA && (g.flags & STREAM_FLAG_FIN) !== 0;
+  });
+  assert.ok(fins.length >= 1, 'FIN must be sent as a zero-window probe');
+  assert.equal(inner.finPending, false, 'FIN no longer pending after the probe');
+});

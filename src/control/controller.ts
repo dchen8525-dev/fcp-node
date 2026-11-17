@@ -276,7 +276,7 @@ function snapshotCounters(c: RxCounters): CounterSnapshot {
     dataDelivered: c.dataDelivered, parityRx: c.parityRx, parityExpected: c.parityExpected,
     setsKUnknown: c.setsKUnknown, setsFull: c.setsFull, lateDup: c.lateDup,
     structFail: c.structFail, setsTailDropped: c.setsTailDropped,
-    dataLateRx: c.lateDup, setsPartial: c.setsPartial,
+    dataLateRx: c.dataLateRx, setsPartial: c.setsPartial,
     ledgerGroups: c.ledgerGroups, ledgerFailed: c.ledgerFailed,
     ledgerKHist: [...c.ledgerKHist],
   };

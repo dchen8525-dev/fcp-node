@@ -23,7 +23,7 @@ const SALT = Buffer.from('0123456789abcdef', 'latin1');
 function counters(over: Partial<RxCounters> = {}): RxCounters {
   return {
     structFail: 0, stale: 0, lateDup: 0, recovered: 0, recoveredLate: 0,
-    dataRxOrig: 0, parityRx: 0, dataDelivered: 0, retiredDropped: 0,
+    dataRxOrig: 0, parityRx: 0, dataDelivered: 0, dataLateRx: 0, retiredDropped: 0,
     aheadDropped: 0, setsPartial: 0, setsFull: 0, setsTailDropped: 0,
     decodeAttempts: 0, badRecon: 0, symbolBudgetDrops: 0,
     setsExpected: 0, dataExpected: 0, parityExpected: 0, setsKUnknown: 0,
@@ -204,4 +204,22 @@ test('FecstatReporter: interval is clamped and matching salt is required', () =>
   const buf = r.onTick(T0 + FECSTAT_INTERVAL_MS * 100, counters(), 0)!;
   assert.equal(decode(buf).intervalMs, 60000);
   assert.equal(decodeFecstat(buf, Buffer.from('ffffffffffffffff', 'latin1')).status, FecstatStatus.BadSalt);
+});
+
+test('FecstatReporter: dataLateRx is independent of lateDup on the wire', () => {
+  // REGRESSION: snapshotCounters used dataLateRx: c.lateDup, so an interval
+  // with only duplicate arrivals reported a fake late-original count (and a
+  // real late original could never be reported). The two are distinct C++
+  // counters (settle.cc kDataLate vs kDataDuplicate).
+  const r = new FecstatReporter(SALT, Direction.C2S);
+  r.onTick(T0, counters(), 0); // prime
+  const dupOnly = counters({ lateDup: 3, dataLateRx: 0 });
+  const p1 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, dupOnly, 0)!);
+  assert.equal(p1.lateDup, 3);
+  assert.equal(p1.dataLateRx, 0, 'duplicates must not appear as late originals');
+
+  const both = counters({ lateDup: 5, dataLateRx: 2 });
+  const p2 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS * 2, both, 0)!);
+  assert.equal(p2.lateDup, 2, 'delta from 3 -> 5');
+  assert.equal(p2.dataLateRx, 2, 'delta from 0 -> 2, independent of lateDup');
 });

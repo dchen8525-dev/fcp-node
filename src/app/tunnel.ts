@@ -646,10 +646,14 @@ export class TunnelClient {
       // OPEN stays first no matter what the backlog already contains.
       queueLocal(open, true);
       if (firstPayload && firstPayload.length) {
-        // Unshift in reverse: the OPEN is already at the front, so the first
-        // payload goes behind it, ahead of whatever the app had queued.
-        const rest = pendingLocal;
-        pendingLocal = [open, Buffer.from(firstPayload), ...rest];
+        // The OPEN is already at pendingLocal[0] (queueLocal unshifted it).
+        // Insert the coalesced first payload right AFTER it, keeping whatever
+        // the app queued during the handshake behind both. Rebuilding the array
+        // from `rest = pendingLocal` duplicated the OPEN (rest already held it)
+        // and leaked a raw FCPO frame into the origin's byte stream. Also count
+        // these bytes in the backlog so the 1 MiB pause gate stays accurate.
+        pendingLocal.splice(1, 0, Buffer.from(firstPayload));
+        pendingLocalBytes += firstPayload.length;
       }
       flushPending();
       this.log(`open sent -> ${targetText(target)}`);

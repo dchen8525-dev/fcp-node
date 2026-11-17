@@ -137,3 +137,16 @@ test('CLI: --version is rejected even though it looks like a help request', () =
   // mode "help"). The removed-opt check must run BEFORE that shortcut.
   expectReject(['--version'], /--version is no longer accepted/);
 });
+
+// --- speedtest --seconds --------------------------------------------------
+
+test('CLI: speedtest --seconds is range-checked like every other numeric option', () => {
+  // REGRESSION: --seconds used Number(raw)||8 clamped to 3..30, so "abc", 2,
+  // 100 and -5 all ran with exit 0 — the only numeric option that silently
+  // swallowed bad input instead of failing loudly.
+  for (const bad of ['abc', '2', '100', '-5', '3.5']) {
+    expectReject(['speedtest', `--key=${KEY}`, `--seconds=${bad}`], /--seconds expects an integer in 3\.\.30/);
+  }
+  // The deprecated spelling is held to the same contract.
+  expectReject(['speedtest', `--key=${KEY}`, '--speedtest-seconds=99'], /--seconds expects an integer in 3\.\.30/);
+});

@@ -179,7 +179,8 @@ interface RxSet {
 export interface RxCounters {
   structFail: number; stale: number; lateDup: number; recovered: number;
   recoveredLate: number; dataRxOrig: number; parityRx: number;
-  dataDelivered: number; retiredDropped: number; aheadDropped: number;
+  dataDelivered: number; dataLateRx: number;
+  retiredDropped: number; aheadDropped: number;
   setsPartial: number; setsFull: number; setsTailDropped: number;
   decodeAttempts: number; badRecon: number; symbolBudgetDrops: number;
   /** Settlement view, reported in FECSTAT: accounted sets with symbols and
@@ -219,7 +220,7 @@ export class FrameRx {
   private symbolBytes = 0;
   readonly counters: RxCounters = {
     structFail: 0, stale: 0, lateDup: 0, recovered: 0, recoveredLate: 0,
-    dataRxOrig: 0, parityRx: 0, dataDelivered: 0, retiredDropped: 0,
+    dataRxOrig: 0, parityRx: 0, dataDelivered: 0, dataLateRx: 0, retiredDropped: 0,
     aheadDropped: 0, setsPartial: 0, setsFull: 0, setsTailDropped: 0,
     decodeAttempts: 0, badRecon: 0, symbolBudgetDrops: 0,
     setsExpected: 0, dataExpected: 0, parityExpected: 0, setsKUnknown: 0,
@@ -298,9 +299,14 @@ export class FrameRx {
 
     const set = this.getOrCreate(hdr.setId, nowMs);
     if (!set) { ++this.counters.structFail; return; }
-    // k is first-wins and clamped to the negotiated parity ceiling.
+    // k is first-wins and clamped to the negotiated parity ceiling (C++ A9).
+    // Once known, a symbol declaring a different k is a structural violation:
+    // decoding with the wrong geometry could reconstruct corrupt data. C++
+    // note_k() returns false in that case and the datagram is dropped with
+    // struct_fail; do the same instead of silently keeping the first value.
     const kClamped = Math.min(kField, this.p);
     if (!set.kKnown) { set.k = kClamped; set.kKnown = true; }
+    else if (set.k !== kClamped) { ++this.counters.structFail; return; }
 
     if (type === SymbolType.Data) {
       const idx = hdr.index;
@@ -315,6 +321,12 @@ export class FrameRx {
       // arrival here would put shards from still-active sets into the period's
       // numerator while their sets have not entered the denominator yet.
       ++this.counters.dataDelivered;
+      // FECSTAT data_late_rx counts unique originals arriving during the
+      // tombstone window WITHIN the accounted code length (C++ settle.cc:188).
+      // late_unexpected (k-unknown / index past the accounted boundary) is a
+      // separate condition and must not inflate this field, or the peer's
+      // data_lost() identity would exceed expected.
+      if (late && !lateUnexpected) ++this.counters.dataLateRx;
       this.deliverFn(symbol.subarray(2), { recovered: false, late: late || lateUnexpected });
       this.tryDecode(set, nowMs);
       return;
@@ -362,7 +374,18 @@ export class FrameRx {
    */
   private storeRecovered(set: RxSet, idx: number, symbol: Buffer): void {
     const old = set.data.get(idx);
-    this.symbolBytes += symbol.length - (old ? old.length : 0);
+    const oldLen = old ? old.length : 0;
+    // A reconstructed row is a real heap allocation and must obey the same
+    // session ceiling as an arriving symbol (C++ frame_rx.cc:452 store_symbol,
+    // called from the recovery path). Without this check, heavy loss could push
+    // symbolBytes past MAX_RX_SYMBOL_BYTES and defeat the only heap guard.
+    // A refusal is safe: the caller still delivers this reconstruction, and a
+    // later parity can repair the slot again.
+    if (this.symbolBytes - oldLen + symbol.length > MAX_RX_SYMBOL_BYTES) {
+      ++this.counters.symbolBudgetDrops;
+      return;
+    }
+    this.symbolBytes += symbol.length - oldLen;
     set.data.set(idx, symbol);
   }
 
@@ -429,6 +452,15 @@ export class FrameRx {
       if (victimSet) {
         this.symbolBytes -= this.setBytes(victimSet);
         if (!victimSet.accounted) ++this.counters.setsTailDropped;
+        else {
+          // An ACCOUNTED set is final: retire its id so a late symbol cannot
+          // re-create and settle it a second time (mirror C++ frame_rx.cc:415
+          // "Evicted after accounting"). A tail-dropped set is only a 1 s
+          // heuristic verdict — a late parity may legitimately rebuild it, so
+          // it is deliberately NOT retired.
+          this.retired.add(victim);
+          this.pruneRetired();
+        }
       }
       this.sets.delete(victim);
       this.accountBoundary.delete(victim);
@@ -492,8 +524,11 @@ export class FrameRx {
    */
   private accountSet(set: RxSet): void {
     if (!set.hasAnySymbol) {
-      // A gap placeholder: the whole set never produced a symbol.
-      ++this.counters.setsTailDropped;
+      // A gap placeholder: the whole set never produced a symbol (seen only
+      // as a set-id jump). C++ settle.cc:127 counts this as sets_k_unknown —
+      // NOT a tail drop, which is the 1 s heuristic for a set that had data
+      // but no parity. Reporting it as tailDropped also mis-set FLG_TAIL_DROPPED.
+      ++this.counters.setsKUnknown;
       return;
     }
     const nUsed = set.nKnown ? set.n : set.maxDataIndex + 1;
