@@ -29,6 +29,36 @@ const TICK_MS = 10;
 /** Stats line cadence: fast enough for a live graph, slow enough not to spam. */
 const STATS_PERIOD_MS = 500;
 
+/**
+ * One trace row per established session per 2 s: what the current k bought.
+ *
+ * `fec_k` records the controller's decision and `bbr` its estimate; neither
+ * records the counters the decision moves (retransmissions, loss, send rate).
+ * Those used to exist only in the debug stats line, and turning debug on to get
+ * them also writes two lines per datagram — at 300 KB/s that is megabytes per
+ * minute of formatting and disk, enough to change the throughput a benchmark is
+ * trying to measure. This costs one small line per session per interval.
+ */
+function traceStreamInterval(
+  sink: TraceSink | undefined,
+  s: Session,
+  st: ReturnType<Session['stats']>,
+): void {
+  if (!sink) return;
+  sink.write(JSON.stringify({
+    t: 'stream',
+    k: st.k,
+    loss: s.fecLoss,
+    srtt: st.srttMs,
+    retx: s.segsRetransmitted,
+    sent: s.segsSent,
+    sendBw: Math.round(s.sendRateBytesPerMs * 1000),
+    inflight: s.inflightBytes,
+    queued: s.queuedBytes,
+    rwnd: s.peerWindowBytes,
+  }));
+}
+
 export interface TunnelOptions {
   psk: Buffer;
   host?: string; port?: number;
@@ -504,6 +534,7 @@ export class TunnelClient {
       b.session.onTick(now);
       if (b.session.established && statsDue) {
         const st = b.session.stats();
+        traceStreamInterval(b.trace, b.session, st);
         this.dbg(`stats inflight=${b.session.inflightBytes}B rwnd=${b.session.peerWindowBytes}B ` +
           `queued=${b.session.queuedBytes}B retx=${b.session.segsRetransmitted}/${b.session.segsSent} ` +
           `retxSplit=${b.session.retxSplit} k=${st.k} loss=${(b.session.fecLoss * 100).toFixed(1)}% srtt=${st.srttMs}ms ` +
@@ -1095,6 +1126,7 @@ export class TunnelServer {
       b.session.onTick(now);
       if (b.session.established && statsDue) {
         const st = b.session.stats();
+        traceStreamInterval(b.trace, b.session, st);
         this.dbg(`stats inflight=${b.session.inflightBytes}B rwnd=${b.session.peerWindowBytes}B ` +
           `queued=${b.session.queuedBytes}B retx=${b.session.segsRetransmitted}/${b.session.segsSent} ` +
           `retxSplit=${b.session.retxSplit} k=${st.k} loss=${(b.session.fecLoss * 100).toFixed(1)}% srtt=${st.srttMs}ms ` +

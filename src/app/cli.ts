@@ -277,6 +277,28 @@ function parseFec(v: string | undefined): { d: number; p: number } {
   return { d, p };
 }
 
+/**
+ * Benchmark-only pin for the FEC parity count.
+ *
+ * `--k` / `--parity` were removed on purpose: a pinned k turns the loss-driven
+ * controller off, and that controller is the thing being tuned. Measuring a
+ * fixed k against the adaptive one on the same path is still the only way to
+ * answer "is the controller choosing enough parity", so the pin survives as an
+ * environment variable: no flag to stumble over, no help entry to look like a
+ * supported setting, and a warning whenever it actually fires. Unset (the
+ * normal case) it returns 0 and the controller owns k.
+ */
+function pinnedKFromEnv(log: (line: string) => void): number {
+  const raw = process.env.FCP_FEC_PIN_K;
+  if (raw === undefined || raw.trim() === '') return 0;
+  const k = Number(raw);
+  if (!Number.isInteger(k) || k < 1 || k > 7) {
+    throw new Error(`FCP_FEC_PIN_K expects an integer 1..7, got "${raw}"`);
+  }
+  log(`WRN FEC k pinned at ${k} by FCP_FEC_PIN_K: loss-driven adaptation is OFF (benchmark only)`);
+  return k;
+}
+
 async function speedtest(base: TunnelOptions, seconds: number): Promise<void> {
   // In-process loopback: a real FCP tunnel (handshake + envelope + FEC +
   // FCP-STREAM) carrying a local TCP echo, measured over the proxy port.
@@ -408,6 +430,7 @@ async function main(): Promise<void> {
     mtu: mtuMin,
     pmtuMaxMtu: mtuMax,
     ...fecGeo,
+    pinnedK: pinnedKFromEnv(log),
     // PMTUD is ON by default now. CAP_PMTUD (bit4) used to be a hard caps gate
     // against C++ 0.0.19 peers, but the tunnel is Node<->Node only, so the
     // negotiation risk is gone and the path can grow itself.

@@ -180,9 +180,20 @@ export const CLEAN_EVIDENCE = 2;
  *  from flapping on a path whose loss rate sits right on a step boundary. */
 export const FEC_DROP_STREAK = 4;
 /** Multiplier on the expected number of lost shards per group when choosing k.
- *  `k` must cover the mean plus variance: 1.5 x d x loss covers the bursty
- *  losses this path produces without paying for worst case every group. */
-export const FEC_HEADROOM = 1.5;
+ *  `k` must cover the mean plus variance: 3 x d x loss covers the bursty
+ *  losses this path produces without paying for worst case every group.
+ *
+ *  1.5 covered the MEAN of the per-group loss distribution and nothing else.
+ *  Measured on the live path at 19-20% shard loss with d=10: the formula picked
+ *  k=3, where P(a group loses more than k) = 12.1%, so one group in eight could
+ *  not be repaired and waited an ARQ round on a ~400 ms path. Pinning k=6
+ *  (tail 0.09%) on the same path, same 19-20% loss, doubled goodput: 1.88-2.36
+ *  MB/s against 0.90-1.00 MB/s, with retransmissions down from 6.5-7.0% to
+ *  1.3-2.4% of segments and the wire rate still only 3.0-3.8 MB/s (loss did not
+ *  rise with it, so the link was never the limit — recovery was). 3.0 puts
+ *  k=6 at 20% loss, 3 at 10%, 2 at 5% and the floor at <=2%, so a clean path
+ *  still pays the minimum. Above ~22% loss the ceiling P is what binds. */
+export const FEC_HEADROOM = 3.0;
 /** Minimum delivered data shards in one FECSTAT before its loss rate is used.
  *  1000 was too high: a 0.3 MB/s stream produces ~600 shards per 2 s report,
  *  so the controller simply never engaged on a slow path. At 256 the standard
@@ -376,4 +387,4 @@ export const TARGET_RECOVERY = 0.80;
 export const FECSTAT_INTERVAL_MS = 1000;
 export const FECSTAT_MAX_INTERVAL_MS = 60000;
 
-export const PRODUCT_VERSION = '0.0.17';
+export const PRODUCT_VERSION = '0.0.18';

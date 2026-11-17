@@ -162,7 +162,6 @@ export class AdaptiveFec {
    *    k within one 2 s interval instead of being averaged away.
    */
   onFecstat(stat: FecstatPacket, nowMs = 0): void {
-    if (this.pinnedK > 0) return;
     if (nowMs > 0) this.lastPeerReportMs = nowMs;
     // The peer IS reporting, so the local ledger steps aside. This used to be
     // set only once the peer's samples crossed the noise floor, and on a slow
@@ -172,30 +171,45 @@ export class AdaptiveFec {
     // wrong direction's loss rate. The peer's own samples keep accumulating
     // and decide one interval later.
     this.peerReports = true;
-    // FECSTAT counters are per interval (the reporter emits deltas), exactly
-    // like the C++ settlement view. `data_expected` is Σ n_used over the sets
-    // settled in this interval, so short flush groups cannot inflate the
-    // denominator the way `groups x d` did. Samples below the noise floor are
-    // summed across reports so a slow path (~120 KB/s and under) eventually
-    // crosses FEC_LOSS_MIN_SHARDS and gets a k decision too.
+    const loss = this.sampleLoss(stat);
+    if (loss === null) return;
+    // A pin freezes the choice of k, not the measurement. Returning before the
+    // rate is recorded left a pinned leg reporting loss=0, which makes its
+    // trace useless as the control group of a fixed-k experiment — the whole
+    // reason a pin exists.
+    if (this.pinnedK > 0) { this.lossRate = loss; return; }
+    this.adjust(loss, 'fecstat_loss');
+  }
+
+  /**
+   * Loss fraction for one peer report, or null while the sample is still below
+   * the shard floor.
+   *
+   * FECSTAT counters are per interval (the reporter emits deltas), exactly like
+   * the C++ settlement view. `data_expected` is Σ n_used over the sets settled
+   * in this interval, so short flush groups cannot inflate the denominator the
+   * way `groups x d` did. Samples below the noise floor are summed across
+   * reports so a slow path (~120 KB/s and under) eventually crosses
+   * FEC_LOSS_MIN_SHARDS and gets a k decision too.
+   */
+  private sampleLoss(stat: FecstatPacket): number | null {
     const expected = stat.dataExpected >>> 0;
     const rxOrig = stat.dataRxOrig >>> 0;
     if (expected < FEC_LOSS_MIN_SHARDS) {
       this.pendExpected += expected;
       this.pendOrig += rxOrig;
-      if (this.pendExpected < FEC_LOSS_MIN_SHARDS) return;
+      if (this.pendExpected < FEC_LOSS_MIN_SHARDS) return null;
       const evalExpected = this.pendExpected;
       const evalOrig = this.pendOrig;
       this.pendExpected = 0;
       this.pendOrig = 0;
       const lost = Math.max(0, Math.min(evalExpected, evalExpected - evalOrig));
-      this.adjust(lost / evalExpected, 'fecstat_loss');
-      return;
+      return lost / evalExpected;
     }
     this.pendExpected = 0;
     this.pendOrig = 0;
     const lost = Math.max(0, Math.min(expected, expected - rxOrig));
-    this.adjust(lost / expected, 'fecstat_loss');
+    return lost / expected;
   }
 
   /** No dead band: every sample has a target. Raise immediately, lower only

@@ -106,7 +106,7 @@ test('FEC: the local fallback reports shard loss and raises k from it', () => {
   const fec = new AdaptiveFec({ d: 10, p: 6 });
   feedLocal(fec, 500, 30);
   assert.equal(fec.currentLoss(), 0.3, '30% of data shards never arrived');
-  assert.equal(fec.currentK(), 5, 'ceil(10 * 0.30 * 1.5)');
+  assert.equal(fec.currentK(), 6, 'ceil(10 * 0.30 * 3.0) = 9, clamped to the P=6 ceiling');
 });
 
 test('FEC: the local fallback samples at the FECSTAT cadence, not per tick', () => {
@@ -131,6 +131,18 @@ test('FEC: the peer report wins over the local fallback', () => {
   feedLocal(fec, 500, 50);
   assert.equal(fec.currentK(), settled, 'local 50% does not move a peer-reported k');
   assert.equal(fec.currentLoss(), 0, 'and does not overwrite the peer loss rate');
+});
+
+test('FEC: a pinned k still measures the loss it is not acting on', () => {
+  // FCP_FEC_PIN_K is the only way to compare a fixed k against the adaptive
+  // one, and the pinned leg is the control group: it has to report the path it
+  // ran on. Returning before the rate was recorded made every pinned leg print
+  // loss=0%, which is indistinguishable from a clean path — and a clean path
+  // is the one explanation a fixed-k result must be able to rule out.
+  const fec = new AdaptiveFec({ d: 10, p: 6, pinnedK: 6 });
+  feedLoss(fec, 1, 20);
+  assert.equal(fec.currentK(), 6, 'the pin holds');
+  assert.equal(fec.currentLoss(), 0.2, 'and the measurement still happens');
 });
 
 test('FEC: a small peer report already hands k over to the peer', () => {
@@ -180,7 +192,7 @@ test('FEC: repaired loss still counts, because the signal is raw shard loss', ()
   const before = fec.currentK();
   feedLoss(fec, 3, 35);
   assert.ok(fec.currentK() > before, 'heavy shard loss raises k');
-  assert.equal(fec.currentK(), 6, 'ceil(10 * 0.35 * 1.5)');
+  assert.equal(fec.currentK(), 7, 'ceil(10 * 0.35 * 3.0) = 11, clamped to the 7-symbol ceiling');
 });
 
 test('FEC: every loss sample maps to a target, so there is no dead band', () => {
@@ -192,13 +204,13 @@ test('FEC: every loss sample maps to a target, so there is no dead band', () => 
 
   const rough = new AdaptiveFec({ d: 10, p: 7 });
   feedLoss(rough, 8, 40);
-  assert.equal(rough.currentK(), 6, '40% loss needs six');
+  assert.equal(rough.currentK(), 7, '40% loss wants 12, clamped to the 7-symbol ceiling');
 });
 
 test('FEC: k pins at the negotiated parity ceiling instead of overshooting it', () => {
   const fec = new AdaptiveFec({ d: 10, p: 3 });
   feedLoss(fec, 3, 50);
-  assert.equal(fec.currentK(), 3, '50% loss wants 8, the handshake allows 3');
+  assert.equal(fec.currentK(), 3, '50% loss wants 15, the handshake allows 3');
 });
 
 test('FEC: a single tiny sample is ignored so one lost group cannot spike k', () => {
