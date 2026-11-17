@@ -511,6 +511,7 @@ export class TunnelClient {
           `recvNext=${b.session.recvNext} ` +
           `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B ` +
           `retxLat=${b.session.retxLatencyP50Ms}/${b.session.retxLatencyP95Ms}ms(n=${b.session.retxLatencyCount}) ` +
+          `ackTrunc=${b.session.ackRangesTruncated}/${b.session.ackRangesDropped} ` +
           `authFail=${st.authFail} structFail=${st.structFail}`);
       }
       // Session-level isClosed only: on a shared mux session the default
@@ -1101,6 +1102,7 @@ export class TunnelServer {
           `recvNext=${b.session.recvNext} ` +
           `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B ` +
           `retxLat=${b.session.retxLatencyP50Ms}/${b.session.retxLatencyP95Ms}ms(n=${b.session.retxLatencyCount}) ` +
+          `ackTrunc=${b.session.ackRangesTruncated}/${b.session.ackRangesDropped} ` +
           `authFail=${st.authFail} structFail=${st.structFail}`);
       }
       if (b.session.isClosed) {

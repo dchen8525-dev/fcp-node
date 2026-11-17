@@ -21,9 +21,10 @@ import {
   MIN_OOB_CHUNKS, MAX_OOB_CHUNKS,
   TLP_MIN_PTO_MS, TLP_MAX_PROBES,
   HOLE_DUP_ACK_MIN_MS, HOLE_DUP_ACK_DIVISOR, RETX_LAT_SAMPLES,
+  STREAM_ACK_V2_MIN_LEN, STREAM_ACK_V2_MAX_RANGES,
 } from '../constants.ts';
 import {
-  seqAfter, seqAtOrAfter, seqDist, getLe32, putLe32,
+  seqAfter, seqAtOrAfter, seqDist, getLe32, putLe32, uvarintSize,
 } from '../wire.ts';
 import {
   parseSegment, encodeData, encodeAck, encodeAckV2, encodeRst,
@@ -105,6 +106,11 @@ export class Stream {
   // made a delivered segment clear the duplicate-ACK tally, so fast retransmit
   // either fired spuriously or never armed.
   private lastAckCum = 0; private haveAckCum = false; private dupAcks = 0;
+  /** Measurement: ACKs that could not carry every received run, and how many
+   *  runs were left out. See keepAckRanges() and scripts/ack-probe.ts. */
+  private ackTruncCount = 0; private ackDropCount = 0;
+  /** Where the next ACK's low-end window starts (ACK v2 hole rotation). */
+  private ackRotateIdx = 0;
   private sackRotateCum = 0; private sackRotateHave = false;
   /** Highest byte offset the peer has ever reported receiving (cum ack or any
    *  SACK block). Anything below it that is neither acked nor sacked is
@@ -592,6 +598,106 @@ export class Stream {
   }
 
   private cumOut(): number { return this.rcvNxt; }
+
+  /**
+   * Which received runs make it into this ACK, and where the next ACK's
+   * rotating window starts.
+   *
+   * Three parts, in ascending offset order:
+   *
+   *   - the runs nearest cum. They mark the exact edge of the real gap, so
+   *     the sender's "not acked, not sacked, below sackedHigh -> missing"
+   *     test points at the bytes that are really missing instead of at a hole
+   *     the peer already has. These are never rotated away: a window that
+   *     moved the near end widened the sender's idea of the gap by the width
+   *     of the window, and the fast retransmit it triggered landed on data the
+   *     peer had (measured on the same budget: -7% for the rotating window
+   *     against -43% for the same budget held still).
+   *   - the highest run. It raises sackedHigh, and fast retransmit only fires
+   *     for a segment the peer has reported *past*: without it the tail of
+   *     the stream can only be recovered by an RTO.
+   *   - a rotating window over the runs in between. The sender retransmits
+   *     everything it has no SACK evidence for, so a hole that no ACK ever
+   *     mentions is retransmitted forever. Rotating gives every hole a turn,
+   *     the way the v1 ACK rotates its single SACK block (C++
+   *     stream_recv.cc: sack_rotate_).
+   *
+   * A range costs what it encodes to, not the worst case. The budget used to
+   * assume 10 B per range (5 B gap + 5 B length), but a gap of a few hundred
+   * bytes and a short run are one byte each, and a path with many small holes
+   * was throwing away two thirds of the datagram it had left. Every range
+   * that fits is another hole the sender stops guessing about.
+   */
+  private keepAckRanges(runs: RcvChunk[], cum: number, budget: number, rotate: number):
+      { picked: RcvChunk[]; nextRotate: number } {
+    const n = runs.length;
+    if (n === 0) return { picked: [], nextRotate: 0 };
+    const end = (c: RcvChunk): number => (c.offset + c.bytes.length) >>> 0;
+    // What a range costs after the one ending at `prev`.
+    const cost = (c: RcvChunk, prev: number): number =>
+      uvarintSize(seqDist(c.offset, prev)) + uvarintSize(c.bytes.length);
+    // The wire format itself caps the list at 64 ranges.
+    const cap = STREAM_ACK_V2_MAX_RANGES;
+    // Nothing to drop: the whole list fits the datagram.
+    if (n <= cap) {
+      let total = STREAM_ACK_V2_MIN_LEN;
+      let prev = cum;
+      for (const c of runs) {
+        total += cost(c, prev);
+        prev = end(c);
+        if (total > budget) break;   // over budget: the cut below decides
+      }
+      if (total <= budget) return { picked: runs, nextRotate: 0 };
+    }
+    // The highest run and the runs nearest cum are the two ends that matter.
+    const top = runs[n - 1]!;
+    const frontCount = Math.min(2, n - 1);
+    const front = runs.slice(0, frontCount);
+    // Try the whole front window, then a narrower one, then the top alone. The
+    // tail (sackedHigh) is what waits for an RTO, but the near end is what
+    // tells the sender where the real gap is, so neither is given up first.
+    let keepFront: RcvChunk[] = [];
+    let used = 0;
+    let prevEnd = cum;
+    for (let take = front.length; take >= 0; --take) {
+      const cand = front.slice(0, take);
+      let total = STREAM_ACK_V2_MIN_LEN;
+      let prev = cum;
+      for (const c of cand) { total += cost(c, prev); prev = end(c); }
+      // The top range is reserved at its worst case (its gap measured from
+      // cum), so the window below can be filled without breaking the datagram.
+      total += cost(top, cum);
+      if (total <= budget) { keepFront = cand; used = total; prevEnd = prev; break; }
+    }
+    if (used === 0) return { picked: [], nextRotate: 0 };
+    // The runs in between: a window over them that rotates, so every hole is
+    // reported once per cycle instead of the same ones over and over.
+    const pool = runs.slice(keepFront.length, n - 1);
+    const picked = keepFront.slice();
+    let nextRotate = 0;
+    if (pool.length > 0) {
+      const start = rotate % pool.length;
+      let prev = prevEnd;
+      let taken = 0;
+      for (let i = start; i < pool.length && picked.length + 1 < cap; ++i) {
+        const c = pool[i]!;
+        const add = cost(c, prev);
+        if (used + add > budget) break;
+        used += add;
+        prev = end(c);
+        picked.push(c);
+        ++taken;
+      }
+      nextRotate = (start + taken) % pool.length;
+    }
+    picked.push(top);
+    return { picked, nextRotate };
+  }
+
+  /** ACKs whose SACK list did not fit the datagram budget. */
+  get ackRangesTruncated(): number { return this.ackTruncCount; }
+  /** Received runs that were never reported to the peer. */
+  get ackRangesDropped(): number { return this.ackDropCount; }
   private rwndOut(): number {
     const used = this.oobBytes + this.deliveryPending;
     return this.cfg.rcvBufBytes > used ? this.cfg.rcvBufBytes - used : 0;
@@ -612,19 +718,37 @@ export class Stream {
       // payloadMax without a word (mtuDrops), so on a small MTU a wide ACK
       // simply vanished — and an ACK that never arrives is indistinguishable
       // from a lost one, which turns every wide hole into an RTO stall. Cap the
-      // range count at what the budget actually holds; the dropped tail is
-      // still covered by the next ACK, and cum/ rwnd always go out.
+      // range count at what the budget actually holds; cum/ rwnd always go out.
+      //
+      // Which ranges are dropped is not a free choice. The newest holes must
+      // stay: they are what lets the sender fast-retransmit the tail instead
+      // of waiting for an RTO. The rest rotate, so every hole is reported once
+      // per cycle. Keeping the oldest holes and dropping the newest — which is
+      // what the plain offset order did by itself — left the tail without any
+      // evidence at all: the dropped tail is NOT covered by the next ACK,
+      // because the next ACK truncates the same way, and the hole only
+      // surfaced once an RTO had already dragged the sender back to it.
       const budget = this.cfg.maxSegment;
-      const maxRanges = Math.max(0, Math.min(64, Math.floor((budget - 10) / 10)));
-      const blocks = this.oob.slice(0, maxRanges).map((c) => ({ start: c.offset, end: (c.offset + c.bytes.length) >>> 0 }));
+      const sel = this.keepAckRanges(this.oob, cum, budget, this.ackRotateIdx);
+      this.ackRotateIdx = sel.nextRotate;
+      const blocks = sel.picked.map((c) => ({ start: c.offset, end: (c.offset + c.bytes.length) >>> 0 }));
       let ack = encodeAckV2(cum, rwnd, blocks);
-      // The estimate above is an upper bound per range; shrink until it fits
-      // for real (a range can encode shorter than 5+5).
+      // Safety net: the byte accounting above is exact, so this should not
+      // run. If it ever does, give up the middle range first -- the two ends
+      // carry the sender's fast-retransmit evidence.
       while (ack.length > budget && blocks.length > 0) {
-        blocks.pop();
+        const at = blocks.length > 2 ? Math.floor(blocks.length / 2) : 0;
+        blocks.splice(at, 1);
         ack = encodeAckV2(cum, rwnd, blocks);
       }
       if (ack.length > budget) return; // even an empty v2 ACK does not fit
+      // Measurement: how many of the received runs never made it into the
+      // ACK. The sender can only fast-retransmit what the peer reported
+      // past, so a dropped run is a hole the sender has to find by RTO.
+      if (blocks.length < this.oob.length) {
+        ++this.ackTruncCount;
+        this.ackDropCount += this.oob.length - blocks.length;
+      }
       this.cb.send(ack);
       return;
     }
@@ -1105,6 +1229,7 @@ export class Stream {
     this.state = StreamState.Closed;
     this.closeReason = reason;
     this.tx = []; this.pending = []; this.oob = [];
+    this.ackRotateIdx = 0;
     this.cb.closed(reason);
   }
 }

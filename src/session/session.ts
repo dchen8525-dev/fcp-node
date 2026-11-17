@@ -786,6 +786,11 @@ export class Session {
   get recvPendingBytes(): number { return this.eachStream((s) => s.deliveryPendingBytes); }
   get segsSent(): number { return this.eachStream((s) => s.segsSent); }
   get segsRetransmitted(): number { return this.eachStream((s) => s.retransmits); }
+  /** ACKs whose SACK list did not fit the datagram, and the holes left out of
+   *  them. A non-zero count says the path cannot carry the receiver's hole
+   *  list, so the sender works from a partial view of what arrived. */
+  get ackRangesTruncated(): number { return this.eachStream((s) => s.ackRangesTruncated); }
+  get ackRangesDropped(): number { return this.eachStream((s) => s.ackRangesDropped); }
   /** fast-retransmit copies / RTO copies / fast-retransmit rounds. */
   get retxSplit(): string {
     return `${this.stream.retxFast}/${this.stream.retxRto}/${this.stream.fastRounds}`;

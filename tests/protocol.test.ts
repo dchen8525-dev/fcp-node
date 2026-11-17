@@ -14,6 +14,7 @@ import {
   CAP_FECSTAT, TLV_TYPE_ACK_V2, TLV_TYPE_PREWARM, TLV_TYPE_ERROR,
   HandshakeRole, HandshakeState, HandshakeError, Direction, SymbolType,
   TLV_BLOCK_LEN_BYTES, ENVELOPE_OVERHEAD, FEC_HDR_LEN, PMTU_HEADER_LEN,
+  STREAM_TYPE_ACK_V2,
 } from '../src/constants.ts';
 import { deriveSessionKeyV7 } from '../src/crypto/keys.ts';
 import { computeMtuLimits, FrameTx, FrameRx, packTxFrame, type TxSymbol } from '../src/fec/frame.ts';
@@ -945,6 +946,59 @@ test('STREAM: the receiver never holds more than the window it advertises', () =
   assert.ok(held <= CAP,
     `held ${held} bytes > the advertised ${CAP} (${(held / CAP).toFixed(2)}x)`);
   assert.ok(s.reorderBytes >= 0, `the reorder counter went negative: ${s.reorderBytes}`);
+});
+
+test('STREAM: a truncated ACK v2 keeps the newest hole and fills the datagram it has', () => {
+  // The ACK v2 range list is cut to what the datagram budget holds, and the
+  // cut used to keep the *oldest* holes and drop the newest ones — the holes
+  // in the tail of the stream, where the window is full. Fast retransmit only
+  // fires for a segment the peer has reported *past* (sackedHigh), so a tail
+  // hole that no ACK mentions can only be found by an RTO: measured on the
+  // same loss pattern, that cost 26% to 46% of the completion time at a 128 B
+  // MTU, and the dropped ranges were never covered by a later ACK either
+  // (the next ACK truncates the same way).
+  //
+  // The budget was also estimated at 10 B per range (5 B gap + 5 B length),
+  // but a gap of a few hundred bytes and a short run are one byte each, so
+  // two thirds of every ACK went out unused.
+  const MAXSEG = 66;                    // 60 B payload + 6 B DATA header
+  const HOLES = 40;
+  const acks: Buffer[] = [];
+  const s = new Stream(
+    { maxSegment: MAXSEG, initialSrttMs: 40, sendWindowBytes: 256 * 1024,
+      rcvBufBytes: 256 * 1024, idleTimeoutMs: 1e9, ackV2: true },
+    { send: (b) => acks.push(b), read: () => {}, closed: () => {} },
+  );
+  const seg = (off: number, n: number) => {
+    const b = Buffer.alloc(6 + n); b[0] = 1; b.writeUInt32LE(off >>> 0, 1); return b;
+  };
+  const rangesOf = (b: Buffer): Array<{ start: number; end: number }> => {
+    const p = parseSegment(b);
+    if (!p || p.type !== STREAM_TYPE_ACK_V2) return [];
+    return p.ranges;
+  };
+  // One in-order segment moves cum to 60; the holes start at 120 and are
+  // spaced 120 B apart so they stay separate runs instead of merging.
+  s.onSegment(seg(0, 60), 1);
+  for (let k = 0; k < HOLES; ++k) s.onSegment(seg(120 + 120 * k, 60), 2 + k);
+  s.onTick(200);
+  const worstCase = Math.floor((MAXSEG - 10) / 10);
+  const all = acks.map(rangesOf);
+  const last = all[all.length - 1] ?? [];
+  assert.ok(last.length > 0, 'no ACK v2 went out');
+  assert.ok(last.length > worstCase,
+    `the ACK carried ${last.length} ranges, no more than the ${worstCase} the worst-case estimate allows`);
+  assert.equal(last[0]!.start, 120,
+    'the range nearest cum is missing: the sender cannot see where the real gap ends');
+  assert.equal(last[last.length - 1]!.end, 120 + 120 * (HOLES - 1) + 60,
+    'the newest hole is not in the ACK: the tail can only be recovered by an RTO');
+  // Every hole has to turn up in some ACK. A hole that no ACK names stays
+  // invisible to the sender, which then treats the bytes it covers as
+  // provably missing and retransmits them for the rest of the stream.
+  const seen = new Set<number>();
+  for (const rs of all) for (const r of rs) seen.add(r.start);
+  assert.ok(seen.size > worstCase,
+    `the ACK kept naming the same ${seen.size} holes: the rest are retransmitted forever`);
 });
 
 test('STREAM: a host that re-enters from read() must not duplicate or lose bytes', () => {

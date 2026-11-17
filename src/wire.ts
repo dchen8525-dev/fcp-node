@@ -82,6 +82,15 @@ export function getUvarint(b: Uint8Array, cap: number, state: { off: number }): 
   }
   return null;
 }
+/** How many bytes putUvarint() would spend on this value. Lets a caller size
+ *  an ACK before encoding it — the worst case is 5 bytes per field, but a gap
+ *  or a run length is usually one or two. */
+export function uvarintSize(v: number): number {
+  let x = v >>> 0;
+  let n = 1;
+  while (x >= 0x80) { x >>>= 7; ++n; }
+  return n;
+}
 
 // Wrap-safe modular half-window comparison (src/fcp/seq.h).
 export function seqAfter(a: number, b: number): boolean {
