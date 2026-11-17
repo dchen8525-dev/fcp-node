@@ -948,22 +948,27 @@ test('STREAM: the receiver never holds more than the window it advertises', () =
   assert.ok(s.reorderBytes >= 0, `the reorder counter went negative: ${s.reorderBytes}`);
 });
 
-test('STREAM: a truncated ACK v2 keeps the newest hole and fills the datagram it has', () => {
-  // The ACK v2 range list is cut to what the datagram budget holds, and the
-  // cut used to keep the *oldest* holes and drop the newest ones — the holes
-  // in the tail of the stream, where the window is full. Fast retransmit only
-  // fires for a segment the peer has reported *past* (sackedHigh), so a tail
-  // hole that no ACK mentions can only be found by an RTO: measured on the
-  // same loss pattern, that cost 26% to 46% of the completion time at a 128 B
-  // MTU, and the dropped ranges were never covered by a later ACK either
-  // (the next ACK truncates the same way).
+test('STREAM: a truncated ACK v2 never reports past a run it left out', () => {
+  // The ACK v2 range list is cut to what the datagram budget holds, and what
+  // gets cut is the tail of the list -- never a run in the middle. That is not
+  // a style choice. Fast retransmit treats every segment below sackedHigh, the
+  // end of the *highest reported* run, that the ACK did not name as missing.
+  // Reporting the newest run while skipping middle ones therefore declares the
+  // skipped runs lost while the peer is holding them in its receive queue, and
+  // the sender spends its six retransmissions a round re-sending bytes that
+  // already arrived. Measured on a seeded 5% loss path at MTU 300: 1499
+  // retransmissions and 49 KB of duplicate delivery against 798 and 38 KB for
+  // the prefix, and 19% later completion (scripts/ack-probe.ts).
   //
-  // The budget was also estimated at 10 B per range (5 B gap + 5 B length),
-  // but a gap of a few hundred bytes and a short run are one byte each, so
-  // two thirds of every ACK went out unused.
+  // The invariant: for every ACK, every byte the receiver holds below the last
+  // reported end (sackedHigh) must be inside a reported range. Anything else is
+  // a phantom hole.
   const MAXSEG = 66;                    // 60 B payload + 6 B DATA header
   const HOLES = 40;
+  const SPACING = 120;
+  const RUN = 60;
   const acks: Buffer[] = [];
+  const have: Array<{ start: number; end: number }> = [];
   const s = new Stream(
     { maxSegment: MAXSEG, initialSrttMs: 40, sendWindowBytes: 256 * 1024,
       rcvBufBytes: 256 * 1024, idleTimeoutMs: 1e9, ackV2: true },
@@ -972,33 +977,44 @@ test('STREAM: a truncated ACK v2 keeps the newest hole and fills the datagram it
   const seg = (off: number, n: number) => {
     const b = Buffer.alloc(6 + n); b[0] = 1; b.writeUInt32LE(off >>> 0, 1); return b;
   };
-  const rangesOf = (b: Buffer): Array<{ start: number; end: number }> => {
-    const p = parseSegment(b);
-    if (!p || p.type !== STREAM_TYPE_ACK_V2) return [];
-    return p.ranges;
-  };
-  // One in-order segment moves cum to 60; the holes start at 120 and are
-  // spaced 120 B apart so they stay separate runs instead of merging.
-  s.onSegment(seg(0, 60), 1);
-  for (let k = 0; k < HOLES; ++k) s.onSegment(seg(120 + 120 * k, 60), 2 + k);
+  // One in-order segment moves cum to 60; the runs start at 120 and are spaced
+  // 120 B apart so each stays a separate run instead of merging.
+  s.onSegment(seg(0, RUN), 1);
+  have.push({ start: 0, end: RUN });
+  for (let k = 0; k < HOLES; ++k) {
+    const off = 120 + SPACING * k;
+    s.onSegment(seg(off, RUN), 2 + k);
+    have.push({ start: off, end: off + RUN });
+  }
   s.onTick(200);
+  const parsed = acks
+    .map((b) => parseSegment(b))
+    .filter((p): p is NonNullable<typeof p> => !!p && p.type === STREAM_TYPE_ACK_V2);
+  assert.ok(parsed.length > 0, 'no ACK v2 went out');
+  const last = parsed[parsed.length - 1]!;
+  // The byte-accurate budget (not the old 10 B-per-range estimate) is what lets
+  // a prefix ACK carry this many ranges at all.
   const worstCase = Math.floor((MAXSEG - 10) / 10);
-  const all = acks.map(rangesOf);
-  const last = all[all.length - 1] ?? [];
-  assert.ok(last.length > 0, 'no ACK v2 went out');
-  assert.ok(last.length > worstCase,
-    `the ACK carried ${last.length} ranges, no more than the ${worstCase} the worst-case estimate allows`);
-  assert.equal(last[0]!.start, 120,
+  assert.ok(last.ranges.length > worstCase,
+    `the ACK carried ${last.ranges.length} ranges, no more than the ${worstCase} the worst-case estimate allows`);
+  assert.equal(last.ranges[0]!.start, 120,
     'the range nearest cum is missing: the sender cannot see where the real gap ends');
-  assert.equal(last[last.length - 1]!.end, 120 + 120 * (HOLES - 1) + 60,
-    'the newest hole is not in the ACK: the tail can only be recovered by an RTO');
-  // Every hole has to turn up in some ACK. A hole that no ACK names stays
-  // invisible to the sender, which then treats the bytes it covers as
-  // provably missing and retransmits them for the rest of the stream.
-  const seen = new Set<number>();
-  for (const rs of all) for (const r of rs) seen.add(r.start);
-  assert.ok(seen.size > worstCase,
-    `the ACK kept naming the same ${seen.size} holes: the rest are retransmitted forever`);
+  // The cut landed somewhere: if all 40 runs fitted there would be nothing to
+  // check, and the test would pass on the broken ordering too.
+  assert.ok(last.ranges.length < HOLES,
+    'every run fitted the datagram, so this ACK never truncated');
+  for (const a of parsed) {
+    const lastEnd = a.ranges.length ? a.ranges[a.ranges.length - 1]!.end : a.cum!;
+    for (const r of have) {
+      const from = Math.max(r.start, a.cum!);
+      const to = Math.min(r.end, lastEnd);
+      for (let x = from; x < to; x += 20) {
+        assert.ok(a.ranges.some((q) => x >= q.start && x < q.end),
+          `ACK cum=${a.cum} leaves offset ${x} unreported below sackedHigh=${lastEnd}: ` +
+          'the sender will retransmit bytes the peer already holds');
+      }
+    }
+  }
 });
 
 test('STREAM: a host that re-enters from read() must not duplicate or lose bytes', () => {
