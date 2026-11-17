@@ -139,6 +139,10 @@ export class Session {
    *  DPLPMTUD-style binary search between the acked floor and this ceiling
    *  converges in ~3 probes instead of 100 B linear steps. */
   private pmtuCeiling = 0;
+  /** Targets of probes that are still awaiting an answer, oldest first. A probe
+   *  leaves this list when the next one goes out (it timed out) or when the
+   *  peer acknowledges a size at least as large. */
+  private pmtuPending: number[] = [];
   /** Largest symbol this end will accept, independent of its send budget. */
   private rxSymbolMax = 65535;
   private pinnedK: number;
@@ -486,6 +490,14 @@ export class Session {
       if (token === this.pmtuToken && mtu > this.pmtuAckedMtu) {
         this.pmtuAckedMtu = mtu; this.pmtuMtu = mtu;
         this.pmtuProbesLost = 0; this.pmtuBackoffMs = 0;
+        // The peer just proved the path carries this size, so a ceiling that
+        // was written from probes that went unanswered is stale. Leaving it
+        // in place froze the walk one step below a size that demonstrably
+        // works: `ceiling - acked <= PMTU_PROBE_STEP` stops every further
+        // probe, for the rest of the session.
+        if (this.pmtuCeiling > 0 && mtu >= this.pmtuCeiling) this.pmtuCeiling = 0;
+        // Every probe at or below the acknowledged size has been answered.
+        this.pmtuPending = this.pmtuPending.filter((t) => t > mtu);
         this.applyPmtuMtu(mtu, 'ack');
         if (mtu >= this.pmtuMaxMtu && !this.pmtuCeilingLogged) {
           this.pmtuCeilingLogged = true;
@@ -524,6 +536,28 @@ export class Session {
     if (!this.cfg.pmtud) return;
     const gap = Math.max(1000, 5 * this.bbr.srttMs) + this.pmtuBackoffMs;
     if (nowMs - this.pmtuLastProbeMs < gap) return;
+    // A probe that is still outstanding when the next one goes out has timed
+    // out: the peer did not answer it within a full probe gap. The probe that
+    // goes out right now has not had a chance to be answered yet, so it must
+    // not be counted as lost — the verdict used to fire on the third probe at
+    // the instant it was sent, and it pinned the ceiling to a size the peer
+    // was about to answer.
+    if (this.pmtuPending.length) {
+      const timedOut = this.pmtuPending.shift()!;
+      if (++this.pmtuProbesLost >= 3) {
+        this.pmtuProbesLost = 0;
+        this.pmtuBackoffMs = Math.min(PMTU_BACKOFF_MAX_MS, Math.max(1000, this.pmtuBackoffMs * 2));
+        // The ceiling is the smallest size the path is suspected not to
+        // carry: a bigger probe that went unanswered says nothing about a
+        // smaller one.
+        if (this.pmtuCeiling === 0 || timedOut < this.pmtuCeiling) this.pmtuCeiling = timedOut;
+        if (this.pmtuMtu !== this.pmtuAckedMtu) {
+          this.pmtuMtu = this.pmtuAckedMtu;
+          this.applyPmtuMtu(this.pmtuMtu, 'blackhole-fallback');
+        }
+        this.dbg(`[${this.tag()}] PMTU probe ${timedOut} unanswered x3; ceiling=${this.pmtuCeiling} pinned at ${this.pmtuMtu}, backoff=${this.pmtuBackoffMs}ms`);
+      }
+    }
     // Within one step of the proven ceiling: the acked size is the answer,
     // further probing only burns datagrams.
     if (this.pmtuCeiling > 0 && this.pmtuCeiling - this.pmtuAckedMtu <= PMTU_PROBE_STEP) return;
@@ -542,20 +576,8 @@ export class Session {
     this.pmtuProbeMtu = target;
     this.pmtuLastProbeMs = nowMs;
     ++this.pmtuProbesSent;
+    this.pmtuPending.push(target);
     this.dbg(`[${this.tag()}] PMTU probe tx mtu=${target} (cur=${this.pmtuMtu} ceiling=${this.pmtuCeiling || '—'} lost=${this.pmtuProbesLost})`);
-    // Three unacknowledged probes at this size = black hole: that size becomes
-    // the ceiling (binary search halves the next probe), the budget falls back
-    // to the proved size, and the walk backs off.
-    if (++this.pmtuProbesLost >= 3) {
-      this.pmtuProbesLost = 0;
-      this.pmtuBackoffMs = Math.min(PMTU_BACKOFF_MAX_MS, Math.max(1000, this.pmtuBackoffMs * 2));
-      this.pmtuCeiling = target;
-      if (this.pmtuMtu !== this.pmtuAckedMtu) {
-        this.pmtuMtu = this.pmtuAckedMtu;
-        this.applyPmtuMtu(this.pmtuMtu, 'blackhole-fallback');
-      }
-      this.dbg(`[${this.tag()}] PMTU probe ${target} unanswered x3; ceiling=${this.pmtuCeiling} pinned at ${this.pmtuMtu}, backoff=${this.pmtuBackoffMs}ms`);
-    }
   }
 
   /**

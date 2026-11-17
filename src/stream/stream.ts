@@ -330,6 +330,20 @@ export class Stream {
     return Math.max(0, Math.min(this.cfg.sendWindowBytes, this.peerRwnd));
   }
 
+  /**
+   * A DATA segment is a 6-byte header plus at least one payload byte, so a peer
+   * window below that cannot carry a single segment. pump() then computes
+   * payloadRoom = room - 6 <= 0 and sends nothing; with nothing in flight no
+   * RTO can fire; and the persist probe was gated on `window() === 0`, so
+   * there was no deadline either — nextTimerMs() answered -1 and the host
+   * never even woke up. The transfer sat there until the 5-minute idle
+   * timeout. C++ probes the same way: "a peer window that cannot carry it
+   * deadlocks the sender even when the window is not zero".
+   */
+  private windowBlocked(): boolean {
+    return this.window() < STREAM_DATA_HDR_LEN + 1;
+  }
+
   private pump(nowMs: number): void {
     // Burst budget must cover one full ACK cycle (ACK_EVERY_SEGMENTS segments).
     // A fixed byte budget starves the replenish loop once PMTUD grows the
@@ -509,6 +523,22 @@ export class Stream {
     }
     this.oob = merged;
     this.oobBytes = merged.reduce((a, c) => a + c.bytes.length, 0);
+    // Whatever no longer fits is cut from the tail; the sender retransmits it.
+    // The limit counts the host's un-taken backlog too, so the receive side
+    // never holds more than the window rwndOut() advertises. C++ stream_recv.cc
+    // does exactly this ("counting only the buffer would let the receiver hold
+    // twice the window it promised"); the port kept only the chunk-count
+    // ceiling, so oobBytes + deliveryPending reached 1.99x the advertised
+    // window while rwnd already read 0 — and a session with 255 mux streams
+    // multiplies that overshoot.
+    const limit = Math.max(0, this.cfg.rcvBufBytes - this.deliveryPending);
+    while (this.oobBytes > limit && this.oob.length) {
+      const last = this.oob[this.oob.length - 1]!;
+      const excess = Math.min(this.oobBytes - limit, last.bytes.length);
+      last.bytes = last.bytes.subarray(0, last.bytes.length - excess);
+      this.oobBytes -= excess;
+      if (last.bytes.length === 0) this.oob.pop();
+    }
   }
 
   private deliverPrefix(nowMs: number): void {
@@ -521,11 +551,21 @@ export class Stream {
         if (seqAtOrAfter(this.rcvNxt, c.offset) && seqAfter(cEnd, this.rcvNxt)) {
           const skip = seqDist(this.rcvNxt, c.offset);
           const part = c.bytes.subarray(skip);
-          this.deliveryPending += part.length;
-          this.cb.read(part);
-          this.rcvNxt = cEnd;
+          // Detach before handing the bytes to the host: read() may re-enter
+          // with more segments, and a chunk that is no longer at the front
+          // must not be dropped by the splice below. C++ stream_recv.cc does
+          // the same ("pop and advance rcv_nxt first, then call read"). The
+          // port did it the other way round: the re-entrant insert replaced
+          // the queue and the splice removed the wrong chunk, so the same
+          // bytes were delivered again and the reorder counter went negative.
           this.oob.splice(i, 1);
           this.oobBytes -= c.bytes.length;
+          this.rcvNxt = cEnd;
+          this.deliveryPending += part.length;
+          this.cb.read(part);
+          // The host may have closed the stream from inside read(); the
+          // delivery loop stops there, like C++ does.
+          if (this.state === StreamState.Closed) return;
           advanced = true;
           break;
         }
@@ -617,7 +657,17 @@ export class Stream {
     // past sndMax are discarded instead of being trusted: an over-large range
     // would raise sackedHigh and mark real in-flight segments sacked, which
     // suppresses their retransmission and permanently loses them.
-    this.sackRanges = ranges.filter((r) => seqAfter(r.end, r.start) && seqAtOrAfter(this.sndMax, r.end));
+    // The block must also lie above the cumulative point (C++
+    // stream_send.cc): "ignore the SACK half of such an ACK but keep its
+    // cumulative point and window". A block that starts below cum covers the
+    // segment right in front of the hole, and marking that segment SACKed
+    // takes it out of both the fast-retransmit and the RTO paths — the
+    // cumulative point then never advances and the stream hangs until the
+    // idle timeout.
+    this.sackRanges = ranges.filter((r) =>
+      seqAfter(r.end, r.start) &&
+      seqAtOrAfter(r.start, cum) &&
+      seqAtOrAfter(this.sndMax, r.end));
     const prevUna = this.sndUna;
     // A cumulative point that does not move forward is a duplicate or a stale
     // ACK reordered behind a newer one. Moving sndUna backwards would inflate
@@ -638,7 +688,16 @@ export class Stream {
           // A probed segment has two copies in flight even though
           // retransmits stayed 0: the ACK could be for either, so its timing
           // is not a valid RTT sample (Karn). Skip it just like a retransmit.
-          if (sampleMs < 0 && s.retransmits === 0 && !s.probed) sampleMs = Math.max(0, nowMs - s.sentMs);
+          if (sampleMs < 0 && s.retransmits === 0 && !s.probed) {
+            const delta = nowMs - s.sentMs;
+            // A clock that went backwards says nothing about the path: the
+            // sample would be negative and, fed into srtt, would drag every
+            // timer with it. C++ drops it (stream_send.cc). Clamping it to 0
+            // did the opposite: it turned an invalid sample into a *perfect*
+            // 0 ms RTT, which zeroed minRttMs and took the reorder gate's
+            // floor with it (395 ms -> 185 ms on a measured path).
+            if (delta >= 0) sampleMs = delta;
+          }
           // Recovery latency, the opposite question: for a segment that DID
           // need retransmission, how long after its first copy did recovery
           // finally happen. Counted separately from the RTT sample so the two
@@ -903,7 +962,7 @@ export class Stream {
     // pin the host in a 1 ms busy loop. Above the cap the outstanding segments'
     // RTO deadlines drive recovery instead.
     if ((this.pendingBytes > 0 || (this.finPending && !this.finSent)) &&
-        this.window() === 0 && this.tx.length <= 64) {
+        this.windowBlocked() && this.tx.length <= 64) {
       take(this.lastZeroWinProbeMs + ZERO_WINDOW_PROBE_MS - nowMs);
     }
     if (this.tx.length > 0 && this.tlpProbes < TLP_MAX_PROBES && this.window() > 0 &&
@@ -999,10 +1058,12 @@ export class Stream {
         break;
       }
     }
-    // Drain what the burst cap left behind. With a zero peer window pump()
+    // Drain what the burst cap left behind. With a closed peer window pump()
     // cannot emit anything at all (inflight >= window() == 0 breaks on the
-    // first iteration), so that case needs a real one-byte probe.
-    if (this.window() === 0) this.probeZeroWindow(nowMs);
+    // first iteration), so that case needs a real one-byte probe. A window
+    // that is merely too small to carry a segment (1..6 bytes) is the same
+    // deadlock and gets the same probe.
+    if (this.windowBlocked()) this.probeZeroWindow(nowMs);
     else if (this.pendingBytes > 0 || this.finPending) this.pump(nowMs);
   }
 

@@ -96,7 +96,26 @@ const RATE_MAP_MAX = 4096;
  *  exact duplicates are replays or network duplicates, never retries. */
 const BOOT_REPLAY_TTL_MS = 180_000;
 
-function nowMs(): number { return Date.now(); }
+/**
+ * Wall clock, clamped to be monotonic.
+ *
+ * Date.now() can step backwards (an NTP correction, a VM snapshot restore, a
+ * manual clock change). Every protocol timer is a difference of two
+ * timestamps, so a backwards step turns "the RTO expired 200 ms ago" into
+ * "the RTO expires in 30 s": the ARQ, the handshake retry and the PMTUD walk
+ * all freeze until the wall clock catches up. The clamp advances the clock by
+ * exactly the wall-clock delta while the wall clock moves forward, and keeps
+ * it where it is while the wall clock is behind — a backwards step then reads
+ * as "time stood still" instead of "time ran backwards".
+ */
+let clockLastWall = 0;
+let clockMono = 0;
+export function nowMs(): number {
+  const wall = Date.now();
+  if (clockMono === 0) { clockMono = wall; clockLastWall = wall; }
+  else if (wall > clockLastWall) { clockMono += wall - clockLastWall; clockLastWall = wall; }
+  return clockMono;
+}
 
 /**
  * Socket buffer sizing. Node leaves SO_RCVBUF at the OS default — 64 KiB on
@@ -591,7 +610,14 @@ export class TunnelClient {
         localPaused = false;
         sock.resume();
       }
-      if (session && !pendingLocal.length && endPending) {
+      // The FIN is sticky until it has actually reached the tunnel stream:
+      // while the pool session is still handshaking, closeWriteConn is still
+      // the empty placeholder and connStream is null, so consuming the flag
+      // here dropped the local application's half-close on the floor — the
+      // target never saw the EOF, and an origin that only answers after EOF
+      // never answered at all (the local app hung until the idle timeout).
+      // C++ proxy_engine.cc keeps want_fin until the stream exists.
+      if (session && connStream && !pendingLocal.length && endPending) {
         endPending = false;
         closeWriteConn();
       }
@@ -1238,10 +1264,11 @@ export class TunnelServer {
   }
 
   /**
-   * Drain the tunnel->target FIFO with backpressure. Everything queued here is
-   * already consumed (the receive window was released at queue time), so the
-   * queue is bounded by the peer's send window; a `false` from write() keeps
-   * the rest until the socket drains.
+   * Drain the tunnel->target FIFO with backpressure. The queued bytes are
+   * still charged to the receive window: they are consumed only once the
+   * target socket has actually flushed them, so a target that never accepts
+   * the connection closes the window instead of letting the peer pile up
+   * megabytes here.
    */
   private pumpToTarget(t: ServerTunnel): void {
     const sock = t.targetSock;
@@ -1252,7 +1279,10 @@ export class TunnelServer {
       // duplicated every upload chunk that crossed the 16 KB buffer: the target
       // received the same bytes twice and the request stream was corrupted.
       const b = t.pendingToTarget.shift()!;
-      if (!sock.write(b)) break;
+      // The window is released when the bytes reach the target socket, not
+      // when they are queued.
+      const flushed = sock.write(b, () => t.consumeBuf(b.length));
+      if (!flushed) break;
     }
   }
 
@@ -1269,9 +1299,18 @@ export class TunnelServer {
       // bypass pendingToTarget: Node flushes its connect buffer ahead of any
       // later write, so a direct sock.write() here would overtake the OPEN
       // payload and reorder the stream. Everything goes through the FIFO.
+      //
+      // The bytes are NOT consumed here. consumeBuf() is the "the target
+      // application took these bytes" signal, and releasing it at queue time
+      // threw the receive window away: a target whose TCP connect hangs (a
+      // black-holed address keeps connect() pending for the full 10 s) then
+      // buffered every byte the peer sent — 42.7 MB measured, with the peer's
+      // window never closing because deliveryPending stayed at 0. C++
+      // proxy_engine.cc counts the queued bytes towards the window for
+      // exactly this reason ("counting only app_in there would keep the
+      // window open and let the peer grow stream_in without bound").
       if (!t.openOkSent || t.pendingToTarget.length) {
         t.pendingToTarget.push(bytes);
-        t.consumeBuf(bytes.length);
         this.pumpToTarget(t);
         return;
       }
@@ -1294,7 +1333,10 @@ export class TunnelServer {
       return;
     }
     t.openDone = true;
-    t.consumeBuf(bytes.length);
+    // Only the OPEN header is protocol overhead. The coalesced first payload
+    // is application data: it stays charged to the receive window until the
+    // target socket has flushed it (see onStreamBytes / pumpToTarget).
+    t.consumeBuf(bytes.length - rest.length);
     if (rest.length) t.pendingToTarget.push(rest);
     const target = r.value;
     this.dbg(`[${t.key.slice(0, 8)}] OPEN rx target=${targetText(target)}:${target.port} firstPayload=${rest.length}B`);

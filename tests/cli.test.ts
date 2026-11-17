@@ -88,6 +88,20 @@ test('CLI: --fec rejects a malformed shape, an oversized D, and an out-of-range 
   expectReject(['server', `--key=${KEY}`, '--fec=250:7'], /--fec out of range/);
 });
 
+test('CLI: a space-separated value that looks like an option fails loudly', () => {
+  // `--mtu-min -5` used to parse as a switch: the server started on the
+  // default MTU with exit 0 and a "WRN unknown switch" line, so the peer
+  // budget silently disagreed with what was asked for. A value option must
+  // fail the same way it fails for `--mtu-min=99999`.
+  expectReject(['server', '--mtu-min', '-5'], /--mtu-min expects an integer in 128\.\.9000/);
+  expectReject(['speedtest', `--key=${KEY}`, '--seconds', '-5'], /--seconds expects an integer in 3\.\.30/);
+  // The string-valued ones have no range check to run, so the parser itself
+  // has to say that the value is missing.
+  expectReject(['server', '--key', '-abc'], /--key expects a value/);
+  expectReject(['server', `--key=${KEY}`, '-b', '-1'], /-b expects a value/);
+  expectReject(['server', `--key=${KEY}`, '--bind'], /--bind expects a value/);
+});
+
 test('CLI: an invalid --log-level fails instead of silently using info', () => {
   expectReject(['server', `--key=${KEY}`, '--log-level=verbose'], /--log-level expects debug\|info\|warn\|error\|off/);
 });

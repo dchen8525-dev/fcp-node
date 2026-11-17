@@ -45,6 +45,11 @@ export function capsValid(c: HandshakeCaps): boolean {
   return (c.flags & ~CAP_KNOWN_MASK) === 0;
 }
 export function nonceValid(n: Uint8Array): boolean {
+  // The C++ checks a fixed 16-byte array. A short buffer used to pass here:
+  // the missing bytes read as undefined, which ORs to 0, so only the bytes that
+  // were actually present counted — and the failure surfaced two modules
+  // later, as an uncaught throw out of deriveSessionKeyV7.
+  if (n.length < HANDSHAKE_NONCE_LEN) return false;
   let acc = 0;
   for (let i = 0; i < HANDSHAKE_NONCE_LEN; ++i) acc |= n[i];
   return acc !== 0;
@@ -70,6 +75,12 @@ export function tlvEncode(tlvs: HandshakeTlv[], out: Uint8Array, off = 0): numbe
 
 export function tlvParse(block: Uint8Array, len = block.length): HandshakeTlv[] | null {
   const out: HandshakeTlv[] = [];
+  // A claimed length past the block is malformed. Without this guard both
+  // checks below silently passed: `block[off]` read as undefined (which is
+  // not 0, so the reserved-type test missed) and the length arithmetic turned
+  // into NaN < undefined, which is false. The result was a TLV with
+  // `type: undefined` handed to the caller as if it were parsed.
+  if (len > block.length) return null;
   let off = 0;
   while (off < len) {
     if (len - off < TLV_OVERHEAD) return null;
@@ -147,6 +158,12 @@ export function encodePrewarmTlv(ticket: {
 export function decodePrewarmTlv(v: Uint8Array): { initialK: number; srttMs: number; windowKb: number; bwKbps: number; minRttMs: number } | null {
   if (v.length !== 12 || v[0] !== 1) return null;
   const initialK = v[1];
+  // C++ prewarm.cc: a k byte above the "unknown" marker (15) is malformed
+  // outright, and so is any k above the parity ceiling (7) that is not that
+  // marker — k is a 3-bit field on the wire, so 8..255 can never be a
+  // measurement. "A value that cannot be a measurement is a malformed ticket,
+  // not a seed worth honouring."
+  if (initialK > 0x0f) return null;
   if (initialK >= 8 && initialK <= 14) return null;
   return {
     initialK: initialK === 0x0f ? 0 : initialK,

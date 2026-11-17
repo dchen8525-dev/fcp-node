@@ -114,6 +114,27 @@ const KNOWN_OPTS = new Set([
   'log-level', 'log-file', 'seconds', 'speedtest-seconds', 'positional',
 ]);
 
+// Options that take a value. A value separated by a space cannot start with
+// '-' without being indistinguishable from the next option, so such an
+// invocation used to be parsed as a switch: `--mtu-min -5` became "unknown
+// switch --mtu-min ignored" and the tunnel silently ran on the default MTU.
+// That is the "silently fell back to the default" bug class the CLI contract
+// forbids, and the peer budget it produces does not match what was asked for.
+const VALUE_OPTS = new Set([
+  'key', 'bind', 'peer', 'mtu-min', 'fec', 'metrics',
+  'log-level', 'log-file', 'seconds', 'speedtest-seconds',
+]);
+
+// The numeric ones read a leading-'-' token as their value anyway, so the
+// range check produces the precise diagnostic ("expects an integer in
+// 128..9000") instead of a generic "that looks like another option".
+const NUMERIC_OPTS = new Set(['mtu-min', 'seconds', 'speedtest-seconds', 'fec']);
+
+function missingValue(spelling: string, next: string | undefined): Error {
+  const shown = next === undefined ? 'it was given without one' : `"${next}" looks like another option`;
+  return new Error(`${spelling} expects a value: ${shown} (write ${spelling}=VALUE)`);
+}
+
 // Renamed knobs that must fail loudly instead of being dropped as "unknown".
 // Silence would be worse than the error: an ignored `-m 1040` reverts to 1400
 // (peer budget mismatch, every oversize symbol silently dropped) and an
@@ -159,6 +180,8 @@ function parseArgs(argv: string[]): { mode: string; opts: Map<string, string>; f
       if (BOOL_FLAGS.has(name)) { flags.add(name); continue; }
       const next = rest[i + 1];
       if (next !== undefined && !next.startsWith('-')) { opts.set(name, next); ++i; }
+      else if (next !== undefined && NUMERIC_OPTS.has(name)) { opts.set(name, next); ++i; }
+      else if (VALUE_OPTS.has(name)) throw missingValue(`--${name}`, next);
       else flags.add(name);
       continue;
     }
@@ -175,6 +198,8 @@ function parseArgs(argv: string[]): { mode: string; opts: Map<string, string>; f
       if (inline) opts.set(key, inline);
       else if (BOOL_FLAGS.has(key)) flags.add(key);
       else if (next !== undefined && !next.startsWith('-')) { opts.set(key, next); ++i; }
+      else if (next !== undefined && NUMERIC_OPTS.has(key)) { opts.set(key, next); ++i; }
+      else if (VALUE_OPTS.has(key)) throw missingValue(a, next);
       else flags.add(key);
       continue;
     }

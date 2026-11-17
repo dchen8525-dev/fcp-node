@@ -13,12 +13,12 @@ import {
   HELLO_LEN, HELLO_ACK_LEN, CAPS_VERSION, LOCAL_FLAGS_M1, CAP_TLV, CAP_FRAMING,
   CAP_FECSTAT, TLV_TYPE_ACK_V2, TLV_TYPE_PREWARM, TLV_TYPE_ERROR,
   HandshakeRole, HandshakeState, HandshakeError, Direction, SymbolType,
-  TLV_BLOCK_LEN_BYTES,
+  TLV_BLOCK_LEN_BYTES, ENVELOPE_OVERHEAD, FEC_HDR_LEN, PMTU_HEADER_LEN,
 } from '../src/constants.ts';
 import { deriveSessionKeyV7 } from '../src/crypto/keys.ts';
 import { computeMtuLimits, FrameTx, FrameRx, packTxFrame, type TxSymbol } from '../src/fec/frame.ts';
 import { Stream } from '../src/stream/stream.ts';
-import { parseSegment } from '../src/stream/segment.ts';
+import { parseSegment, encodeAckV2, encodeAck } from '../src/stream/segment.ts';
 import { Session, type SessionConfig } from '../src/session/session.ts';
 import {
   socks5ParseGreeting, socks5GreetingReply, socks5ParseRequest, socks5Reply,
@@ -794,4 +794,245 @@ test('FrameRx: a symbol with a conflicting k is rejected as structFail', () => {
   rx.onDatagram(frame(2, 1), 0); // conflicting k=2 -> rejected
   assert.equal(rx.counters.structFail, 1, 'conflicting k counted as structFail');
   assert.equal(rx.view(9)!.orig.size, before, 'conflicting symbol not absorbed into the set');
+});
+
+// ---------------------------------------------------------------------------
+// PMTUD: the probe walk must survive a lost probe answer
+// ---------------------------------------------------------------------------
+
+/** A PMTU ACK is the only 16-byte oob payload on the wire, so its wire length
+ *  is unique: FEC header + envelope overhead + the 16-byte PMTU header. */
+const PMTU_ACK_WIRE_LEN = ENVELOPE_OVERHEAD + FEC_HDR_LEN + PMTU_HEADER_LEN;
+
+/**
+ * A client that walks its MTU up while the peer answers every probe it
+ * receives. `dropAcks` says how many of the peer's answers never arrive, and
+ * `silentPeer` makes the peer answer nothing at all.
+ */
+function pmtudWalk(opts: { dropAcks?: number; silentPeer?: boolean } = {}) {
+  const toServer: Buffer[] = [];
+  const toClient: Buffer[] = [];
+  const base = {
+    psk: PSK, salt: SALT, d: 10, p: 3, mtu: 576, pmtuMaxMtu: 1500,
+  };
+  const client = new Session(
+    { ...base, sendDirection: Direction.C2S, recvDirection: Direction.S2C, role: HandshakeRole.Client, pmtud: true },
+    { sendWire: (w) => toServer.push(Buffer.from(w)), read: () => {}, closed: () => {} },
+  );
+  const server = new Session(
+    { ...base, sendDirection: Direction.S2C, recvDirection: Direction.C2S, role: HandshakeRole.Server, pmtud: false },
+    { sendWire: (w) => toClient.push(Buffer.from(w)), read: () => {}, closed: () => {} },
+  );
+  client.start(0);
+  server.start(0);
+  let now = 0;
+  let dropped = 0;
+  const step = (): void => {
+    now += 20;
+    client.onTick(now);
+    server.onTick(now);
+    while (toServer.length) server.onWire(toServer.shift()!, now);
+    while (toClient.length) {
+      const d = toClient.shift()!;
+      // Only the probe answers are silenced; the handshake still goes through.
+      if (d.length === PMTU_ACK_WIRE_LEN &&
+          (opts.silentPeer || dropped < (opts.dropAcks ?? 0))) { ++dropped; continue; }
+      client.onWire(d, now);
+    }
+  };
+  for (let i = 0; i < 25; ++i) step();                  // handshake
+  assert.equal(client.established, true, 'the pair established');
+  for (let i = 0; i < 1200; ++i) step();                // 24 s of probing
+  return { client, server, dropped };
+}
+
+test('PMTUD: a probe answer that was lost does not freeze the MTU walk', () => {
+  // Symptom: the black-hole verdict was declared on the probe that was being
+  // SENT — it had not had a single millisecond to be answered. Two lost probe
+  // answers were enough: the third probe was declared "unanswered x3", the
+  // ceiling was pinned to the size of that probe, and the peer answered it one
+  // millisecond later. `ceiling - acked <= PMTU_PROBE_STEP` then stopped every
+  // further probe for the rest of the session: the tunnel stayed at 676 B
+  // forever on a path that carried 1500 B, roughly halving throughput with a
+  // single line in the log. The ceiling was never lifted either.
+  const { client, dropped } = pmtudWalk({ dropAcks: 2 });
+  assert.equal(dropped, 2, 'two probe answers were really lost');
+  assert.equal(client.mtuLimits.mtu, 1500,
+    `the walk must continue past the lost answers (stuck at ${client.mtuLimits.mtu} B)`);
+});
+
+test('PMTUD: a peer that answers nothing keeps the MTU at the proven size', () => {
+  // The guard for the fix above: a genuinely silent peer must still stop the
+  // walk, and the budget must fall back to the last size that was proven.
+  const { client } = pmtudWalk({ silentPeer: true });
+  assert.equal(client.mtuLimits.mtu, 576,
+    `a silent peer must not grow the MTU (it reached ${client.mtuLimits.mtu} B)`);
+});
+
+test('STREAM: a peer window too small to carry a segment must not deadlock the sender', () => {
+  // C++ stream_send.cc: "A peer window that cannot carry it deadlocks the
+  // sender even when the window is not zero". A DATA segment is a 6-byte
+  // header plus at least one payload byte, so a peer window of 1..6 bytes
+  // left pump() with no room: it sent nothing, nothing was in flight, so no
+  // RTO could fire, and the persist probe was gated on `window() === 0` —
+  // nextTimerMs() answered -1 and the host never even woke up. The transfer
+  // sat there until the 5-minute idle timeout.
+  for (const rwnd of [1, 3, 6]) {
+    const sent: Buffer[] = [];
+    const s = new Stream(
+      { maxSegment: 1200, initialSrttMs: 40, sendWindowBytes: 256 * 1024,
+        rcvBufBytes: 256 * 1024, idleTimeoutMs: 1e9, ackV2: true },
+      { send: (b) => sent.push(b), read: () => {}, closed: () => {} },
+    );
+    s.onSegment(encodeAckV2(0, rwnd, []), 1);
+    s.write(Buffer.alloc(5000), 2);
+    let now = 2;
+    for (let i = 0; i < 20; ++i) { s.onTick(now); now += 10; }
+    assert.ok(sent.length > 0, `rwnd=${rwnd}: not even a persist probe went out`);
+    assert.ok(s.nextTimerMs(now) > 0, `rwnd=${rwnd}: no deadline, so the host never wakes`);
+    assert.ok(s.pendingQueueBytes < 5000, `rwnd=${rwnd}: the queue never moved`);
+  }
+});
+
+test('STREAM: a backwards wall clock must not poison the RTT estimator', () => {
+  // C++ stream_send.cc: "A clock that went backwards says nothing about the
+  // path: the sample would be negative and, fed into srtt, would drag every
+  // timer with it" — the sample is dropped. Clamping it to 0 did the
+  // opposite: the invalid sample became a *perfect* 0 ms RTT, minRttMs was
+  // zeroed, and the reorder gate lost its floor (395 ms -> 185 ms on a
+  // measured path) — the very gate that keeps a reordering path from being
+  // mistaken for a lossy one.
+  const s = new Stream(
+    { maxSegment: 1200, initialSrttMs: 200, sendWindowBytes: 256 * 1024,
+      rcvBufBytes: 256 * 1024, idleTimeoutMs: 1e9, ackV2: true },
+    { send: () => {}, read: () => {}, closed: () => {} },
+  );
+  s.write(Buffer.alloc(4000), 0);
+  s.onSegment(encodeAckV2(1200, 65535, []), 80);   // a clean 80 ms sample
+  const gateBefore = s.retxAgeGateMs;
+  assert.ok(gateBefore >= 100, `the gate starts high (${gateBefore} ms)`);
+  // The wall clock steps back by 5 s between the send and the ACK.
+  s.write(Buffer.alloc(1200), 120);
+  s.onSegment(encodeAckV2(2400, 65535, []), 120 - 5000);
+  assert.ok(s.retxAgeGateMs >= gateBefore * 0.9,
+    `the reorder gate collapsed on an invalid sample: ${gateBefore} -> ${s.retxAgeGateMs}`);
+});
+
+test('STREAM: the receiver never holds more than the window it advertises', () => {
+  // C++ stream_recv.cc: "counting only the buffer would let the receiver hold
+  // twice the window it promised" — the reorder buffer is trimmed to
+  // rcv_cap - delivery_pending. The port kept only the chunk-count ceiling,
+  // so oobBytes + deliveryPending reached 1.99x the advertised window while
+  // rwnd already read 0, and a session with 255 mux streams multiplies that
+  // overshoot.
+  const CAP = 100 * 1024;
+  let now = 0;
+  const s = new Stream(
+    { maxSegment: 1200, initialSrttMs: 40, sendWindowBytes: 256 * 1024,
+      rcvBufBytes: CAP, idleTimeoutMs: 1e9, ackV2: true },
+    { send: () => {}, read: () => {}, closed: () => {} },   // the app never consumes
+  );
+  const seg = (off: number, n: number) => {
+    const b = Buffer.alloc(6 + n); b[0] = 1; b.writeUInt32LE(off >>> 0, 1); return b;
+  };
+  for (let off = 0; off < CAP - 1; off += 1194) {
+    s.onSegment(seg(off, Math.min(1194, CAP - 1 - off)), now++);
+  }
+  for (let off = CAP + 1000; off < 2 * CAP + 100000; off += 1194) {
+    s.onSegment(seg(off, 1194), now++);
+  }
+  const held = s.reorderBytes + s.deliveryPendingBytes;
+  assert.ok(held <= CAP,
+    `held ${held} bytes > the advertised ${CAP} (${(held / CAP).toFixed(2)}x)`);
+  assert.ok(s.reorderBytes >= 0, `the reorder counter went negative: ${s.reorderBytes}`);
+});
+
+test('STREAM: a host that re-enters from read() must not duplicate or lose bytes', () => {
+  // C++ stream_recv.cc: "Detach before handing bytes to the host: read_ may
+  // re-enter with more segments, and a chunk that is no longer at the front
+  // must not be dropped." The port called read() first and spliced after, so
+  // the re-entrant insert replaced the queue and the splice removed the wrong
+  // chunk: the same bytes were delivered over and over (328 times in the
+  // measurement) and the reorder counter went negative, which lets rwndOut()
+  // advertise more than the buffer can hold.
+  let s: Stream | null = null;
+  const delivered: number[] = [];
+  const seg = (off: number, n: number) => {
+    const b = Buffer.alloc(6 + n); b[0] = 1; b.writeUInt32LE(off >>> 0, 1); return b;
+  };
+  s = new Stream(
+    { maxSegment: 1200, initialSrttMs: 40, sendWindowBytes: 64 * 1024,
+      rcvBufBytes: 64 * 1024, idleTimeoutMs: 1e9, ackV2: true },
+    { send: () => {}, closed: () => {},
+      read: (b) => { delivered.push(b.length); (s as Stream).onSegment(seg(5000, 100), 10); } },
+  );
+  s.onSegment(seg(100, 100), 1);
+  s.onSegment(seg(0, 100), 2);
+  assert.equal(delivered.length, 1, `the same bytes were delivered ${delivered.length} times`);
+  assert.ok(s.reorderBytes >= 0, `the reorder counter went negative: ${s.reorderBytes}`);
+});
+
+test('STREAM: a v1 SACK block below the cumulative point must be ignored', () => {
+  // C++ stream_send.cc: "the block must describe a non-empty range above the
+  // cumulative point ... Ignore the SACK half of such an ACK but keep its
+  // cumulative point and window". The port accepted a block that starts below
+  // cum, and that block covers the segment right in front of the hole: the
+  // segment was marked SACKed, which takes it out of both the fast-retransmit
+  // and the RTO paths, so the cumulative point never advanced and the stream
+  // hung until the idle timeout.
+  const s = new Stream(
+    { maxSegment: 1200, initialSrttMs: 40, sendWindowBytes: 64 * 1024,
+      rcvBufBytes: 64 * 1024, idleTimeoutMs: 1e9 },
+    { send: () => {}, read: () => {}, closed: () => {} },
+  );
+  s.write(Buffer.alloc(12000), 0);
+  s.onTick(1); s.onTick(2);
+  s.onSegment(encodeAck(6000, 65535, 1000, 7164), 10);
+  const tx = (s as unknown as { tx: Array<{ end: number; sacked: boolean }> }).tx;
+  const above = tx.filter((x) => x.end > 6000);
+  assert.ok(above.length > 0, 'the segments are in flight');
+  assert.equal(above.filter((x) => x.sacked).length, 0,
+    'a block below the cumulative point marked an unacked segment as delivered');
+});
+
+test('HANDSHAKE: a short local nonce is refused at construction, not at key derivation', () => {
+  // nonceValid() checked 16 bytes of a buffer that could be shorter: the
+  // missing bytes read as undefined, which ORs to 0, so a 3-byte nonce
+  // passed the check and the failure only appeared two modules later — as an
+  // uncaught throw out of deriveSessionKeyV7, on the UDP receive path.
+  const h = new Handshake({
+    localD: 10, localP: 6, role: HandshakeRole.Client,
+    localNonce: Buffer.from([1, 2, 3]),
+    send: () => {},
+  });
+  assert.equal(h.failed, true, 'the short nonce must be refused');
+  assert.equal(h.error, HandshakeError.BadNonce);
+  // A full-length nonce is still fine.
+  const ok = new Handshake({
+    localD: 10, localP: 6, role: HandshakeRole.Client,
+    localNonce: Buffer.alloc(16, 3),
+    send: () => {},
+  });
+  assert.equal(ok.failed, false);
+});
+
+test('HANDSHAKE: a TLV block that claims more than it holds is malformed', () => {
+  // The claimed length ran past the block: `block[off]` read as undefined
+  // (which is not 0, so the reserved-type test missed) and the length
+  // arithmetic became NaN < undefined, which is false — both guards passed
+  // and the caller got a TLV with `type: undefined` as if it were parsed.
+  assert.equal(tlvParse(Buffer.from([1, 5, 0, 0]), 10), null);
+  assert.equal(tlvParse(Buffer.from([1, 5, 0, 0]), 4), null, 'the value does not fit the block');
+  assert.equal(tlvParse(Buffer.from([1, 2, 0xaa, 0xbb]), 4)!.length, 1, 'a legal block still parses');
+});
+
+test('HANDSHAKE: a prewarm ticket with an impossible k is malformed', () => {
+  // C++ prewarm.cc: k is a 3-bit field on the wire, so anything above the
+  // parity ceiling (7) that is not the "unknown" marker (15) cannot be a
+  // measurement — "a value that cannot be a measurement is a malformed
+  // ticket, not a seed worth honouring".
+  const v = Buffer.alloc(12); v[0] = 1; v[1] = 200;
+  assert.equal(decodePrewarmTlv(v), null);
+  const ok = Buffer.alloc(12); ok[0] = 1; ok[1] = 6;
+  assert.ok(decodePrewarmTlv(ok), 'a legal k still decodes');
 });

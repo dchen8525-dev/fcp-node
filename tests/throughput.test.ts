@@ -133,6 +133,28 @@ test('FEC: the peer report wins over the local fallback', () => {
   assert.equal(fec.currentLoss(), 0, 'and does not overwrite the peer loss rate');
 });
 
+test('FEC: a small peer report already hands k over to the peer', () => {
+  // The local ledger observes the INBOUND direction while k governs the
+  // OUTBOUND one, so it may only speak when the peer is silent. `peerReports`
+  // used to be set only once the peer's samples crossed the 256-shard noise
+  // floor, so on a slow path (~120 KB/s) both controllers drove k at the same
+  // time: the peer reported its loss, the inbound ledger reported a clean
+  // path, and after FEC_DROP_STREAK samples the wrong direction won — the
+  // outbound parity was driven to the floor on exactly the link that needed
+  // it. The peer's own samples still accumulate and decide, one interval
+  // later.
+  const fec = new AdaptiveFec({ d: 10, p: 6 });
+  for (let i = 1; i <= 6; ++i) {
+    const now = i * 1000;
+    // A report below the noise floor: no k decision yet, but the peer is alive.
+    fec.onFecstat({ setsFull: 2, setsPartial: 0, dataExpected: 40, dataRxOrig: 20 } as never, now);
+    // The inbound direction is clean; the local ledger would push k down.
+    fec.noteLocalCounters(1000, 1000, now);
+  }
+  assert.equal(fec.currentK(), 3, 'the local ledger must not move k while the peer reports');
+  assert.equal(fec.currentLoss(), 0, 'and it must not overwrite the peer loss rate either');
+});
+
 /** Feed `rounds` FECSTAT reports, each covering 100 groups of d=10 shards at
  *  the given shard-loss percentage. Counters accumulate because the controller
  *  works on per-report deltas. */

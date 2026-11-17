@@ -164,6 +164,14 @@ export class AdaptiveFec {
   onFecstat(stat: FecstatPacket, nowMs = 0): void {
     if (this.pinnedK > 0) return;
     if (nowMs > 0) this.lastPeerReportMs = nowMs;
+    // The peer IS reporting, so the local ledger steps aside. This used to be
+    // set only once the peer's samples crossed the noise floor, and on a slow
+    // path (< 256 shards per report) it never did: both controllers drove k at
+    // once, and the ledger — which measures the INBOUND direction, while k
+    // governs the OUTBOUND one — could undo the peer's decision with the
+    // wrong direction's loss rate. The peer's own samples keep accumulating
+    // and decide one interval later.
+    this.peerReports = true;
     // FECSTAT counters are per interval (the reporter emits deltas), exactly
     // like the C++ settlement view. `data_expected` is Σ n_used over the sets
     // settled in this interval, so short flush groups cannot inflate the
@@ -180,14 +188,12 @@ export class AdaptiveFec {
       const evalOrig = this.pendOrig;
       this.pendExpected = 0;
       this.pendOrig = 0;
-      this.peerReports = true;
       const lost = Math.max(0, Math.min(evalExpected, evalExpected - evalOrig));
       this.adjust(lost / evalExpected, 'fecstat_loss');
       return;
     }
     this.pendExpected = 0;
     this.pendOrig = 0;
-    this.peerReports = true;
     const lost = Math.max(0, Math.min(expected, expected - rxOrig));
     this.adjust(lost / expected, 'fecstat_loss');
   }
