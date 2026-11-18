@@ -64,16 +64,17 @@ test('golden: pack_type_k and FEC header (tests/hdr_test.cc:9-27)', () => {
   assert.equal(packTypeK(7, 7, 1), 0xfd);
   assert.equal(packTypeK(0, 0, 2), 0x02);
   assert.equal(packTypeK(0, 0, 3), 0x03);
-  const bytes = packHdr({ setId: 0x04030201, index: 5, typeK: packTypeK(1, 0, 0) });
-  assert.equal(hex(bytes), '010203040520');
+  const bytes = packHdr({ setId: 0x04030201, index: 5, d: 10, typeK: packTypeK(1, 0, 0) });
+  assert.equal(hex(bytes), '01020304050a20');
   const parsed = parseHdr(bytes)!;
   assert.equal(parsed.setId, 0x04030201);
   assert.equal(parsed.index, 5);
+  assert.equal(parsed.d, 10);
   assert.equal(parsed.typeK, 0x20);
   assert.equal(hdrType(parsed.typeK), 0);
   assert.equal(hdrK(parsed.typeK), 1);
   assert.equal(hdrJ(parsed.typeK), 0);
-  assert.equal(parseHdr(bytes.subarray(0, 5)), null);
+  assert.equal(parseHdr(bytes.subarray(0, 6)), null);
 });
 
 test('golden: Reed-Solomon parity bytes (tests/rs_test.cc:24-50)', () => {

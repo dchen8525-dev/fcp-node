@@ -92,16 +92,22 @@ test('stateless reset bypasses the replay window', () => {
 });
 
 test('FEC header: pack/parse/validate', () => {
-  const h = packHdr({ setId: 0x12345678, index: 3, typeK: (3 << 5) | (1 << 2) | 1 });
-  assert.equal(hex(h), '785634120365');
+  const h = packHdr({ setId: 0x12345678, index: 3, d: 10, typeK: (3 << 5) | (1 << 2) | 1 });
+  assert.equal(hex(h), '78563412030a65');
   const p = parseHdr(h)!;
-  assert.deepEqual(p, { setId: 0x12345678, index: 3, typeK: 0x65 });
+  assert.deepEqual(p, { setId: 0x12345678, index: 3, d: 10, typeK: 0x65 });
   assert.equal(hdrType(p.typeK), 1);
   assert.equal(hdrK(p.typeK), 3);
   assert.equal(hdrJ(p.typeK), 1);
-  assert.equal(validateHdr(p, 10, 13, true, 3), HdrStatus.Ok);
-  assert.equal(validateHdr(parseHdr(packHdr({ setId: 1, index: 3, typeK: packTypeK(3, 0, 0) }))!, 10, 13, true, 3), HdrStatus.DataPastKnownN);
-  assert.equal(validateHdr(parseHdr(packHdr({ setId: 1, index: 0, typeK: packTypeK(0, 0, 3) }))!, 10, 13, false, 0), HdrStatus.InvalidType);
+  assert.equal(validateHdr(p, 3, true, 3), HdrStatus.Ok);
+  assert.equal(validateHdr(parseHdr(packHdr({ setId: 1, index: 3, d: 10, typeK: packTypeK(3, 0, 0) }))!, 3, true, 3), HdrStatus.DataPastKnownN);
+  assert.equal(validateHdr(parseHdr(packHdr({ setId: 1, index: 0, d: 10, typeK: packTypeK(0, 0, 3) }))!, 3, false, 0), HdrStatus.InvalidType);
+  // A set that declares its own group size validates against that, not against
+  // whatever the session negotiated: d=4 with index 5 is out of range even
+  // though the session ceiling is 10.
+  assert.equal(validateHdr(parseHdr(packHdr({ setId: 1, index: 5, d: 4, typeK: packTypeK(3, 0, 0) }))!, 3, false, 0), HdrStatus.DataIndexPastD);
+  assert.equal(validateHdr(parseHdr(packHdr({ setId: 1, index: 7, d: 4, typeK: packTypeK(3, 0, 0) }))!, 3, false, 0), HdrStatus.IndexPastS);
+  assert.equal(validateHdr(parseHdr(packHdr({ setId: 1, index: 0, d: 0, typeK: packTypeK(3, 0, 0) }))!, 3, false, 0), HdrStatus.BadD);
 });
 
 test('RS systematic codec recovers up to k erasures', () => {
@@ -143,16 +149,16 @@ test('FECSTAT: 128-byte layout round-trip and validator', () => {
 
 test('MTU limits match frame_tx.h static_assert', () => {
   const a = computeMtuLimits(1400, 20);
-  assert.equal(a.payloadMax, 1336);
-  assert.equal(a.symbolMax, 1338);
-  assert.equal(a.mss, 1312);
+  assert.equal(a.payloadMax, 1335);   // 1372 - 37 (envelope 28 + hdr 7 + len 2)
+  assert.equal(a.symbolMax, 1337);    // 1372 - 35 (envelope 28 + hdr 7)
+  assert.equal(a.mss, 1311);          // payloadMax - 24 byte stream reserve
   const b = computeMtuLimits(1400, 40);
-  assert.equal(b.payloadMax, 1316);
-  assert.equal(b.mss, 1292);
+  assert.equal(b.payloadMax, 1315);
+  assert.equal(b.mss, 1291);
   assert.equal(computeMtuLimits(80, 20).valid, false);
   const oob = packOobFrame(Buffer.from('FCPKAL1\0', 'latin1'));
-  assert.equal(oob.length, 6 + 8);
-  assert.equal(oob[0], 0); assert.equal(oob[4], 0); assert.equal(oob[5], 2);
+  assert.equal(oob.length, 7 + 8);
+  assert.equal(oob[0], 0); assert.equal(oob[4], 0); assert.equal(oob[5], 0); assert.equal(oob[6], 2);
 });
 
 test('wire: uvarint, LE/BE, modular sequence', () => {

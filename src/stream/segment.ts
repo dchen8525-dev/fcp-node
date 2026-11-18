@@ -6,13 +6,14 @@ import {
   STREAM_TYPE_DATA, STREAM_TYPE_ACK, STREAM_TYPE_RST, STREAM_TYPE_ACK_V2,
   STREAM_DATA_HDR_LEN, STREAM_ACK_LEN, STREAM_ACK_V2_MIN_LEN,
   STREAM_ACK_V2_MAX_RANGES, STREAM_RST_LEN, STREAM_FLAG_FIN, STREAM_RST_ABORT,
+  ACK_V2_FLAG_COPY,
 } from '../constants.ts';
 import { getLe32, putLe32, putUvarint, getUvarint, seqAfter, seqAtOrAfter, seqDist } from '../wire.ts';
 
 export type Segment =
   | { type: typeof STREAM_TYPE_DATA; seq: number; flags: number; payload: Buffer }
   | { type: typeof STREAM_TYPE_ACK; cum: number; rwnd: number; sackStart: number; sackEnd: number }
-  | { type: typeof STREAM_TYPE_ACK_V2; cum: number; rwnd: number; ranges: Array<{ start: number; end: number }> }
+  | { type: typeof STREAM_TYPE_ACK_V2; cum: number; rwnd: number; ranges: Array<{ start: number; end: number }>; copy: boolean }
   | { type: typeof STREAM_TYPE_RST; code: number };
 
 export function encodeData(seq: number, flags: number, payload: Uint8Array): Buffer {
@@ -32,7 +33,7 @@ export function encodeAck(cum: number, rwnd: number, sackStart: number, sackEnd:
   putLe32(sackEnd, out, 13);
   return out;
 }
-export function encodeAckV2(cum: number, rwnd: number, blocks: Array<{ start: number; end: number }>): Buffer {
+export function encodeAckV2(cum: number, rwnd: number, blocks: Array<{ start: number; end: number }>, copy = false): Buffer {
   const out = Buffer.alloc(STREAM_ACK_V2_MIN_LEN + STREAM_ACK_V2_MAX_RANGES * 10);
   out[0] = STREAM_TYPE_ACK_V2;
   putLe32(cum, out, 1);
@@ -49,7 +50,11 @@ export function encodeAckV2(cum: number, rwnd: number, blocks: Array<{ start: nu
     prevEnd = b.end;
     ++n;
   }
-  out[9] = n;
+  // Bit 7 of the range count marks a redundant copy of some other ACK. The
+  // count never exceeds 64, so the bit is free; a receiver that has already
+  // seen this exact ACK content must not treat the copy as fresh loss
+  // evidence (DUP_ACK_THRESH is 1, so it would trigger a spurious retransmit).
+  out[9] = n | (copy ? ACK_V2_FLAG_COPY : 0);
   return out.subarray(0, off);
 }
 export function encodeRst(code = STREAM_RST_ABORT): Buffer {
@@ -80,7 +85,8 @@ export function parseSegment(input: Uint8Array, len = input.length): Segment | n
   if (type === STREAM_TYPE_ACK_V2) {
     if (len < STREAM_ACK_V2_MIN_LEN) return null;
     const cum = getLe32(input, 1), rwnd = getLe32(input, 5);
-    const declared = Math.min(input[9], STREAM_ACK_V2_MAX_RANGES);
+    const declared = Math.min(input[9] & ~ACK_V2_FLAG_COPY, STREAM_ACK_V2_MAX_RANGES);
+    const copy = (input[9] & ACK_V2_FLAG_COPY) !== 0;
     const state = { off: STREAM_ACK_V2_MIN_LEN };
     const ranges: Array<{ start: number; end: number }> = [];
     let prevEnd = cum;
@@ -96,7 +102,7 @@ export function parseSegment(input: Uint8Array, len = input.length): Segment | n
       prevEnd = end;
     }
     if (state.off !== len) return null;
-    return { type, cum, rwnd, ranges };
+    return { type, cum, rwnd, ranges, copy };
   }
   return null; // unknown type: ignored, counted as bad_segs
 }

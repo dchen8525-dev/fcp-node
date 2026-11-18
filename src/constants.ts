@@ -3,7 +3,19 @@
 // 效力顺序（docs/文档索引.md §2）：C++ 代码 > 详细设计 > 协议规格 > README。
 // 与规格文档冲突处以代码为准，差异登记在 docs/兼容矩阵与差异.md。
 
-export const FEC_HDR_LEN = 6;
+// FEC header v2 (7 bytes):
+//   offset 0  set_id u32 LE
+//   offset 4  index  u8
+//   offset 5  d      u8   data shards this set was built with
+//   offset 6  type_k = (k << 5) | (j << 2) | type
+//
+// `d` used to be a session constant, so both ends had to agree on it for the
+// whole session and the receiver could only validate against the negotiated
+// ceiling. Carrying it per symbol makes every set self-describing: the sender
+// may resize groups while a session is running (adaptive d) and the decoder
+// still knows the exact geometry of the set in front of it, instead of
+// inferring it from how many data indices happened to show up.
+export const FEC_HDR_LEN = 7;
 export const MAX_S = 256;
 export const MAX_PARITY = 7;
 
@@ -107,6 +119,42 @@ export const GF256_POLY = 0x11d;
 export const RS_MAX_SHARDS = 256;
 export const RS_MAX_PARITY = 7;
 
+// FEC interleaving / adaptive group size
+/** Interleave depth ceiling: the sender keeps this many repair groups open and
+ *  round-robins segments across them, so a burst of B consecutive datagram
+ *  losses lands B/L in each group instead of B in one. */
+export const MAX_INTERLEAVE = 8;
+/** Smallest group the adaptive controller may pick. Below this the parity
+ *  granularity gets coarse (k/d jumps by 1/d per step) and the set rate climbs. */
+export const D_FLOOR = 4;
+/** Ceiling on full groups per second, used to reject a d so small that the
+ *  receiver would evict unaccounted sets faster than it settles them
+ *  (MAX_ACTIVE_SETS = 256 over a 2 s settle window). */
+export const MAX_SETS_PER_SECOND = 150;
+/** A d change is only applied when it moves by at least this much, so the
+ *  controller cannot chatter between two adjacent values every tick. */
+export const D_STEP_MIN = 2;
+/** Minimum spacing between d changes. One FECSTAT interval of evidence. */
+export const D_ADAPT_INTERVAL_MS = 2000;
+
+// ACK redundancy
+/** Copies of every ACK put on the wire. 1 disables the feature.
+ *
+ *  Off by default, and that is a measured choice, not caution. Each copy costs
+ *  the *receiver* one more encrypt+send per ACK, so the price scales with the
+ *  ACK rate: on a loopback run at 7-10k datagrams/s, --ack-copies=2 cut
+ *  goodput from 11-15 MB/s to 5.6-8.7 MB/s and three copies to 6.6-7.0 MB/s,
+ *  with interleaving at 4 lanes costing nothing on the same runs. The path this
+ *  is deployed on loses 1.6% and already retransmits ~0, so there is nothing to
+ *  win there. It stays a knob for a link whose *uplink* is the lossy side. */
+export const MAX_ACK_COPIES = 4;
+/** Bit 7 of the ACK v2 range-count byte marks a redundant copy. The count
+ *  itself never exceeds 64, so the bit is free. */
+export const ACK_V2_FLAG_COPY = 0x80;
+/** How many recent ACK signatures the receiver remembers, so a copy that
+ *  arrives after a newer ACK still cannot be mistaken for fresh loss evidence. */
+export const ACK_SIG_RING = 4;
+
 // Defaults (defaults.h)
 export const DEFAULT_D = 10;
 export const DEFAULT_P = 6;
@@ -206,8 +254,8 @@ export const LogSeverity = { Debug: 10, Info: 20, Warn: 30, Error: 40, Off: 100 
 
 // Frame / MTU (frame_tx.h)
 export const FRAME_ENVELOPE_OVERHEAD = 28;
-export const DATA_WIRE_OVERHEAD = 36;   // 28 + 6 + 2
-export const PARITY_WIRE_OVERHEAD = 34; // 28 + 6
+export const DATA_WIRE_OVERHEAD = 37;   // 28 + 7 + 2
+export const PARITY_WIRE_OVERHEAD = 35; // 28 + 7
 export const KCP_HEADER_RESERVE = 24;   // legacy reserve, no KCP implementation exists
 export const MIN_FLUSH_MS = 25;
 export const MAX_FLUSH_MS = 200;

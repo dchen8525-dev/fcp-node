@@ -48,6 +48,8 @@ function traceStreamInterval(
   sink.write(JSON.stringify({
     t: 'stream',
     k: st.k,
+    d: st.d,
+    lanes: st.lanes,
     loss: s.fecLoss,
     srtt: st.srttMs,
     retx: s.segsRetransmitted,
@@ -68,6 +70,10 @@ export interface TunnelOptions {
   /** PMTUD ceiling: the walk never goes above this. */
   pmtuMaxMtu?: number;
   d?: number; p?: number;
+  /** Repair groups kept open in parallel (1 = no interleaving). */
+  interleave?: number;
+  /** Redundant copies of every ACK v2 (1 = off). */
+  ackCopies?: number;
   pinnedK?: number;
   ack_v2?: boolean; pmtud?: boolean; keyUpdate?: boolean;
   log?: (line: string) => void;
@@ -343,6 +349,7 @@ export class TunnelClient {
       sendDirection: Direction.C2S, recvDirection: Direction.S2C,
       role: HandshakeRole.Client,
       d: this.opts.d ?? DEFAULT_D, p: this.opts.p ?? DEFAULT_P,
+      interleave: this.opts.interleave, ackCopies: this.opts.ackCopies,
       mtu: this.opts.mtu ?? DEFAULT_MTU_MIN,
       pmtuMaxMtu: this.opts.pmtuMaxMtu,
       pinnedK: this.opts.pinnedK,
@@ -537,7 +544,7 @@ export class TunnelClient {
         traceStreamInterval(b.trace, b.session, st);
         this.dbg(`stats inflight=${b.session.inflightBytes}B rwnd=${b.session.peerWindowBytes}B ` +
           `queued=${b.session.queuedBytes}B retx=${b.session.segsRetransmitted}/${b.session.segsSent} ` +
-          `retxSplit=${b.session.retxSplit} k=${st.k} loss=${(b.session.fecLoss * 100).toFixed(1)}% srtt=${st.srttMs}ms ` +
+          `retxSplit=${b.session.retxSplit} k=${st.k} d=${st.d} L=${st.lanes} loss=${(b.session.fecLoss * 100).toFixed(1)}% srtt=${st.srttMs}ms ` +
           `sendBw=${(b.session.sendRateBytesPerMs * 1000 / 1048576).toFixed(2)}MB/s ` +
           `recvNext=${b.session.recvNext} ` +
           `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B ` +
@@ -1129,7 +1136,7 @@ export class TunnelServer {
         traceStreamInterval(b.trace, b.session, st);
         this.dbg(`stats inflight=${b.session.inflightBytes}B rwnd=${b.session.peerWindowBytes}B ` +
           `queued=${b.session.queuedBytes}B retx=${b.session.segsRetransmitted}/${b.session.segsSent} ` +
-          `retxSplit=${b.session.retxSplit} k=${st.k} loss=${(b.session.fecLoss * 100).toFixed(1)}% srtt=${st.srttMs}ms ` +
+          `retxSplit=${b.session.retxSplit} k=${st.k} d=${st.d} L=${st.lanes} loss=${(b.session.fecLoss * 100).toFixed(1)}% srtt=${st.srttMs}ms ` +
           `sendBw=${(b.session.sendRateBytesPerMs * 1000 / 1048576).toFixed(2)}MB/s ` +
           `recvNext=${b.session.recvNext} ` +
           `reorder=${b.session.reorderBytes}B delivPending=${b.session.recvPendingBytes}B ` +
@@ -1194,6 +1201,7 @@ export class TunnelServer {
       sendDirection: Direction.S2C, recvDirection: Direction.C2S,
       role: HandshakeRole.Server,
       d: this.opts.d ?? DEFAULT_D, p: this.opts.p ?? DEFAULT_P,
+      interleave: this.opts.interleave, ackCopies: this.opts.ackCopies,
       mtu: this.opts.mtu ?? DEFAULT_MTU_MIN,
       pmtuMaxMtu: this.opts.pmtuMaxMtu,
       pinnedK: this.opts.pinnedK,

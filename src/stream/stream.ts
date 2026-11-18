@@ -21,7 +21,7 @@ import {
   MIN_OOB_CHUNKS, MAX_OOB_CHUNKS,
   TLP_MIN_PTO_MS, TLP_MAX_PROBES,
   HOLE_DUP_ACK_MIN_MS, HOLE_DUP_ACK_DIVISOR, RETX_LAT_SAMPLES,
-  STREAM_ACK_V2_MIN_LEN, STREAM_ACK_V2_MAX_RANGES,
+  STREAM_ACK_V2_MIN_LEN, STREAM_ACK_V2_MAX_RANGES, ACK_SIG_RING,
 } from '../constants.ts';
 import {
   seqAfter, seqAtOrAfter, seqDist, getLe32, putLe32, uvarintSize,
@@ -106,6 +106,13 @@ export class Stream {
   // made a delivered segment clear the duplicate-ACK tally, so fast retransmit
   // either fired spuriously or never armed.
   private lastAckCum = 0; private haveAckCum = false; private dupAcks = 0;
+  /** Ring of recent ACK content signatures. A flagged redundant copy whose
+   *  content is already in here carries no new information and must not reach
+   *  the dup-ack counter: DUP_ACK_THRESH is 1, so an un-suppressed copy would
+   *  trigger a retransmit of data the peer already holds. */
+  private ackSigRing: number[] = [];
+  private ackSigIdx = 0;
+  ackCopiesDropped = 0;
   /** Measurement: ACKs that could not carry every received run, and how many
    *  runs were left out. See keepAckRanges() and scripts/ack-probe.ts. */
   private ackTruncCount = 0; private ackDropCount = 0;
@@ -421,8 +428,8 @@ export class Stream {
     this.lastInboundMs = Math.max(this.lastInboundMs, nowMs);
     switch (seg.type) {
       case STREAM_TYPE_DATA: this.onData(seg, nowMs); break;
-      case STREAM_TYPE_ACK: this.onAck(seg.cum, seg.rwnd, [{ start: seg.sackStart, end: seg.sackEnd }], nowMs); break;
-      case STREAM_TYPE_ACK_V2: this.onAck(seg.cum, seg.rwnd, seg.ranges, nowMs); break;
+      case STREAM_TYPE_ACK: this.onAck(seg.cum, seg.rwnd, [{ start: seg.sackStart, end: seg.sackEnd }], nowMs, false); break;
+      case STREAM_TYPE_ACK_V2: this.onAck(seg.cum, seg.rwnd, seg.ranges, nowMs, seg.copy); break;
       case STREAM_TYPE_RST: this.finish('reset'); break;
       default: ++this.badSegs; break;
     }
@@ -728,8 +735,19 @@ export class Stream {
     this.cb.send(encodeAck(cum, rwnd, sackStart, sackEnd));
   }
 
-  private onAck(cum: number, rwnd: number, ranges: Array<{ start: number; end: number }>, nowMs: number): void {
+  private onAck(cum: number, rwnd: number, ranges: Array<{ start: number; end: number }>, nowMs: number, copy = false): void {
     if (seqAfter(cum, this.sndMax)) { ++this.badSegs; return; }
+    // Redundant copies are sent by the peer to survive an ACK loss. When the
+    // original (or an earlier copy) already arrived, this one describes state
+    // we have processed: it must not count as a duplicate ACK, which at
+    // DUP_ACK_THRESH = 1 would fire a retransmit on every single ACK. The ring
+    // rather than a single slot matters because interleaving deliberately
+    // separates the copies, so a real ACK can land between two of them.
+    if (copy) {
+      const sig = ackSignature(cum, rwnd, ranges);
+      if (this.ackSigRing.includes(sig)) { ++this.ackCopiesDropped; return; }
+    }
+    this.rememberAckSig(ackSignature(cum, rwnd, ranges));
     this.peerRwnd = rwnd;
     // A SACK block can never describe bytes this side has not sent. Ranges
     // past sndMax are discarded instead of being trusted: an over-large range
@@ -1185,4 +1203,27 @@ export class Stream {
     this.tx = []; this.pending = []; this.oob = [];
     this.cb.closed(reason);
   }
+
+  private rememberAckSig(sig: number): void {
+    this.ackSigRing[this.ackSigIdx % ACK_SIG_RING] = sig;
+    this.ackSigIdx = (this.ackSigIdx + 1) % ACK_SIG_RING;
+  }
+}
+
+/**
+ * Content hash of one ACK. Two ACKs with the same cum, window and SACK ranges
+ * say exactly the same thing, so the hash is a faithful "have I already acted
+ * on this" test rather than an approximation of one.
+ */
+function ackSignature(cum: number, rwnd: number, ranges: Array<{ start: number; end: number }>): number {
+  let h = 0x811c9dc5;
+  const mix = (v: number): void => {
+    h ^= v & 0xff; h = Math.imul(h, 0x01000193);
+    h ^= (v >>> 8) & 0xff; h = Math.imul(h, 0x01000193);
+    h ^= (v >>> 16) & 0xff; h = Math.imul(h, 0x01000193);
+    h ^= (v >>> 24) & 0xff; h = Math.imul(h, 0x01000193);
+  };
+  mix(cum); mix(rwnd); mix(ranges.length);
+  for (const r of ranges) { mix(r.start); mix(r.end); }
+  return h >>> 0;
 }

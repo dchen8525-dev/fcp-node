@@ -7,6 +7,7 @@ import {
   DEFAULT_D, DEFAULT_P, DEFAULT_SRTT_MS,
   FECSTAT_INTERVAL_MS, MAX_PARITY,
   BBR_BW_WINDOW_MS, FEC_HEADROOM, FEC_DROP_STREAK, FEC_LOSS_MIN_SHARDS,
+  D_FLOOR, MAX_SETS_PER_SECOND,
   FLG_DIRECTION, FLG_LEDGER, FLG_TAIL_DROPPED, FLG_LATE_RECOVERY,
   type DirectionValue,
 } from '../constants.ts';
@@ -86,6 +87,8 @@ export class AdaptiveFec {
     this.trace = cfg.trace;
   }
   currentK(): number { return this.k; }
+  /** Negotiated parity ceiling k may climb to. */
+  currentParityCeiling(): number { return this.p; }
   /** Fraction of inbound data shards that had to be reconstructed. */
   currentLoss(): number { return this.lossRate; }
 
@@ -235,8 +238,47 @@ export class AdaptiveFec {
   }
 }
 
-/** BBR v1/v2 lite: only exposes pacing/srtt hints to the reactor. */
-export class BbrLite {
+/**
+ * Group size for the next repair group.
+ *
+ * `k = ceil(d x loss x HEADROOM)` is a per-group count, so d decides how
+ * finely the redundancy can be aimed and whether the aim is achievable at all.
+ * Two bounds fight over it:
+ *
+ *  - Tail coverage: once `d x loss x HEADROOM` reaches the negotiated parity
+ *    ceiling p, the formula saturates. Adding data symbols then only widens
+ *    the group while k/d falls, so the tail gets fatter at the same overhead.
+ *    Cutting d until k fits under p restores the ratio, and a smaller group
+ *    also concentrates the binomial, which is why 10:6 beats 20:6 at 20% loss.
+ *  - Settle rate: a group is `d` symbols, and the receiver settles it 1 s after
+ *    its first symbol and retires it at 2 s. If groups are produced faster than
+ *    MAX_SETS_PER_SECOND the active-set map fills and sets get evicted
+ *    half-decoded. This one is a correctness bound, so it overrides the above.
+ *
+ * `p === 0` (framing without repair) leaves d alone: it only groups set ids.
+ */
+export function chooseGroupD(o: {
+  dMax: number; p: number; loss: number; symPerSec: number;
+}): number {
+  const dMax = Math.max(1, o.dMax);
+  let d = dMax;
+  if (o.p > 0 && o.loss > 0) {
+    // The epsilon keeps 0.4 x 3 = 1.2000000000000002 from turning an exact
+    // 6/1.2 = 5 into 4.
+    const byTail = Math.floor(o.p / (o.loss * FEC_HEADROOM) + 1e-9);
+    if (byTail < d) d = Math.max(D_FLOOR, byTail);
+  }
+  if (o.symPerSec > 0) {
+    const byRate = Math.ceil(o.symPerSec / MAX_SETS_PER_SECOND);
+    if (byRate > d) d = byRate;
+  }
+  if (d > dMax) d = dMax;
+  // D_FLOOR is a preference, not a licence to exceed the negotiated ceiling:
+  // with --fec=2:6 the session runs d=2 and every bound above must respect it.
+  return Math.max(1, Math.min(dMax, d));
+}
+
+/** BBR v1/v2 lite: only exposes pacing/srtt hints to the reactor. */export class BbrLite {
   version: 1 | 2 = 2;
   srttMs: number;
   minRttMs = 0;

@@ -12,7 +12,7 @@ import {
   AHEAD_CONFIRM_TIMEOUT_MS, FRAME_ENVELOPE_OVERHEAD, DATA_WIRE_OVERHEAD,
   PARITY_WIRE_OVERHEAD, KCP_HEADER_RESERVE, MIN_FLUSH_MS, MAX_FLUSH_MS,
   DEFAULT_FLUSH_MS, DEFAULT_MTU, DEFAULT_IP_HEADER_LEN, MAX_RX_SYMBOL_BYTES,
-  FLUSH_DRAIN_FACTOR,
+  FLUSH_DRAIN_FACTOR, MAX_INTERLEAVE,
 } from '../constants.ts';
 import {
   getLe16, putLe16, getLe32, putLe32, bytesEqual, seqAfter,
@@ -41,24 +41,38 @@ export function pmtuProbeLen(mtu: number, ipHdrLen = DEFAULT_IP_HEADER_LEN): num
   return (mtu - ipHdrLen - 8) - FRAME_ENVELOPE_OVERHEAD - FEC_HDR_LEN;
 }
 
-export interface TxSymbol { setId: number; index: number; typeK: number; symbol: Buffer; }
+export interface TxSymbol { setId: number; index: number; d: number; typeK: number; symbol: Buffer; }
+
+/** One open repair group. The sender keeps `interleave` of these plus one
+ *  control lane, and round-robins data segments across the former. */
+interface TxLane {
+  setId: number; n: number; k: number; d: number; symbolMax: number;
+  symbols: Buffer[]; tLastMs: number;
+}
+function emptyLane(): TxLane {
+  return { setId: 0, n: 0, k: 0, d: 0, symbolMax: 0, symbols: [], tLastMs: 0 };
+}
+function resetLane(l: TxLane): void {
+  l.n = 0; l.k = 0; l.d = 0; l.symbolMax = 0; l.symbols = []; l.tLastMs = 0;
+}
 
 export class FrameTx {
   private d: number;
   private limits: MtuLimits;
   private emitFn: (s: TxSymbol) => void;
-  private setId = 0;
-  private n = 0;
-  private k = 0;
+  private lanes: TxLane[] = [emptyLane()];
+  /** Control segments (ACK/RST) never share a group with data: they are
+   *  latency-critical and must close immediately, and putting them in the
+   *  round-robin would truncate whichever data group they landed in. */
+  private ctl: TxLane = emptyLane();
+  private cursor = 0;
+  private nextSetId = 0;
   private nextK = 0;
-  private symbolMax = 0;
-  private tLastMs = 0;
   private flushMs = DEFAULT_FLUSH_MS;
   private srttMs = DEFAULT_FLUSH_MS;
   /** Time the sender needs to put D symbols on the wire, or -1 when unknown.
    *  -1 keeps the old behaviour (flush after sRTT). */
   private drainMs = -1;
-  private symbols: Buffer[] = [];
   closedFull = 0; closedIdle = 0; abortedSets = 0; dataSymbols = 0; paritySymbols = 0; mtuDrops = 0;
 
   constructor(d: number, limits: MtuLimits, emit: (s: TxSymbol) => void) {
@@ -66,6 +80,36 @@ export class FrameTx {
   }
   setK(k: number): void { this.nextK = Math.min(k, 7); }
   setSrttMs(srtt: number): void { this.srttMs = srtt; this.recomputeFlush(); }
+  /** Group size for groups opened from now on. Groups already open keep the d
+   *  they were cut with — it travels in every symbol's header. */
+  setGroupD(d: number): void { if (d >= 1) this.d = d; }
+  get groupD(): number { return this.d; }
+
+  /**
+   * Interleave depth: how many repair groups stay open at once.
+   *
+   * With L=1 a burst of B consecutive losses lands in one group and needs
+   * k >= B to survive. With L lanes the same burst is spread over L groups
+   * (ceil(B/L) each), so the same k covers a burst L times longer. Redundancy
+   * is unchanged: k/d per group, same bytes per group. The costs are that a
+   * lane takes L times longer to fill (so parity for its tail is L times
+   * later) and that the sender holds L groups of symbol buffers.
+   */
+  setInterleave(n: number): void {
+    const want = Math.max(1, Math.min(MAX_INTERLEAVE, n | 0));
+    if (want === this.lanes.length) return;
+    if (want < this.lanes.length) {
+      // Shrinking: settle the lanes we are dropping now rather than at the
+      // flush timer, because nothing will ever add to them again.
+      for (let i = want; i < this.lanes.length; ++i) this.closeLane(this.lanes[i], false);
+      this.lanes.length = want;
+    } else {
+      while (this.lanes.length < want) this.lanes.push(emptyLane());
+    }
+    if (this.cursor >= this.lanes.length) this.cursor = 0;
+  }
+  get interleave(): number { return this.lanes.length; }
+
   /**
    * How long this sender needs to fill a whole group at its current rate.
    *
@@ -76,6 +120,9 @@ export class FrameTx {
    * in 14 ms is pure delay on a fast path. On a slow path the same formula is
    * larger than sRTT and the cap collapses back to sRTT, so the set count and
    * the parity overhead of a trickle are unchanged.
+   *
+   * With interleaving the caller passes the time to fill the *lane*, i.e.
+   * interleave x d symbols, not d: a lane only sees one segment in every L.
    */
   setGroupDrainMs(ms: number): void { this.drainMs = ms > 0 ? ms : -1; this.recomputeFlush(); }
   private recomputeFlush(): void {
@@ -86,89 +133,133 @@ export class FrameTx {
     }
     this.flushMs = ms;
   }
-  /** Milliseconds until the open group must be closed, or -1. */
+  /** Milliseconds until the earliest open group must be closed, or -1. */
   nextTimerMs(nowMs: number): number {
-    if (this.n < 1) return -1;
-    const due = this.tLastMs + this.flushMs - nowMs;
-    return due < 1 ? 1 : due;
+    let best = -1;
+    const consider = (lane: TxLane): void => {
+      if (lane.n < 1) return;
+      const due = lane.tLastMs + this.flushMs - nowMs;
+      const ms = due < 1 ? 1 : due;
+      if (best < 0 || ms < best) best = ms;
+    };
+    for (const lane of this.lanes) consider(lane);
+    consider(this.ctl);
+    return best;
   }
   raiseLimits(l: MtuLimits): void { if (l.valid && l.payloadMax > this.limits.payloadMax) this.limits = l; }
   lowerLimits(l: MtuLimits): void { if (l.valid && l.payloadMax < this.limits.payloadMax) this.limits = l; }
   get limitsValue(): MtuLimits { return this.limits; }
-  get openN(): number { return this.n; }
-  get openK(): number { return this.n > 0 ? this.k : 0; }
-  get currentSetId(): number { return this.setId; }
+  /** Symbols currently waiting for their group to close, across every lane. */
+  get openN(): number {
+    let n = this.ctl.n;
+    for (const lane of this.lanes) n += lane.n;
+    return n;
+  }
+  get openK(): number {
+    for (const lane of this.lanes) if (lane.n > 0) return lane.k;
+    return this.ctl.n > 0 ? this.ctl.k : 0;
+  }
+  get currentSetId(): number { return this.nextSetId; }
 
-  onSegment(seg: Uint8Array, nowMs: number): void {
+  /**
+   * Add one segment.
+   *
+   * `control` routes it to the dedicated control lane and closes that lane
+   * immediately: an ACK must not wait for a data group to fill, and it must
+   * not truncate one either.
+   */
+  onSegment(seg: Uint8Array, nowMs: number, control = false): void {
     if (seg.length > this.limits.payloadMax) { ++this.mtuDrops; return; }
     this.maybeFlush(nowMs);
-    if (this.n === 0) { this.k = this.nextK; this.symbolMax = 0; this.symbols = []; }
+    let lane: TxLane;
+    if (control) {
+      lane = this.ctl;
+    } else {
+      lane = this.lanes[this.cursor];
+      this.cursor = (this.cursor + 1) % this.lanes.length;
+    }
+    if (lane.n === 0) this.openLane(lane);
     const symLen = seg.length + 2;
     const symbol = Buffer.allocUnsafe(symLen); // len + payload fully written
     putLe16(symLen, symbol, 0);
     Buffer.from(seg).copy(symbol, 2);
-    this.symbolMax = Math.max(this.symbolMax, symLen);
-    this.symbols.push(symbol);
-    this.emitFn({ setId: this.setId, index: this.n, typeK: packTypeK(this.k, 0, SymbolType.Data), symbol });
+    lane.symbolMax = Math.max(lane.symbolMax, symLen);
+    lane.symbols.push(symbol);
+    this.emitFn({
+      setId: lane.setId, index: lane.n, d: lane.d,
+      typeK: packTypeK(lane.k, 0, SymbolType.Data), symbol,
+    });
     ++this.dataSymbols;
-    ++this.n;
-    this.tLastMs = nowMs;
-    if (this.n === this.d) this.closeSet(true);
+    ++lane.n;
+    lane.tLastMs = nowMs;
+    if (lane.n >= lane.d) this.closeLane(lane, true);
+    else if (control) this.closeLane(lane, false);
+  }
+
+  private openLane(lane: TxLane): void {
+    lane.setId = this.nextSetId;
+    this.nextSetId = (this.nextSetId + 1) >>> 0;
+    lane.k = this.nextK;
+    lane.d = this.d;
+    lane.symbolMax = 0;
+    lane.symbols = [];
   }
 
   onTick(nowMs: number): void { this.maybeFlush(nowMs); }
-  /**
-   * Close the open set now instead of waiting for D segments or flushMs.
-   * Control segments (ACK/RST) must not sit in a repair group: on a quiet link
-   * a group only closes when the flush timer (≈srtt, capped at 200 ms) fires,
-   * which caps acknowledgement at D symbols per flush — about 68 KB/s.
-   */
-  flush(): void { this.closeSet(false); }
+
   abort(): void {
-    if (this.n === 0) return;
-    ++this.abortedSets;
-    this.setId = (this.setId + 1) >>> 0;
-    this.n = 0; this.k = 0; this.symbolMax = 0; this.symbols = [];
+    let any = false;
+    for (const lane of this.lanes) if (lane.n > 0) { resetLane(lane); any = true; }
+    if (this.ctl.n > 0) { resetLane(this.ctl); any = true; }
+    if (any) ++this.abortedSets;
   }
 
   private maybeFlush(nowMs: number): void {
-    if (this.n >= 1 && nowMs - this.tLastMs >= this.flushMs) this.closeSet(false);
+    for (const lane of this.lanes) {
+      if (lane.n >= 1 && nowMs - lane.tLastMs >= this.flushMs) this.closeLane(lane, false);
+    }
+    if (this.ctl.n >= 1 && nowMs - this.ctl.tLastMs >= this.flushMs) this.closeLane(this.ctl, false);
   }
 
-  private closeSet(full: boolean): void {
-    if (this.n === 0) return;
-    if (this.d === 0) { this.abort(); return; }
+  private closeLane(lane: TxLane, full: boolean): void {
+    if (lane.n === 0) return;
+    if (lane.d === 0) { resetLane(lane); ++this.abortedSets; return; }
+    const d = lane.d;
     let kEff = 0;
-    if (this.k >= 1) kEff = Math.max(1, Math.min(this.k, Math.ceil(this.k * this.n / this.d)));
+    if (lane.k >= 1) kEff = Math.max(1, Math.min(lane.k, Math.ceil(lane.k * lane.n / d)));
     if (kEff >= 1) {
-      const padded = this.symbols.map((s) => {
-        const row = Buffer.alloc(this.symbolMax);
+      const padded = lane.symbols.map((s) => {
+        const row = Buffer.alloc(lane.symbolMax);
         s.copy(row, 0);
         return row;
       });
-      const parities = rsEncode(padded, this.n, this.k, this.symbolMax);
+      const parities = rsEncode(padded, lane.n, kEff, lane.symbolMax);
       if (parities === null) kEff = 0;
       for (let j = 0; j < kEff; ++j) {
         if (parities === null) break;
         this.emitFn({
-          setId: this.setId, index: this.n + j,
-          typeK: packTypeK(this.k, j, SymbolType.Parity),
+          setId: lane.setId, index: lane.n + j, d,
+          typeK: packTypeK(lane.k, j, SymbolType.Parity),
           symbol: parities[j],
         });
         ++this.paritySymbols;
       }
     }
     if (full) ++this.closedFull; else ++this.closedIdle;
-    this.setId = (this.setId + 1) >>> 0;
-    this.n = 0; this.k = 0; this.symbolMax = 0; this.symbols = [];
+    resetLane(lane);
   }
 }
+
 
 export interface RxEventInfo { event: string; setId: number; repairMs?: number; }
 
 interface RxSet {
   setId: number;
   n: number; nKnown: boolean; k: number; kKnown: boolean;
+  /** Data-shard count this set was cut with, taken from the first symbol's
+   *  header. Sets are self-describing, so a sender may resize its groups
+   *  mid-session without the decoder having to be told out of band. */
+  d: number; dKnown: boolean;
   symbolMax: number; maxDataIndex: number;
   data: Map<number, Buffer>; parity: Map<number, Buffer>;
   orig: Set<number>; recov: Set<number>;
@@ -200,7 +291,10 @@ export interface FrameRxOptions {
 }
 
 export class FrameRx {
-  private d: number;
+  /** Negotiated group-size ceiling. A set may declare any d up to this; the
+   *  sender adapts downwards, never upwards, so the value doubles as the
+   *  bound that keeps a corrupt or hostile header from allocating the world. */
+  private dMax: number;
   private p: number;
   private deliverFn: FrameRxOptions['deliver'];
   private oobFn: FrameRxOptions['oob'];
@@ -230,7 +324,7 @@ export class FrameRx {
   // whole session. The FecstatReporter keeps its own per-interval list.)
 
   constructor(o: FrameRxOptions) {
-    this.d = o.d; this.p = o.p;
+    this.dMax = o.d; this.p = o.p;
     this.deliverFn = o.deliver; this.oobFn = o.oob; this.eventFn = o.event;
     this.maxSymbolLen = o.maxSymbolLen ?? 65535;
   }
@@ -258,11 +352,14 @@ export class FrameRx {
       if (behind > MAX_ACTIVE_SETS && behind < 0x80000000) { ++this.counters.stale; return; }
     }
 
-    const s = this.d + this.p;
+    // A set declares its own group size. Anything above the negotiated ceiling
+    // is a protocol violation: the sender only ever adapts downwards, so this
+    // bound is what stops a bogus header from claiming d = 255.
+    if (hdr.d < 1 || hdr.d > this.dMax) { ++this.counters.structFail; return; }
     const existing = this.sets.get(hdr.setId);
     const nKnown = existing?.nKnown ?? false;
     const n = existing?.n ?? 0;
-    if (validateHdr(hdr, this.d, s, nKnown, n) !== HdrStatus.Ok) { ++this.counters.structFail; return; }
+    if (validateHdr(hdr, this.p, nKnown, n) !== HdrStatus.Ok) { ++this.counters.structFail; return; }
     if (symbol.length < 2 || symbol.length > this.maxSymbolLen) { ++this.counters.structFail; return; }
     const kField = hdrK(hdr.typeK), jField = hdrJ(hdr.typeK);
     let nNew = 0;
@@ -307,6 +404,11 @@ export class FrameRx {
     const kClamped = Math.min(kField, this.p);
     if (!set.kKnown) { set.k = kClamped; set.kKnown = true; }
     else if (set.k !== kClamped) { ++this.counters.structFail; return; }
+    // Same rule for the group size: first symbol wins, and a later symbol of
+    // the same set declaring a different d is a structural violation. Mixing
+    // geometries inside one set would decode against the wrong code length.
+    if (!set.dKnown) { set.d = hdr.d; set.dKnown = true; }
+    else if (set.d !== hdr.d) { ++this.counters.structFail; return; }
 
     if (type === SymbolType.Data) {
       const idx = hdr.index;
@@ -466,7 +568,7 @@ export class FrameRx {
       this.accountBoundary.delete(victim);
     }
     const set: RxSet = {
-      setId, n: 0, nKnown: false, k: 0, kKnown: false, symbolMax: 0, maxDataIndex: 0,
+      setId, n: 0, nKnown: false, k: 0, kKnown: false, d: 0, dKnown: false, symbolMax: 0, maxDataIndex: 0,
       data: new Map(), parity: new Map(), orig: new Set(), recov: new Set(),
       tFirstMs: nowMs, accounted: false, tombstoneUntilMs: 0,
       hasAnySymbol: false, decodeAttempts: 0,
@@ -481,7 +583,7 @@ export class FrameRx {
     for (let id = first; id !== last; id = (id + 1) >>> 0) {
       if (this.sets.has(id)) continue;
       const set: RxSet = {
-        setId: id, n: 0, nKnown: false, k: 0, kKnown: false, symbolMax: 0, maxDataIndex: 0,
+        setId: id, n: 0, nKnown: false, k: 0, kKnown: false, d: 0, dKnown: false, symbolMax: 0, maxDataIndex: 0,
         data: new Map(), parity: new Map(), orig: new Set(), recov: new Set(),
         tFirstMs: nowMs, accounted: false, tombstoneUntilMs: 0,
         hasAnySymbol: false, decodeAttempts: 0,
@@ -546,8 +648,12 @@ export class FrameRx {
     if (orig + recov >= nUsed) ++this.counters.setsFull;
     // C++ semantics: "partial" is a short code (a flush before D symbols), not
     // an unrepaired group. setsFull/setsPartial therefore overlap.
-    if (nUsed < this.d) ++this.counters.setsPartial;
-    if (set.kKnown && set.k > 0 && set.k <= 7 && nUsed === this.d) {
+    // The yardstick is the d this set declared, not the session ceiling: with
+    // adaptive group sizes every full group would otherwise read as partial
+    // the moment the sender shrinks d below the negotiated maximum.
+    const dSet = set.dKnown ? set.d : this.dMax;
+    if (nUsed < dSet) ++this.counters.setsPartial;
+    if (set.kKnown && set.k > 0 && set.k <= 7 && nUsed === dSet) {
       ++this.counters.ledgerGroups;
       this.counters.ledgerKHist[set.k] = (this.counters.ledgerKHist[set.k] ?? 0) + 1;
       if (orig + recov < nUsed) ++this.counters.ledgerFailed;
@@ -567,13 +673,13 @@ export class FrameRx {
 /** §4.7: oob headers carry set_id = 0, index = 0, type = oob. */
 export function packOobFrame(msg: Uint8Array): Buffer {
   const out = Buffer.allocUnsafe(FEC_HDR_LEN + msg.length);
-  packHdr({ setId: 0, index: 0, typeK: packTypeK(0, 0, SymbolType.Oob) }).copy(out, 0);
+  packHdr({ setId: 0, index: 0, d: 0, typeK: packTypeK(0, 0, SymbolType.Oob) }).copy(out, 0);
   Buffer.from(msg).copy(out, FEC_HDR_LEN);
   return out;
 }
 export function packTxFrame(s: TxSymbol): Buffer {
   const out = Buffer.allocUnsafe(FEC_HDR_LEN + s.symbol.length);
-  packHdr({ setId: s.setId, index: s.index, typeK: s.typeK }).copy(out, 0);
+  packHdr({ setId: s.setId, index: s.index, d: s.d, typeK: s.typeK }).copy(out, 0);
   s.symbol.copy(out, FEC_HDR_LEN);
   return out;
 }

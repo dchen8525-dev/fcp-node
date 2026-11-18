@@ -15,7 +15,9 @@ import {
   PMTU_MAGIC, PMTU_HEADER_LEN, PMTU_TYPE_PROBE, PMTU_TYPE_ACK,
   PMTU_ABSOLUTE_MAX_MTU, DEFAULT_PMTU_MAX_MTU, PMTU_PROBE_STEP, PMTU_BACKOFF_MAX_MS,
   DEFAULT_MTU_MIN, DEFAULT_IP_HEADER_LEN, DEFAULT_D, DEFAULT_P,
-  DEFAULT_SRTT_MS, FEC_HDR_LEN, SymbolType,
+  DEFAULT_SRTT_MS, FEC_HDR_LEN, SymbolType, MAX_INTERLEAVE, D_FLOOR,
+  D_STEP_MIN, D_ADAPT_INTERVAL_MS,
+  MAX_ACK_COPIES, ACK_V2_FLAG_COPY,
   DATA_WIRE_OVERHEAD,
   STREAM_TYPE_ACK, STREAM_TYPE_ACK_V2, STREAM_TYPE_RST,
   DEFAULT_WINDOW_MIN_BYTES, DEFAULT_WINDOW_CEILING_BYTES,
@@ -37,7 +39,7 @@ import {
 import { hdrType, parseHdr } from '../fec/hdr.ts';
 import { FecstatValidator, FecstatStatus } from '../fec/fecstat.ts';
 import { Stream, type StreamCallbacks } from '../stream/stream.ts';
-import { AdaptiveFec, BbrLite, FecstatReporter } from '../control/controller.ts';
+import { AdaptiveFec, BbrLite, FecstatReporter, chooseGroupD } from '../control/controller.ts';
 
 /** Host-side stream bookkeeping for multiplexed sessions. The default stream
  *  (sid 0) stays wired through the SessionCallbacks read/eof/closed; sids
@@ -60,6 +62,10 @@ export interface SessionConfig {
   recvDirection: DirectionValue;
   role: number; // HandshakeRole.Client / Server
   d?: number; p?: number;
+  /** Interleave depth: repair groups kept open in parallel (1 = off). */
+  interleave?: number;
+  /** Redundant copies of every ACK v2 (1 = off). */
+  ackCopies?: number;
   mtu?: number; ipHdrLen?: number;
   pinnedK?: number;
   initialSrttMs?: number;
@@ -86,7 +92,7 @@ export interface SessionCallbacks {
 export interface SessionStats {
   authFail: number; structFail: number; dataTx: number; dataRx: number;
   fecstatDropped: number; fecstatDup: number; fecstatStale: number;
-  established: boolean; state: number; k: number; srttMs: number;
+  established: boolean; state: number; k: number; d: number; lanes: number; srttMs: number;
   resetByPeer: boolean; peerAliveMs: number;
 }
 
@@ -112,10 +118,15 @@ export class Session {
   private validator = new FecstatValidator();
   private configured = false;
   private nowMs = 0;
-  /** Group size the wire settled on. Only used to estimate how long filling one
-   *  repair group takes, which bounds how long a partial group may sit before
-   *  its parity goes out. */
+  /** Group size currently being cut. Starts at the negotiated value, then
+   *  adapts between D_FLOOR and that ceiling; every symbol carries its own d,
+   *  so changing it needs no coordination with the peer. Also bounds how long
+   *  a partial group may sit before its parity goes out (groupDrainMs). */
   private groupD = DEFAULT_D;
+  private dMax = DEFAULT_D;
+  private interleave = 1;
+  private ackCopies = 1;
+  private lastDChangeMs = 0;
   private bootstrapWindowMs = -1;
   private bootstrapProbes = 0;
   private lastWireOutMs = 0;
@@ -261,6 +272,7 @@ export class Session {
       fecstatDropped: this.fecstatDropped, fecstatDup: this.fecstatDup,
       fecstatStale: this.fecstatStale,
       established: this.established, state: this.state, k: this.k,
+      d: this.groupD, lanes: this.interleave,
       srttMs: this.bbr.srttMs, resetByPeer: this.resetByPeer,
       peerAliveMs: this.lastPeerInMs ? this.nowMs - this.lastPeerInMs : 0,
     };
@@ -425,14 +437,23 @@ export class Session {
     // must carve segments one byte below payloadMax or FrameTx drops each
     // full-size segment as oversize.
     this.stream.setMaxSegment(this.mux ? this.limits.payloadMax - 1 : this.limits.payloadMax);
+    this.dMax = np.d;
+    this.groupD = np.d;
+    this.interleave = Math.max(1, Math.min(MAX_INTERLEAVE, this.cfg.interleave ?? 1));
     this.tx = new FrameTx(np.d, this.limits, (s) => this.emitSymbol(s, false));
+    this.tx.setInterleave(this.interleave);
     this.tx.setSrttMs(this.bbr.srttMs);
     // Follow the agreed parity, not our own proposal: a peer may have offered a
     // lower P, and anything above it is dropped as IndexPastS on arrival.
     this.strategy.setParityCeiling(np.p);
     this.strategy.setGroupSize(np.d);
-    this.groupD = np.d;
     this.tx.setK(this.strategy.currentK());
+    // Copied ACKs are only safe with the v2 marker bit; a v1 ACK has no spare
+    // byte and a blind duplicate would read as loss evidence on the peer.
+    const ackV2 = this.hs.tlvAgreed(TLV_TYPE_ACK_V2);
+    this.ackCopies = ackV2
+      ? Math.max(1, Math.min(MAX_ACK_COPIES, this.cfg.ackCopies ?? 1))
+      : 1;
     this.rx = new FrameRx({
       d: np.d, p: np.p,
       maxSymbolLen: this.rxSymbolMax,
@@ -454,7 +475,7 @@ export class Session {
       if (p && p.srttMs > 0) { this.bbr.onRtt(p.srttMs); this.tx.setSrttMs(p.srttMs); }
     }
     this.configured = true;
-    this.cb.log?.(`FCP established: D=${np.d} P=${np.p} tlv=${this.hs.tlvNegotiated()} ackv2=${this.hs.tlvAgreed(TLV_TYPE_ACK_V2)} ` +
+    this.cb.log?.(`FCP established: D=${np.d} P=${np.p} L=${this.interleave} ackCopies=${this.ackCopies} tlv=${this.hs.tlvNegotiated()} ackv2=${this.hs.tlvAgreed(TLV_TYPE_ACK_V2)} ` +
       `mtu=${this.pmtuMtu}${this.cfg.pmtud ? `->${this.pmtuMaxMtu} (pmtud)` : ' (fixed)'} payloadMax=${this.limits.payloadMax}`);
     this.dbg(`[${this.tag()}] ESTABLISHED D=${np.d} P=${np.p} tlv=${this.hs.tlvNegotiated()} ackv2=${this.hs.tlvAgreed(TLV_TYPE_ACK_V2)} k=${this.strategy.currentK()} keyUpdate=${this.env.keyUpdate} srtt=${this.bbr.srttMs}ms`);
     // Data queued before the handshake was cached unframed, because mux was not
@@ -648,13 +669,36 @@ export class Session {
     // capped recovery in the one mode the client actually uses.
     const kind = this.mux ? (seg.length > 1 ? seg[1] : 0) : (seg.length > 0 ? seg[0] : 0);
     this.dbg(`[${this.tag()}] stream seg tx len=${seg.length} cumAcked=${this.stream.cumAcked}`);
-    this.tx.onSegment(seg, this.nowMs);
+    const control = kind === STREAM_TYPE_ACK || kind === STREAM_TYPE_ACK_V2 || kind === STREAM_TYPE_RST;
+    this.tx.onSegment(seg, this.nowMs, control);
     ++this.dataTx;
-    // Acknowledgements and resets must leave immediately. Left in the repair
-    // group they wait for D segments or the flush timer, and since the flush
-    // timer is ~srtt (200 ms), a download can never exceed D symbols per
-    // 200 ms no matter how fast the path is.
-    if (kind === STREAM_TYPE_ACK || kind === STREAM_TYPE_ACK_V2 || kind === STREAM_TYPE_RST) this.tx.flush();
+    // Acknowledgements and resets must leave immediately, so they get the
+    // dedicated control lane that FrameTx closes on arrival instead of sharing
+    // a group with data.
+    //
+    // The extra ACK copies go through the *data* lanes on purpose. They are
+    // spread by the interleave (one copy per lane, not adjacent datagrams),
+    // and they share the group's parity with data instead of each paying for a
+    // one-symbol group of their own. The copy bit tells the peer not to count
+    // them as duplicate-ACK evidence, which at DUP_ACK_THRESH = 1 would
+    // otherwise fire a retransmit for every ACK.
+    if (kind === STREAM_TYPE_ACK_V2) {
+      for (let i = 1; i < this.ackCopies; ++i) {
+        const copy = this.markAckCopy(seg);
+        if (copy) this.tx.onSegment(copy, this.nowMs, false);
+      }
+    }
+  }
+
+  /** Duplicate an ACK v2 segment with its "redundant copy" bit set. */
+  private markAckCopy(seg: Buffer): Buffer | null {
+    const at = this.mux ? 1 : 0;
+    // type byte + cum(4) + rwnd(4) + range count(1)
+    if (seg.length < at + 10) return null;
+    if (seg[at] !== STREAM_TYPE_ACK_V2) return null;
+    const out = Buffer.from(seg);
+    out[at + 9] |= ACK_V2_FLAG_COPY;
+    return out;
   }
 
   /** M1: host-initiated stream (client side). Mux sessions only; sid 0 is the
@@ -825,18 +869,62 @@ export class Session {
     if (c) {
       this.strategy.noteLocalCounters(c.dataExpected, c.dataRxOrig, nowMs);
     }
+    this.adaptGroupD(nowMs);
     this.tx?.setK(this.strategy.currentK());
     // Filling one group takes d x payloadMax bytes at the measured send rate.
     // FrameTx caps the partial-group flush timer at a small multiple of that, so
     // a group that would close in 14 ms stops waiting 200 ms for parity.
+    // With interleaving a lane only sees one segment in every L, so the time it
+    // needs to fill is L times the time to put d symbols on the wire.
     this.tx?.setGroupDrainMs(this.groupDrainMs());
+  }
+
+  /**
+   * Group size follows the loss rate: d is the resolution at which k can
+   * express "cover this much loss".
+   *
+   * k = ceil(d x loss x HEADROOM) and k cannot exceed the negotiated p. Once
+   * d x loss x HEADROOM reaches p the formula saturates and every extra data
+   * symbol added to the group only dilutes the repair ratio k/d — the group
+   * gets wider while its tail coverage stops growing. So the rule is to keep
+   * d on the large side while k has room, and cut d as loss climbs until k
+   * fits under the ceiling again.
+   *
+   * The second bound runs the other way: if d is too small the sender emits
+   * groups faster than the receiver settles them (MAX_ACTIVE_SETS with the
+   * 1 s/2 s settle clocks), and groups start being evicted half-decoded. That
+   * is a correctness limit, not a tuning knob, so it wins over the loss rule.
+   */
+  private adaptGroupD(nowMs: number): void {
+    const target = this.pickGroupD();
+    if (target === this.groupD) return;
+    if (nowMs - this.lastDChangeMs < D_ADAPT_INTERVAL_MS) return;
+    if (Math.abs(target - this.groupD) < D_STEP_MIN &&
+        target !== D_FLOOR && target !== this.dMax) return;
+    this.lastDChangeMs = nowMs;
+    this.groupD = target;
+    this.tx?.setGroupD(target);
+    this.strategy.setGroupSize(target);
+    this.cfg.trace?.(JSON.stringify({ t: 'geom', d: target, dMax: this.dMax, lanes: this.interleave }));
+  }
+
+  private pickGroupD(): number {
+    const bw = this.sndBbr.bwBytesPerMs;
+    const symPerSec = bw > 0 && this.limits.payloadMax > 0
+      ? (bw * 1000) / this.limits.payloadMax : 0;
+    return chooseGroupD({
+      dMax: this.dMax,
+      p: this.strategy.currentParityCeiling(),
+      loss: this.strategy.currentLoss(),
+      symPerSec,
+    });
   }
 
   /** Estimated time to put one full group on the wire, or -1 when unknown. */
   private groupDrainMs(): number {
     const bw = this.sndBbr.bwBytesPerMs;
     if (bw <= 0 || this.groupD <= 0) return -1;
-    return (this.groupD * this.limits.payloadMax) / bw;
+    return (this.interleave * this.groupD * this.limits.payloadMax) / bw;
   }
 
   /**

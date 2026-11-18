@@ -121,11 +121,11 @@ function fecRx(d: number, p: number) {
   return rx as FrameRx & { symbolBytes: number; sets: Map<number, unknown> };
 }
 
-function dataSymbol(setId: number, index: number, k: number, bytes: Buffer): Buffer {
-  return Buffer.concat([packHdr({ setId, index, typeK: packTypeK(k, 0, SymbolType.Data) }), bytes]);
+function dataSymbol(setId: number, index: number, k: number, bytes: Buffer, d: number): Buffer {
+  return Buffer.concat([packHdr({ setId, index, d, typeK: packTypeK(k, 0, SymbolType.Data) }), bytes]);
 }
-function paritySymbol(setId: number, index: number, j: number, k: number, bytes: Buffer): Buffer {
-  return Buffer.concat([packHdr({ setId, index, typeK: packTypeK(k, j, SymbolType.Parity) }), bytes]);
+function paritySymbol(setId: number, index: number, j: number, k: number, bytes: Buffer, d: number): Buffer {
+  return Buffer.concat([packHdr({ setId, index, d, typeK: packTypeK(k, j, SymbolType.Parity) }), bytes]);
 }
 
 test('FEC: a reconstructed symbol is counted in the session byte budget', () => {
@@ -148,8 +148,8 @@ test('FEC: a reconstructed symbol is counted in the session byte budget', () => 
     });
     const parity = rsEncode(syms, d, k, size)!;
     // 4 originals + 6 parity -> 6 reconstructed, 10 rows held per set.
-    for (let i = 0; i < 4; ++i) rx.onDatagram(dataSymbol(s, i, k, syms[i]!), now);
-    for (let j = 0; j < k; ++j) rx.onDatagram(paritySymbol(s, d + j, j, k, parity[j]!), now);
+    for (let i = 0; i < 4; ++i) rx.onDatagram(dataSymbol(s, i, k, syms[i]!, d), now);
+    for (let j = 0; j < k; ++j) rx.onDatagram(paritySymbol(s, d + j, j, k, parity[j]!, d), now);
     now += 1;
   }
   const held = [...rx.sets.values()].reduce((acc: number, st) => {

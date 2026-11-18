@@ -230,7 +230,7 @@ test('FrameRx: oob symbols are dispatched, malformed headers rejected', () => {
   const delivered: Buffer[] = [];
   const rx = new FrameRx({ d: 10, p: 3, deliver: (b) => delivered.push(b), oob: (b) => oobs.push(b) });
   const oobFrame = Buffer.concat([
-    Buffer.from([0, 0, 0, 0, 0, 2]), Buffer.from('FCPKAL1\0', 'latin1'),
+    Buffer.from([0, 0, 0, 0, 0, 0, 2]), Buffer.from('FCPKAL1\0', 'latin1'),
   ]);
   rx.onDatagram(oobFrame, 0);
   assert.equal(oobs.length, 1);
@@ -245,7 +245,7 @@ test('FrameRx: the FECSTAT accounted-through key stays monotonic after retiremen
   // to 0 and the peer's validator classified every later report as stale.
   const rx = new FrameRx({ d: 10, p: 3, deliver: () => {}, oob: () => {} });
   const dataFrame = (setId: number): Buffer => packTxFrame({
-    setId, index: 0, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
+    setId, index: 0, d: 10, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
   });
   rx.onDatagram(dataFrame(5), 0);
   rx.onTick(1001);
@@ -620,8 +620,10 @@ test('M1: sid control segments inherit ACK v2 and are flushed immediately', () =
   // In mux mode the 1-byte sid prefixes every segment, so the stream type is
   // at offset 1. Reading offset 0 read the sid (0 here), the ACK was treated
   // as data, and it sat in the repair group until the flush timer.
-  // flush() closes the group, so the ACK leaves as a DATA symbol plus the one
-  // scaled repair symbol a 1-symbol group gets at D=10, P=3.
+  // The ACK leaves immediately: it gets the dedicated control lane, which
+  // closes on arrival, so it is one DATA symbol plus the one scaled repair
+  // symbol a 1-symbol group gets at D=10, P=3. (With --ack-copies>1 the extra
+  // copies ride the data lanes, so this would be one datagram per copy more.)
   assert.equal(p.toServer.length, before + 2, 'the ACK left immediately');
 });
 
@@ -662,7 +664,7 @@ test('FrameRx: evicting an accounted set retires its id (no late re-settle)', ()
   const delivered: Buffer[] = [];
   const rx = new FrameRx({ d: 10, p: 3, deliver: (b) => delivered.push(b), oob: () => {} });
   const dataFrame = (setId: number): Buffer => packTxFrame({
-    setId, index: 0, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
+    setId, index: 0, d: 10, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
   });
   // Fill the set map to capacity with data symbols.
   for (let id = 0; id < 256; ++id) rx.onDatagram(dataFrame(id), 0);
@@ -755,7 +757,7 @@ test('FrameRx: set-id gap placeholders count as setsKUnknown, not tailDropped', 
   // FECSTAT reported the wrong field and mis-set FLG_TAIL_DROPPED.
   const rx = new FrameRx({ d: 10, p: 3, deliver: () => {}, oob: () => {} });
   const dataFrame = (setId: number): Buffer => packTxFrame({
-    setId, index: 0, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
+    setId, index: 0, d: 10, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
   });
   rx.onDatagram(dataFrame(0), 0);
   rx.onDatagram(dataFrame(5), 0); // jump 0 -> 5 creates placeholders 1..4
@@ -770,7 +772,7 @@ test('FrameRx: a late in-bound original counts as dataLateRx, not lateDup', () =
   // up and the peer's data_lost() under-counted loss.
   const rx = new FrameRx({ d: 5, p: 3, deliver: () => {}, oob: () => {} });
   const dataFrame = (idx: number): Buffer => packTxFrame({
-    setId: 7, index: idx, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
+    setId: 7, index: idx, d: 5, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
   });
   rx.onDatagram(dataFrame(0), 0);
   rx.onDatagram(dataFrame(2), 0); // maxDataIndex=2 -> nUsed/boundary=3, hole at 1
@@ -787,7 +789,7 @@ test('FrameRx: a symbol with a conflicting k is rejected as structFail', () => {
   // field could drive RS decode with mismatched geometry.
   const rx = new FrameRx({ d: 5, p: 3, deliver: () => {}, oob: () => {} });
   const frame = (k: number, idx: number): Buffer => packTxFrame({
-    setId: 9, index: idx, typeK: (k << 5) | 0, symbol: Buffer.from([3, 0, 0xab]),
+    setId: 9, index: idx, d: 5, typeK: (k << 5) | 0, symbol: Buffer.from([3, 0, 0xab]),
   });
   rx.onDatagram(frame(1, 0), 0); // set 9 k=1 first-wins
   assert.equal(rx.counters.structFail, 0);

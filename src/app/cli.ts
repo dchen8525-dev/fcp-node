@@ -8,6 +8,7 @@ import { createServer, connect } from 'node:net';
 import { randomBytes } from 'node:crypto';
 import {
   PRODUCT_VERSION, DEFAULT_MTU_MIN, DEFAULT_PMTU_MAX_MTU, DEFAULT_D, DEFAULT_P,
+  MAX_INTERLEAVE, MAX_ACK_COPIES,
 } from '../constants.ts';
 import { TunnelClient, TunnelServer, type TunnelOptions } from './tunnel.ts';
 import {
@@ -63,6 +64,23 @@ Common:
                         min(3,P) and adjusts k itself from loss feedback, so
                         there is no --parity / --k / --fec-budget knob any more
                         (all three are rejected).
+  --interleave=N        repair groups kept open in parallel (default 1, max 8).
+                        With N > 1 consecutive segments are dealt across N
+                        groups, so a burst of B datagram losses costs
+                        ceil(B/N) per group instead of B in one. Same k covers
+                        a burst N times longer, at the price of L times the
+                        time for a lane to fill. The receiver needs no support:
+                        every symbol names its own set and group size.
+  --ack-copies=N        copies of every ACK v2 on the wire (default 1 = off,
+                        max 4). Copies cost the *receiver* CPU, one extra
+                        encrypt+send per ACK: on a loopback run at 7-10k
+                        datagrams/s two copies cut goodput in half, while the
+                        deployed path loses 1.6% and already retransmits ~0.
+                        Turn it on for a lossy uplink, where an ACK lost for a
+                        whole RTT stalls the sender's window.
+                        Copies carry a "redundant copy" bit so the peer does
+                        not mistake them for duplicate-ACK loss evidence, and
+                        they ride the data lanes so the interleave spreads them.
   --metrics=PREFIX      per-session controller metrics, one JSONL file per
                         session: <PREFIX>-client-<salt>.jsonl (and -server-).
                         Records the adaptive controllers' decisions (fec_k)
@@ -110,7 +128,7 @@ const ALIASES: Record<string, string> = {
 // typo used to be dropped in silence (e.g. `--speedtest`, which no code path
 // ever reached because the client branch matched first).
 const KNOWN_OPTS = new Set([
-  'key', 'bind', 'peer', 'mtu-min', 'fec', 'metrics',
+  'key', 'bind', 'peer', 'mtu-min', 'fec', 'metrics', 'interleave', 'ack-copies',
   'log-level', 'log-file', 'seconds', 'speedtest-seconds', 'positional',
 ]);
 
@@ -121,14 +139,14 @@ const KNOWN_OPTS = new Set([
 // That is the "silently fell back to the default" bug class the CLI contract
 // forbids, and the peer budget it produces does not match what was asked for.
 const VALUE_OPTS = new Set([
-  'key', 'bind', 'peer', 'mtu-min', 'fec', 'metrics',
+  'key', 'bind', 'peer', 'mtu-min', 'fec', 'metrics', 'interleave', 'ack-copies',
   'log-level', 'log-file', 'seconds', 'speedtest-seconds',
 ]);
 
 // The numeric ones read a leading-'-' token as their value anyway, so the
 // range check produces the precise diagnostic ("expects an integer in
 // 128..9000") instead of a generic "that looks like another option".
-const NUMERIC_OPTS = new Set(['mtu-min', 'seconds', 'speedtest-seconds', 'fec']);
+const NUMERIC_OPTS = new Set(['mtu-min', 'seconds', 'speedtest-seconds', 'fec', 'interleave', 'ack-copies']);
 
 function missingValue(spelling: string, next: string | undefined): Error {
   const shown = next === undefined ? 'it was given without one' : `"${next}" looks like another option`;
@@ -418,6 +436,12 @@ async function main(): Promise<void> {
   // coverage without any visible symptom. The epoch key roll is offered on the
   // same terms — one extra empty TLV, gated by the peer's answer.
   const fecGeo = parseFec(opts.get('fec'));
+  // Interleaving and ACK redundancy are opt-in: both trade a little bandwidth
+  // (and, for interleaving, a little repair latency) for burst tolerance, and
+  // on a path whose loss is random they buy nothing. Defaults keep the wire
+  // exactly as it was before these knobs existed.
+  const interleave = intOpt(opts, 'interleave', 1, 1, MAX_INTERLEAVE);
+  const ackCopies = intOpt(opts, 'ack-copies', 1, 1, MAX_ACK_COPIES);
   const debugLog = logLevel === 'debug' ? (l: string) => log(`DBG ${l}`) : undefined;
   const mtuMin = intOpt(opts, 'mtu-min', DEFAULT_MTU_MIN, 128, 9000);
   // One knob instead of two: the walk's ceiling is not worth a second flag, so
@@ -430,6 +454,8 @@ async function main(): Promise<void> {
     mtu: mtuMin,
     pmtuMaxMtu: mtuMax,
     ...fecGeo,
+    interleave,
+    ackCopies,
     pinnedK: pinnedKFromEnv(log),
     // PMTUD is ON by default now. CAP_PMTUD (bit4) used to be a hard caps gate
     // against C++ 0.0.19 peers, but the tunnel is Node<->Node only, so the
