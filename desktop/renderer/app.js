@@ -606,6 +606,11 @@ el.logDir.addEventListener('click', async () => {
 
 const PROBE_HISTORY = 24;
 
+/** 「最近几次」卡片里最多同时显示多少行数据;超出部分由滚动条承载。
+ *  行高和这个数字都写成 CSS 变量,样式与逻辑只在这里定义一次,避免两边各写死一个数字。 */
+const PROBE_HISTORY_VISIBLE = 10;
+document.documentElement.style.setProperty('--probe-visible-rows', String(PROBE_HISTORY_VISIBLE));
+
 const fmtMbs = (bps) => (bps > 0 ? (bps / 1048576).toFixed(2) : '—');
 const fmtLoss = (v) => (v < 0 || v === undefined ? '—' : `${(v * 100).toFixed(1)}%`);
 const fmtMs = (v) => (v < 0 || v === undefined ? '—' : `${Math.round(v)} ms`);
@@ -625,6 +630,19 @@ function renderProbeWhen() {
     ? `下次 ${mmss(state.probeNextSec)} ｜ 已测 ${state.probeCount} 次`
     : `首次测量 ${mmss(state.probeNextSec)} 后（需空闲）`;
 }
+
+/** 「最近几次」右上角那句说明:条数 + 当前配置的体检间隔。
+ *  间隔直接读输入框,所以用户在高级设置里把 5 改成 10,这里立刻跟着变,
+ *  不用等下一次体检结果回来。 */
+function renderProbeHistoryNote(count) {
+  const n = count === undefined ? Math.min(state.probes.length, PROBE_HISTORY) : count;
+  const probeMin = Number(el.probeInterval.value);
+  const tail = !(probeMin > 0) ? '体检已关闭' : `空闲时每 ${probeMin} 分钟一次`;
+  el.probeHistoryNote.textContent = n > 0 ? `${n} 条 · ${tail}` : `还没有记录 · ${tail}`;
+}
+
+// 输入框一改就刷新这句（不等体检结果），5 改成 10 立即可见。
+el.probeInterval.addEventListener('input', () => renderProbeHistoryNote());
 
 /** One direction's two cards. `ramp` is the pacing rate the ramp proved clean;
  *  `rate` is what actually arrived, so a path that loses 20% shows both. */
@@ -651,7 +669,7 @@ function renderProbe() {
     for (const k of ['probeRtt', 'probeJitter', 'probeQueue', 'probeRun',
       'probeBytes', 'probeElapsed', 'probeMtu', 'probeFec']) el[k].textContent = '—';
     el.probeHistory.textContent = '';
-    el.probeHistoryNote.textContent = '还没有记录';
+    renderProbeHistoryNote(0);
     return;
   }
   const up = p.up;
@@ -672,10 +690,7 @@ function renderProbe() {
 
   const rows = state.probes.slice(0, PROBE_HISTORY);
   const peak = rows.reduce((m, r) => Math.max(m, r.down ? r.down.ramp : 0, r.up ? r.up.ramp : 0), 0) || 1;
-  const probeMin = Number(el.probeInterval.value);
-  el.probeHistoryNote.textContent = !(probeMin > 0)
-    ? `${rows.length} 条 · 体检已关闭`
-    : `${rows.length} 条 · 空闲时每 ${probeMin} 分钟一次`;
+  renderProbeHistoryNote(rows.length);
   const frag = document.createDocumentFragment();
   const head = document.createElement('div');
   head.className = 'probe-row head';

@@ -1003,19 +1003,55 @@ select option { background: var(--card); color: var(--ink); }
 }
 .probe-head-actions .primary { padding: 6px 16px; white-space: nowrap; }
 
-.probe-history { display: flex; flex-direction: column; }
+/* 体检页铺满可视高度：页面本身不纵向滚动，剩余空间全留给「最近几次」，
+   记录多时只在这个列表内部滚动（可视行数上限仍是 10 行）。 */
+.page[data-page="probe"] { height: 100%; }
+.page[data-page="probe"].is-active { display: flex; flex-direction: column; }
+.page[data-page="probe"] > * { flex: 0 0 auto; }
+/* 最后一张卡片（最近几次）可以被压缩，但不能被内容顶出去：
+   这样窗口再矮也只是列表变短，而不会把整页撑出滚动条。 */
+.page[data-page="probe"] > .card:last-child {
+  flex: 0 1 auto;
+  min-height: 0;
+  margin-bottom: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.probe-history {
+  display: flex;
+  flex-direction: column;
+  /* 最多同时显示 N 行数据 + 1 行表头，再多就纵向滚动。
+     行高是固定值；N 由 app.js 在根元素上写 --probe-visible-rows，
+     这里只给 fallback，不要在本元素上声明同名变量（自身声明会遮蔽继承值）。 */
+  --probe-row-h: 34px;
+  flex: 1 1 auto;
+  /* 窗口很矮时留出表头 + 2 行，再矮就让页面滚动兜底。 */
+  min-height: calc(var(--probe-row-h) * 3);
+  max-height: calc(var(--probe-row-h) * (var(--probe-visible-rows, 10) + 1) + 1px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .probe-row {
   display: grid;
   grid-template-columns: 52px 1fr 1fr 70px 84px;
   align-items: center;
   gap: 12px;
-  padding: 8px 2px;
+  /* 固定行高：滚动区高度靠它换算；flex 基线不压缩，否则超出时会被挤扁而不是滚动。 */
+  flex: 0 0 var(--probe-row-h);
+  height: var(--probe-row-h);
+  padding: 0 2px;
+  box-sizing: border-box;
   border-top: 1px solid var(--line);
   font-size: 12px;
 }
 .probe-row:first-child { border-top: 0; }
 .probe-row.head {
-  padding-top: 0;
+  /* 滚动时表头留在顶部，否则往下拉就分不清哪列是什么。 */
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--card);
   font-size: 11px;
   color: var(--muted-2);
 }
