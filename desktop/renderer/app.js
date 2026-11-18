@@ -10,7 +10,7 @@ const el = {
   server: $('server'), proxy: $('proxy'),
   key: $('key'), keyToggle: $('keyToggle'), remember: $('remember'),
   mtu: $('mtu'), fecData: $('fecData'), fecParityMax: $('fecParityMax'),
-  logLevel: $('logLevel'), pmtud: $('pmtud'), probeInterval: $('probeInterval'),
+  logLevel: $('logLevel'), probeInterval: $('probeInterval'),
   advToggle: $('advToggle'), advBody: $('advBody'),
   toggleBtn: $('toggleBtn'), actionNote: $('actionNote'),
   stateDot: $('stateDot'), stateText: $('stateText'), stateAddr: $('stateAddr'), stateUptime: $('stateUptime'),
@@ -243,7 +243,7 @@ function collectSettings() {
     fecData: el.fecData.value === '' ? 10 : Number(el.fecData.value),
     fecParityMax: el.fecParityMax.value === '' ? 4 : Number(el.fecParityMax.value),
     logLevel: el.logLevel.value,
-    pmtud: el.pmtud.checked,
+    // PMTUD 已恒定默认开启，界面不再有开关；存档里不再写 pmtud 字段。
     // 分钟 -> 秒,与 --probe-interval 同一单位。≤0 一律记 0,由 probe=false
     // 让主进程发 --no-probe;不要把 0 吞成默认值。
     // 正数钳到 CLI 接受的 30..86400 秒,这样"填 >0 就体检"不会被边界值拒绝。
@@ -260,7 +260,7 @@ function scheduleSave() {
     window.fcp.saveSettings({
       remember: false, key: '', host: '', port: 4460, listenHost: '127.0.0.1',
       listenPort: 1080, mtu: 1040, fecData: 10, fecParityMax: 4, logLevel: '',
-      pmtud: true, probeInterval: 300, probe: true,
+      probeInterval: 300, probe: true,
     });
     return;
   }
@@ -291,8 +291,8 @@ function applySettings(s) {
   if (typeof s.fecData === 'number') el.fecData.value = String(s.fecData);
   if (typeof s.fecParityMax === 'number') el.fecParityMax.value = String(s.fecParityMax);
   if (s.logLevel) el.logLevel.value = s.logLevel;
-  if (typeof s.pmtud === 'boolean') el.pmtud.checked = s.pmtud;
-  // 秒 -> 分钟。旧存档用 probe:false 表示关闭,这里一并折算成 0。
+  // 旧存档里的 pmtud 字段刻意忽略：PMTUD 现在恒定开启，不再由界面控制。
+  // 分钟 -> 秒。旧存档用 probe:false 表示关闭,这里一并折算成 0。
   if (typeof s.probeInterval === 'number') {
     el.probeInterval.value = String(Math.round(s.probeInterval / 60));
   }

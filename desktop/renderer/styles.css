@@ -684,7 +684,7 @@ html, body {
 .card-note { font-size: 11.5px; font-weight: 400; color: var(--muted-2); }
 
 .grid { display: grid; gap: 14px 16px; }
-.card > .field + .grid, .card > .grid + .check { margin-top: 13px; }
+.card > .field + .grid, .card > .grid + .check, .card > .grid + .field { margin-top: 15px; }
 .grid.two { grid-template-columns: 1fr 1fr; }
 
 .field { display: flex; flex-direction: column; gap: 7px; min-width: 0; }

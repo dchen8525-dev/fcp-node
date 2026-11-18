@@ -189,7 +189,8 @@ function statsArgs(cfg) {
   const args = ['client', `--key=${cfg.key}`, `--peer=${cfg.host}:${cfg.port}`,
     `--bind=${cfg.listenHost}:${cfg.listenPort}`];
   if (cfg.mtu) args.push(`--mtu-min=${cfg.mtu}`);
-  if (cfg.pmtud === false) args.push('--no-pmtud');
+  // PMTUD 恒定默认开启：界面已无开关，主进程也不再发 --no-pmtud。
+  // 旧存档里可能残留 pmtud:false，这里刻意不读，避免把探测关掉。
   // 两半各自透传。旧版的 `fec: "10:4"` 不再被识别,--fec= 在 CLI 侧已被拒绝。
   // 兜底值取渲染层的默认(10/4),不是 CLI 的 10/6:GUI 一直发的是 4,这里不偷偷改。
   args.push(`--fec-data=${Number.isInteger(cfg.fecData) ? cfg.fecData : 10}`);

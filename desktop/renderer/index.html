@@ -89,7 +89,7 @@
         </header>
 
         <div class="card">
-          <div class="card-title">服务器与本地代理</div>
+          <div class="card-title">服务器、本地代理与密钥</div>
           <div class="grid two">
             <label class="field">
               <span class="field-label">服务器地址（地址:UDP 端口）</span>
@@ -100,17 +100,13 @@
               <input id="proxy" type="text" value="127.0.0.1:1080" placeholder="例如 127.0.0.1:1080" spellcheck="false" />
             </label>
           </div>
-        </div>
-
-        <div class="card">
-          <div class="card-title">
-            共享密钥
-            <span class="card-note">需与服务器端密钥完全一致，否则无法连通</span>
-          </div>
-          <div class="key-row">
-            <input id="key" type="password" placeholder="000102030405060708090a0b0c0d0e0f"
-                   spellcheck="false" autocomplete="off" />
-            <button class="icon-btn" id="keyToggle" type="button" title="显示/隐藏">显示</button>
+          <div class="field">
+            <span class="field-label">共享密钥 <span class="card-note">需与服务器端密钥完全一致，否则无法连通</span></span>
+            <div class="key-row">
+              <input id="key" type="password" placeholder="000102030405060708090a0b0c0d0e0f"
+                     spellcheck="false" autocomplete="off" />
+              <button class="icon-btn" id="keyToggle" type="button" title="显示/隐藏">显示</button>
+            </div>
           </div>
           <label class="check">
             <input id="remember" type="checkbox" checked />
@@ -126,18 +122,6 @@
           <div class="adv" id="advBody" hidden>
             <div class="grid two">
               <label class="field">
-                <span class="field-label">MTU 下限（探针起点）</span>
-                <input id="mtu" type="number" min="128" max="9000" value="1040" />
-              </label>
-              <label class="field">
-                <span class="field-label">FEC 数据 symbol（D）</span>
-                <input id="fecData" type="number" min="1" max="256" value="10" />
-              </label>
-              <label class="field">
-                <span class="field-label">FEC 冗余上限（P）</span>
-                <input id="fecParityMax" type="number" min="0" max="7" value="4" />
-              </label>
-              <label class="field">
                 <span class="field-label">日志级别</span>
                 <select id="logLevel">
                   <option value="info">info（默认）</option>
@@ -147,12 +131,18 @@
                   <option value="off">off</option>
                 </select>
               </label>
-            </div>
-            <label class="check">
-              <input id="pmtud" type="checkbox" checked />
-              <span>开启 PMTUD（路径探测，默认开）</span>
-            </label>
-            <div class="grid two">
+              <label class="field">
+                <span class="field-label">MTU 下限（探针起点）</span>
+                <input id="mtu" type="number" min="128" max="9000" value="1040" />
+              </label>
+              <label class="field">
+                <span class="field-label">FEC 数据块数（D）</span>
+                <input id="fecData" type="number" min="1" max="256" value="10" />
+              </label>
+              <label class="field">
+                <span class="field-label">FEC 冗余上限（P）</span>
+                <input id="fecParityMax" type="number" min="0" max="7" value="4" />
+              </label>
               <label class="field">
                 <span class="field-label">空闲体检间隔（分钟，≤0 关闭）</span>
                 <input id="probeInterval" type="number" min="0" max="1440" value="5" />
