@@ -187,6 +187,8 @@ function statsArgs(cfg) {
   if (cfg.mtu) args.push(`--mtu-min=${cfg.mtu}`);
   if (cfg.pmtud === false) args.push('--no-pmtud');
   args.push(`--fec=${cfg.fec || '10:6'}`);
+  if (cfg.probeInterval) args.push(`--probe-interval=${cfg.probeInterval}`);
+  if (cfg.probe === false) args.push('--no-probe');
   args.push(`--log-level=${cfg.logLevel || 'info'}`);
   if (cfg.logFile) args.push(`--log-file=${cfg.logFile}`);
   return args;
@@ -202,7 +204,8 @@ function classify(line) {
 }
 
 // 末尾的 app_* 字段为应用层(浏览器真实)字节:0.0.5 及更早的隧道不带,捕获可选。
-const STATS_RE = /^stats\s+([\d.]+)s\s+live=(\d+)\s+up=(\d+)\s+tunnels=(\d+)\s+tx=(\d+)B\s+rx=(\d+)B\s+tx_rate=(-?\d+)B\/s\s+rx_rate=(-?\d+)B\/s(?:\s+app_rx=(\d+)B\s+app_tx=(\d+)B\s+app_rx_rate=(-?\d+)B\/s\s+app_tx_rate=(-?\d+)B\/s)?/;
+// probe_* 同理:0.0.18 及更早的隧道不发,渲染层按"未启用"处理。
+const STATS_RE = /^stats\s+([\d.]+)s\s+live=(\d+)\s+up=(\d+)\s+tunnels=(\d+)\s+tx=(\d+)B\s+rx=(\d+)B\s+tx_rate=(-?\d+)B\/s\s+rx_rate=(-?\d+)B\/s(?:\s+app_rx=(\d+)B\s+app_tx=(\d+)B\s+app_rx_rate=(-?\d+)B\/s\s+app_tx_rate=(-?\d+)B\/s)?(?:\s+probe_run=(\d)\s+probe_next=(-?\d+)s\s+probe_n=(\d+))?/;
 
 function startTunnel(cfg) {
   if (child) stopTunnel();
@@ -250,10 +253,26 @@ function startTunnel(cfg) {
           appTx: m[10] !== undefined ? Number(m[10]) : undefined,
           appRxRate: m[11] !== undefined ? Number(m[11]) : undefined,
           appTxRate: m[12] !== undefined ? Number(m[12]) : undefined,
+          // 空闲链路体检:probe_next 为 -1 表示未启用,-2 之类不会出现。
+          probeRun: m[13] !== undefined ? m[13] === '1' : undefined,
+          probeNextSec: m[14] !== undefined ? Number(m[14]) : undefined,
+          probeCount: m[15] !== undefined ? Number(m[15]) : undefined,
         });
-      } else {
-        send('fcp:log', { level: 'info', line });
+        return;
       }
+      // One line per finished idle measurement. Not a log line: the log page is
+      // for what went wrong, and a probe that worked is not an event.
+      if (line.startsWith('probe ')) {
+        try {
+          // `at` is the tunnel's monotonic clock (process uptime), useless as a
+          // timestamp; the shelf stamps the arrival time instead.
+          send('fcp:probe', { ...JSON.parse(line.slice(6)), recvAt: Date.now() });
+        } catch {
+          send('fcp:log', { level: 'warn', line: `probe: unparsable result ${line.slice(6, 120)}` });
+        }
+        return;
+      }
+      send('fcp:log', { level: 'info', line });
     }
   });
   proc.stderr.setEncoding('utf8');

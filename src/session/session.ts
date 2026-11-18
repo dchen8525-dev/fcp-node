@@ -8,7 +8,7 @@ import {
   SALT_LEN, Direction, type DirectionValue,
   HandshakeRole, HandshakeState, HandshakeError,
   CAP_PMTUD, CAP_TLV, TLV_TYPE_ACK_V2, TLV_TYPE_KEY_UPDATE, TLV_TYPE_PREWARM,
-  TLV_TYPE_MULTIPLEX, MUX_MAX_STREAMS, LOCAL_FLAGS_M1,
+  TLV_TYPE_MULTIPLEX, MUX_MAX_STREAMS, LOCAL_FLAGS_M1, TLV_TYPE_PATH_PROBE,
   HANDSHAKE_SEND_BUDGET, BOOTSTRAP_PROBES_PER_SECOND,
   NAT_KEEPALIVE_MS, PEER_ALIVE_GRACE_MS, KEEPALIVE_MAGIC, KEEPALIVE_LEN,
   RESET_MAGIC, RESET_MAGIC_LEN, ENVELOPE_OVERHEAD, NONCE_LIMIT,
@@ -40,6 +40,7 @@ import { hdrType, parseHdr } from '../fec/hdr.ts';
 import { FecstatValidator, FecstatStatus } from '../fec/fecstat.ts';
 import { Stream, type StreamCallbacks } from '../stream/stream.ts';
 import { AdaptiveFec, BbrLite, FecstatReporter, chooseGroupD } from '../control/controller.ts';
+import { PathProbe, isProbeFrame, type ProbeResult } from '../probe/pathprobe.ts';
 
 /** Host-side stream bookkeeping for multiplexed sessions. The default stream
  *  (sid 0) stays wired through the SessionCallbacks read/eof/closed; sids
@@ -66,6 +67,9 @@ export interface SessionConfig {
   interleave?: number;
   /** Redundant copies of every ACK v2 (1 = off). */
   ackCopies?: number;
+  /** Offer the idle path probe TLV (default true). False on either end removes
+   *  the feature: no train is started and no train is answered. */
+  probe?: boolean;
   mtu?: number; ipHdrLen?: number;
   pinnedK?: number;
   initialSrttMs?: number;
@@ -87,7 +91,13 @@ export interface SessionCallbacks {
   debug?: (line: string) => void;
   /** Multiplexing host (server side): creates per-sid stream state. */
   streamHost?: StreamHost;
+  /** An idle-time path measurement finished on this end (initiator only).
+   *  Stamped with the session's current geometry so a reader can tell what the
+   *  measured loss would have cost. */
+  pathProbe?: (r: SessionProbeResult) => void;
 }
+
+export type SessionProbeResult = ProbeResult & { mtu: number; d: number; k: number };
 
 export interface SessionStats {
   authFail: number; structFail: number; dataTx: number; dataRx: number;
@@ -168,6 +178,11 @@ export class Session {
   private mux = false;
   private streams = new Map<number, Stream>();
   private streamHost: StreamHost | null = null;
+  /** Idle-time path measurement. Answers a peer's train unconditionally (that
+   *  costs nothing and needs no negotiation beyond the TLV), but only *starts*
+   *  one when the peer also offered TLV 6 — see startPathProbe. */
+  private probe: PathProbe;
+  private probeEnabled = false;
 
   get isClosed(): boolean { return this.closeNotified; }
 
@@ -230,6 +245,13 @@ export class Session {
     this.bbr = new BbrLite(cfg.initialSrttMs ?? DEFAULT_SRTT_MS, cfg.trace);
     this.sndBbr = new BbrLite(cfg.initialSrttMs ?? DEFAULT_SRTT_MS, cfg.trace);
     this.reporter = new FecstatReporter(cfg.salt, cfg.recvDirection);
+    this.probe = new PathProbe({
+      send: (payload) => this.sendOob(payload),
+      srttMs: () => Math.max(1, this.bbr.srttMs),
+      // Fills the current MTU exactly: envelope(28) + fec header(7) + payload.
+      dgramSize: () => (this.limits.valid ? this.limits.symbolMax : 0),
+      onResult: (r) => this.cb.pathProbe?.({ ...r, mtu: this.limits.mtu, d: this.groupD, k: this.k }),
+    });
 
     this.stream = new Stream(
       { maxSegment: this.limits.payloadMax, initialSrttMs: cfg.initialSrttMs ?? DEFAULT_SRTT_MS },
@@ -261,6 +283,18 @@ export class Session {
   get established(): boolean { return this.hs.established; }
   /** True only when both ends offered TLV type 4, i.e. the roll is safe. */
   get keyUpdateActive(): boolean { return this.env.keyUpdate; }
+  /** The peer understands the idle-time path probe. */
+  get pathProbeReady(): boolean { return this.probeEnabled && this.configured; }
+  get pathProbeRunning(): boolean { return this.probe.running; }
+
+  /** Put one bounded probe train on the path. Returns false when the peer did not
+   *  offer the TLV, the session is not usable, or a run is already in flight.
+   *  Only the initiator side gets a result; the answering side just answers. */
+  startPathProbe(budgetBytes: number): boolean {
+    if (!this.pathProbeReady || this.closeNotified) return false;
+    if (this.tx === null || this.rx === null) return false;
+    return this.probe.start(this.nowMs, budgetBytes);
+  }
   get state(): number { return this.hs.state; }
   get mtuLimits(): MtuLimits { return this.limits; }
   get streamRef(): Stream { return this.stream; }
@@ -295,6 +329,11 @@ export class Session {
     // M1: always offered. A peer that does not echo it keeps the single-stream
     // wire (sid framing only engages when BOTH ends offered).
     tlvs.push({ type: TLV_TYPE_MULTIPLEX, value: Buffer.alloc(0) });
+    // Advertised like M1: the probe is passive support on the answering side, so
+    // offering it costs one byte in the handshake and nothing afterwards. It only
+    // runs when both ends offered it, which is what keeps a legacy peer from
+    // being hit by a train it would answer with silence.
+    if (this.cfg.probe !== false) tlvs.push({ type: TLV_TYPE_PATH_PROBE, value: Buffer.alloc(0) });
     if (this.cfg.prewarmTicket) tlvs.push({ type: TLV_TYPE_PREWARM, value: encodePrewarmTlv(this.cfg.prewarmTicket) });
     this.hs.setLocalTlvs(tlvs);
     // #77: no TLVs at all -> plain v7 shape (no kCapTlv bit), which an old
@@ -406,6 +445,7 @@ export class Session {
     }
     if (this.dispatchHandshake(payload, nowMs)) return;
     if (this.isPmtuFrame(payload) && this.pmtuHandle(payload, nowMs)) return;
+    if (this.probeEnabled && isProbeFrame(payload)) { this.probe.onFrame(payload, nowMs); return; }
     this.handleFecstat(payload, nowMs);
   }
 
@@ -433,6 +473,7 @@ export class Session {
     // M1: framing engages only when BOTH ends offered the TLV; an old peer
     // keeps today's single-stream wire, byte for byte.
     this.mux = this.hs.tlvAgreed(TLV_TYPE_MULTIPLEX);
+    this.probeEnabled = this.hs.tlvAgreed(TLV_TYPE_PATH_PROBE);
     // The 1-byte sid prefix rides inside the symbol payload, so every stream
     // must carve segments one byte below payloadMax or FrameTx drops each
     // full-size segment as oversize.
@@ -975,6 +1016,7 @@ export class Session {
         this.sendOob(report);
       }
       this.sendPmtuProbe(nowMs);
+      this.probe.onTick(nowMs);
     }
     if (!this.lastWireOutMs) this.lastWireOutMs = nowMs;
     if (nowMs - this.lastWireOutMs >= NAT_KEEPALIVE_MS) {

@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld('fcp', {
   speedStop: () => ipcRenderer.invoke('fcp:speed:stop'),
   openLogDir: () => ipcRenderer.invoke('fcp:open-log-dir'),
   onStats: (fn) => ipcRenderer.on('fcp:stats', (_e, p) => fn(p)),
+  onProbe: (fn) => ipcRenderer.on('fcp:probe', (_e, p) => fn(p)),
   onLog: (fn) => ipcRenderer.on('fcp:log', (_e, p) => fn(p)),
   onState: (fn) => ipcRenderer.on('fcp:state', (_e, p) => fn(p)),
   onSpeed: (fn) => ipcRenderer.on('fcp:speed', (_e, p) => fn(p)),

@@ -81,6 +81,19 @@ Common:
                         Copies carry a "redundant copy" bit so the peer does
                         not mistake them for duplicate-ACK loss evidence, and
                         they ride the data lanes so the interleave spreads them.
+  --no-probe            disable the idle path probe. Both ends must offer TLV 6,
+                        so this removes the feature end to end instead of
+                        leaving one end sending trains into silence.
+  --probe-interval=SEC  how often an idle tunnel measures its path (default 300,
+                        30..86400). Idle means no application byte for 20 s in
+                        either direction: a busy tunnel is never probed, and the
+                        probe's own bytes do not count as activity.
+  --probe-budget=KiB    DAT payload one measurement may use across both
+                        directions (default 1024, 64..8192). The train ramps
+                        until loss rises above the path's own baseline and then
+                        settles below that rate, so the loss it reports is the
+                        path's, not the probe's. One stdout line per run:
+                        probe <json> with at/mtu/d/k/up/down.
   --metrics=PREFIX      per-session controller metrics, one JSONL file per
                         session: <PREFIX>-client-<salt>.jsonl (and -server-).
                         Records the adaptive controllers' decisions (fec_k)
@@ -117,7 +130,7 @@ See docs/移植对照与差异.md for the full delta list.
 // parser used "the next token does not start with -" to decide, so `--no-pmtud 3`
 // silently swallowed the 3 and every later positional shifted.
 const BOOL_FLAGS = new Set([
-  'help', 'no-pmtud',
+  'help', 'no-pmtud', 'no-probe',
 ]);
 
 const ALIASES: Record<string, string> = {
@@ -129,6 +142,7 @@ const ALIASES: Record<string, string> = {
 // ever reached because the client branch matched first).
 const KNOWN_OPTS = new Set([
   'key', 'bind', 'peer', 'mtu-min', 'fec', 'metrics', 'interleave', 'ack-copies',
+  'probe-interval', 'probe-budget',
   'log-level', 'log-file', 'seconds', 'speedtest-seconds', 'positional',
 ]);
 
@@ -442,6 +456,11 @@ async function main(): Promise<void> {
   // exactly as it was before these knobs existed.
   const interleave = intOpt(opts, 'interleave', 1, 1, MAX_INTERLEAVE);
   const ackCopies = intOpt(opts, 'ack-copies', 1, 1, MAX_ACK_COPIES);
+  // Idle path probe. Both ends must offer TLV 6, so --no-probe on either side
+  // removes the feature end to end rather than leaving one end sending trains
+  // into silence.
+  const probeIntervalSec = intOpt(opts, 'probe-interval', 300, 30, 86400);
+  const probeBudgetKiB = intOpt(opts, 'probe-budget', 1024, 64, 8192);
   const debugLog = logLevel === 'debug' ? (l: string) => log(`DBG ${l}`) : undefined;
   const mtuMin = intOpt(opts, 'mtu-min', DEFAULT_MTU_MIN, 128, 9000);
   // One knob instead of two: the walk's ceiling is not worth a second flag, so
@@ -456,6 +475,9 @@ async function main(): Promise<void> {
     ...fecGeo,
     interleave,
     ackCopies,
+    probe: !flags.has('no-probe'),
+    probeIntervalMs: probeIntervalSec * 1000,
+    probeBudgetBytes: probeBudgetKiB * 1024,
     pinnedK: pinnedKFromEnv(log),
     // PMTUD is ON by default now. CAP_PMTUD (bit4) used to be a hard caps gate
     // against C++ 0.0.19 peers, but the tunnel is Node<->Node only, so the
@@ -492,6 +514,7 @@ async function main(): Promise<void> {
       // Machine channel for the desktop shell: stdout, not `log`, so
       // --log-level=error still reports throughput.
       onStats: (line) => process.stdout.write(line + '\n'),
+      onProbe: (r) => process.stdout.write(`probe ${JSON.stringify(r)}\n`),
     });
   } else if (mode === 'speedtest') {
     // --speedtest used to be advertised as a client flag, but the client branch

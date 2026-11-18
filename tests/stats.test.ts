@@ -8,7 +8,7 @@ import { TunnelClient } from '../src/app/tunnel.ts';
 
 const STATS_RE =
   // 尾部追加的 app_* 字段是 GUI 真实速度的数据源,属于格式契约的一部分
-  /^stats ([\d.]+)s live=(\d+) up=(\d+) tunnels=(\d+) tx=(\d+)B rx=(\d+)B tx_rate=(-?\d+)B\/s rx_rate=(-?\d+)B\/s(?: app_rx=(\d+)B app_tx=(\d+)B app_rx_rate=(-?\d+)B\/s app_tx_rate=(-?\d+)B\/s)?$/;
+  /^stats ([\d.]+)s live=(\d+) up=(\d+) tunnels=(\d+) tx=(\d+)B rx=(\d+)B tx_rate=(-?\d+)B\/s rx_rate=(-?\d+)B\/s(?: app_rx=(\d+)B app_tx=(\d+)B app_rx_rate=(-?\d+)B\/s app_tx_rate=(-?\d+)B\/s)?(?: probe_run=(\d) probe_next=(-?\d+)s probe_n=(\d+))?$/;
 
 test('stats line is emitted on a timer and parses', async () => {
   const lines: string[] = [];
@@ -33,6 +33,11 @@ test('stats line is emitted on a timer and parses', async () => {
     assert.equal(Number(m[3]), 0, 'no established sessions on an idle tunnel');
     assert.ok(Number(m[5]) >= 0, 'tx is non-negative');
     assert.ok(Number(m[6]) >= 0, 'rx is non-negative');
+    // The idle probe schedule is part of the line: the GUI shows the countdown,
+    // and -1 is its "feature off" marker.
+    assert.equal(m[13], '0', 'no probe in flight on an idle tunnel');
+    assert.ok(Number(m[14]) >= 0, 'probe_next is a countdown, or -1 when off');
+    assert.equal(Number(m[15]), 0, 'no measurements yet');
   }
 
   // Uptime advances monotonically: the graph's x-axis depends on it.

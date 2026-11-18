@@ -57,6 +57,10 @@
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 13.5 7 9l3 3 6.5-6.5M12.5 5.5H17v4.5"/></svg>
           <span>运行状态</span>
         </button>
+        <button class="nav-item" data-page="probe" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 10.5h3l2-5 2.5 9.5 2-6.5 1.4 2h4.1"/></svg>
+          <span>链路体检</span>
+        </button>
         <button class="nav-item" data-page="speed" type="button">
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 15a7 7 0 1 1 12 0M10 12l3.2-3.2"/></svg>
           <span>链路测速</span>
@@ -160,6 +164,16 @@
               <input id="pmtud" type="checkbox" checked />
               <span>开启 PMTUD（路径探测，默认开）</span>
             </label>
+            <div class="grid two">
+              <label class="field">
+                <span class="field-label">空闲体检间隔（分钟）</span>
+                <input id="probeInterval" type="number" min="1" max="1440" value="5" />
+              </label>
+            </div>
+            <label class="check">
+              <input id="probeOn" type="checkbox" checked />
+              <span>空闲时自动体检链路（单次最多 1 MB，忙碌时不测）</span>
+            </label>
           </div>
         </div>
 
@@ -206,6 +220,55 @@
             <div><span>运行时长</span><strong id="kUptime">—</strong></div>
             <div><span>本地代理</span><strong class="mono" id="kListen">—</strong></div>
           </div>
+        </div>
+      </section>
+
+      <!-- probe -->
+      <section class="page" data-page="probe">
+        <header class="page-head">
+          <div>
+            <h1>链路体检</h1>
+            <p>空闲时两端自动配合测一次路径：探测包走隧道自己的 UDP 通道，不经过业务流，单次最多 1 MB。忙碌时不测。</p>
+          </div>
+          <div class="probe-when" id="probeWhen">等待首次测量</div>
+        </header>
+
+        <div class="grid two">
+          <div class="metric">
+            <div class="metric-label"><i class="swatch down"></i>下行可用</div>
+            <div class="metric-value" id="probeDown">— <small>MB/s</small></div>
+            <div class="metric-sub" id="probeDownSub">还没测过</div>
+          </div>
+          <div class="metric up-metric">
+            <div class="metric-label"><i class="swatch up"></i>上行可用</div>
+            <div class="metric-value" id="probeUp">— <small>MB/s</small></div>
+            <div class="metric-sub" id="probeUpSub">还没测过</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            本次测量
+            <span class="card-note" id="probeAt">—</span>
+          </div>
+          <div class="kv-grid">
+            <div><span>RTT 最小 / 平均</span><strong id="probeRtt">—</strong></div>
+            <div><span>抖动</span><strong id="probeJitter">—</strong></div>
+            <div><span>排队增量</span><strong id="probeQueue">—</strong></div>
+            <div><span>最长连续丢</span><strong id="probeRun">—</strong></div>
+            <div><span>探测数据</span><strong id="probeBytes">—</strong></div>
+            <div><span>用时</span><strong id="probeElapsed">—</strong></div>
+            <div><span>MTU</span><strong id="probeMtu">—</strong></div>
+            <div><span>FEC k / d</span><strong id="probeFec">—</strong></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            最近几次
+            <span class="card-note" id="probeHistoryNote">还没有记录</span>
+          </div>
+          <div class="probe-history" id="probeHistory"></div>
         </div>
       </section>
 

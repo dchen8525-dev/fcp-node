@@ -9,8 +9,10 @@ import {
   SALT_LEN, Direction, HandshakeRole, DEFAULT_MTU_MIN, DEFAULT_D, DEFAULT_P,
   OPEN_MAX_BYTES, ATYP_DOMAIN, ATYP_IPV4, DATA_WIRE_OVERHEAD, NONCE_LIMIT,
   MUX_MAX_STREAMS, MUX_SESSION_POOL,
+  PROBE_INTERVAL_MS, PROBE_IDLE_MS, PROBE_BUDGET_BYTES, PROBE_RETRY_MS,
 } from '../constants.ts';
-import { Session, type SessionConfig } from '../session/session.ts';
+import { Session, type SessionConfig, type SessionProbeResult } from '../session/session.ts';
+import { probeReport, type ProbeReport } from '../probe/pathprobe.ts';
 import { Stream, type StreamCallbacks } from '../stream/stream.ts';
 import { sealReset } from '../crypto/envelope.ts';
 import {
@@ -88,6 +90,14 @@ export interface TunnelOptions {
   onStats?: (line: string) => void;
   /** Verbose per-datagram / per-connection trace, enabled by --log-level=debug. */
   debugLog?: (line: string) => void;
+  /** One idle-time path measurement finished. Client side only: the server
+   *  answers trains but never starts one (it cannot know whether the user is
+   *  working, and two ends probing each other would double the cost). */
+  onProbe?: (r: ProbeReport) => void;
+  /** Idle path probe: false disables it entirely (the peer still answers). */
+  probe?: boolean;
+  probeIntervalMs?: number;
+  probeBudgetBytes?: number;
   tracePrefix?: string;
 }
 
@@ -267,6 +277,14 @@ export class TunnelClient {
    *  which only held while the tick was a fixed 10 ms interval; a
    *  deadline-driven tick can straddle the window and skip a whole period. */
   private lastStatsDbgMs = 0;
+  /** Idle path probe: when the next one is due (0 = not scheduled yet), whether
+   *  one is in flight, and the last time the *application* moved a byte. Raw
+   *  wire bytes are useless here — the tunnel's own ACKs and keepalives would
+   *  keep a completely idle session looking busy forever. */
+  private probeNextMs = 0;
+  private probeRunning = false;
+  private probeCount = 0;
+  private lastAppByteMs = 0;
 
   constructor(opts: TunnelOptions) {
     this.opts = opts;
@@ -309,6 +327,9 @@ export class TunnelClient {
     this.armTick();
     this.startedMs = nowMs();
     this.statsPrevMs = this.startedMs;
+    // The first probe is due one interval after start, not at start: a user who
+    // launches the app and immediately works should never see a train.
+    this.lastAppByteMs = this.startedMs;
     if (this.opts.onStats) {
       this.statsTimer = setInterval(() => this.emitStats(), STATS_PERIOD_MS);
     }
@@ -350,6 +371,7 @@ export class TunnelClient {
       role: HandshakeRole.Client,
       d: this.opts.d ?? DEFAULT_D, p: this.opts.p ?? DEFAULT_P,
       interleave: this.opts.interleave, ackCopies: this.opts.ackCopies,
+      probe: this.opts.probe,
       mtu: this.opts.mtu ?? DEFAULT_MTU_MIN,
       pmtuMaxMtu: this.opts.pmtuMaxMtu,
       pinnedK: this.opts.pinnedK,
@@ -377,6 +399,9 @@ export class TunnelClient {
         this.pool = this.pool.filter((p) => p.key !== key);
       },
       eof: () => {},
+      // Only pool sessions are probed: they outlive any single connection, which
+      // is exactly the state the probe needs (established, no user traffic).
+      pathProbe: (r) => this.onPathProbe(r),
       streamHost: {
         // The client opens every stream itself; nothing inbound to accept.
         inboundStream: () => null,
@@ -466,13 +491,91 @@ export class TunnelClient {
       `stats ${uptime}s live=${this.sessions.size} up=${up} tunnels=${this.sessions.size} ` +
         `tx=${this.bytesTx}B rx=${this.bytesRx}B tx_rate=${txRate}B/s rx_rate=${rxRate}B/s ` +
         `app_rx=${this.bytesAppRx}B app_tx=${this.bytesAppTx}B ` +
-        `app_rx_rate=${appRxRate}B/s app_tx_rate=${appTxRate}B/s`,
+        `app_rx_rate=${appRxRate}B/s app_tx_rate=${appTxRate}B/s ` +
+        `probe_run=${this.probeRunning ? 1 : 0} probe_next=${this.probeDueSec(now)}s probe_n=${this.probeCount}`,
     );
     this.statsPrevTx = this.bytesTx;
     this.statsPrevRx = this.bytesRx;
     this.statsPrevAppRx = this.bytesAppRx;
     this.statsPrevAppTx = this.bytesAppTx;
     this.statsPrevMs = now;
+  }
+
+  /** Seconds until the next idle probe, or -1 when the feature is off. */
+  private probeDueSec(now: number): number {
+    if (this.opts.probe === false) return -1;
+    if (this.probeRunning) return 0;
+    if (this.probeNextMs === 0) return Math.round((this.opts.probeIntervalMs ?? PROBE_INTERVAL_MS) / 1000);
+    return Math.max(0, Math.round((this.probeNextMs - now) / 1000));
+  }
+
+  /**
+   * One idle-time measurement, on a cadence.
+   *
+   * The gate is application bytes, not wire bytes: a session that is only
+   * exchanging keepalives and ACKs is idle by any measure a user cares about, and
+   * gating on wire traffic would mean the probe never runs. The probe is also
+   * skipped while any stream has bytes in flight or queued — measuring a path
+   * that is already carrying data reports the user's traffic, and adds a
+   * megabyte to it.
+   *
+   * If no session is established at all (fresh start, or the pool idled out
+   * after five minutes of silence) one is created: "idle" is precisely the state
+   * in which the user has nothing connected, so a probe that required a live
+   * session would never run when it matters.
+   */
+  private maybeProbe(now: number): void {
+    if (this.opts.probe === false) return;
+    if (this.probeRunning) {
+      // The session carrying the run can die mid-train; without this the flag
+      // would stay set and no later probe would ever start.
+      let live = false;
+      for (const entry of this.pool) if (entry.session.pathProbeRunning) { live = true; break; }
+      if (live) return;
+      this.probeRunning = false;
+    }
+    const interval = this.opts.probeIntervalMs ?? PROBE_INTERVAL_MS;
+    if (this.probeNextMs === 0) {
+      this.probeNextMs = Math.max(now, this.lastAppByteMs) + interval;
+      return;
+    }
+    if (now < this.probeNextMs) return;
+    if (now - this.lastAppByteMs < PROBE_IDLE_MS) {
+      // Busy: do not consume the schedule, come back when it might be idle.
+      this.probeNextMs = now + Math.min(interval, PROBE_RETRY_MS * 6);
+      return;
+    }
+    let target: Session | null = null;
+    for (const entry of this.pool) {
+      const s = entry.session;
+      if (!s.pathProbeReady || s.pathProbeRunning) continue;
+      if (s.inflightBytes > 0 || s.queuedBytes > 0) continue;
+      target = s;
+      break;
+    }
+    if (!target) {
+      if (this.pool.length === 0) this.ensurePoolEntry();
+      this.probeNextMs = now + PROBE_RETRY_MS;
+      return;
+    }
+    const budget = this.opts.probeBudgetBytes ?? PROBE_BUDGET_BYTES;
+    if (!target.startPathProbe(budget)) { this.probeNextMs = now + PROBE_RETRY_MS; return; }
+    this.probeRunning = true;
+    this.probeNextMs = now + interval;
+    this.log(`path probe: ${Math.round(budget / 1024)} KiB train, idle ${Math.round((now - this.lastAppByteMs) / 1000)}s, mtu=${target.mtuLimits.mtu}`);
+  }
+
+  private onPathProbe(r: SessionProbeResult): void {
+    this.probeRunning = false;
+    ++this.probeCount;
+    const report = probeReport(r, { mtu: r.mtu, d: r.d, k: r.k });
+    this.opts.onProbe?.(report);
+    const pct = (v: number): string => (v < 0 ? '—' : `${(v * 100).toFixed(1)}%`);
+    const mbs = (v: number): string => (v <= 0 ? '—' : `${(v / 1048576).toFixed(2)} MB/s`);
+    this.log(`path probe: up ${mbs(report.up?.ramp ?? 0)} loss ${pct(report.up?.lossRx ?? -1)} · ` +
+      `down ${mbs(report.down?.ramp ?? 0)} loss ${pct(report.down?.lossRx ?? -1)} · ` +
+      `rtt ${report.up?.rttMin ?? -1}/${report.up?.rttAvg ?? -1}ms · ${Math.round(report.ms / 1000 * 10) / 10}s ` +
+      `(${Math.round(report.used / 1024)} KiB)`);
   }
 
   private onUdp(msg: Buffer, rinfo: RemoteInfo): void {
@@ -557,6 +660,7 @@ export class TunnelClient {
       // session down (the default stream's close callback already guards).
       if (b.session.isClosed) { this.sessions.delete(key); b.cleanup(); b.trace?.close(); }
     }
+    this.maybeProbe(now);
     // Armed last: onTick is what creates most deadlines (delayed ack, repair
     // group close, TLP), so computing the delay before the loop would always
     // schedule against the previous round's state and miss them.
@@ -690,6 +794,7 @@ export class TunnelClient {
         writeConn = (b) => {
           const n = connStream!.write(b, nowMs());
           this.bytesAppTx += n;
+          this.lastAppByteMs = nowMs();
           return n;
         };
         consumedConn = (n) => connStream!.consumed(n);
@@ -727,6 +832,7 @@ export class TunnelClient {
     streamRead = (bytes: Buffer) => {
       // 应用层下行:交付给本地应用(浏览器)的字节,不含任何隧道开销。
       this.bytesAppRx += bytes.length;
+      this.lastAppByteMs = nowMs();
       // Consumption is what releases the peer's send window. Doing it only
       // after the local socket has flushed applies real backpressure; the old
       // immediate consumed() let a slow reader grow Node's writable buffer
@@ -1202,6 +1308,7 @@ export class TunnelServer {
       role: HandshakeRole.Server,
       d: this.opts.d ?? DEFAULT_D, p: this.opts.p ?? DEFAULT_P,
       interleave: this.opts.interleave, ackCopies: this.opts.ackCopies,
+      probe: this.opts.probe,
       mtu: this.opts.mtu ?? DEFAULT_MTU_MIN,
       pmtuMaxMtu: this.opts.pmtuMaxMtu,
       pinnedK: this.opts.pinnedK,

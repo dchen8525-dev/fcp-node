@@ -1018,6 +1018,58 @@ select option { background: var(--card); color: var(--ink); }
 .page[data-page="connect"] .card { padding: 15px 18px; margin-bottom: 12px; }
 .page[data-page="connect"] .actions { margin-top: 4px; }
 
+/* ------------------------------------------------------------ link probe */
+
+/* The pill doubles as the answer to "when is it going to run again", so it
+   sits opposite the page heading rather than inside a card. */
+.probe-when {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 11px;
+  white-space: nowrap;
+}
+.probe-when.is-live {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.probe-when.is-off { color: var(--faint); }
+
+.probe-history { display: flex; flex-direction: column; }
+.probe-row {
+  display: grid;
+  grid-template-columns: 52px 1fr 1fr 70px 84px;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 2px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+}
+.probe-row:first-child { border-top: 0; }
+.probe-row.head {
+  padding-top: 0;
+  font-size: 11px;
+  color: var(--muted-2);
+}
+.probe-row .t { font-family: var(--mono); color: var(--muted); }
+.probe-row .bar { display: flex; align-items: center; gap: 8px; }
+.probe-row .bar .track {
+  flex: 1;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--track);
+  overflow: hidden;
+}
+.probe-row .bar .fill { height: 100%; border-radius: 999px; }
+.probe-row .bar .fill.down { background: var(--accent); }
+.probe-row .bar .fill.up { background: var(--sand); }
+.probe-row .n { font-family: var(--mono); text-align: right; color: var(--ink-2); }
+.probe-row .r, .probe-row .l { font-family: var(--mono); color: var(--muted); }
+.probe-empty { padding: 10px 2px; font-size: 12px; color: var(--muted-2); }
+
 /* ---------------------------------------------------------------- motion */
 
 @media (prefers-reduced-motion: reduce) {

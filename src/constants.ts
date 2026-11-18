@@ -81,6 +81,10 @@ export const TLV_TYPE_KEY_UPDATE = 4;
  *  each id carries its own FCP-STREAM byte stream. Old peers never offer it
  *  and see today's single-stream wire, byte for byte. */
 export const TLV_TYPE_MULTIPLEX = 5;
+/** Idle-time path probe. Offered unconditionally; a probe only runs when both
+ *  ends offered it, so a peer that never heard of it is simply never probed
+ *  (one lost probe train would otherwise look like 100% loss). */
+export const TLV_TYPE_PATH_PROBE = 6;
 export const MUX_MAX_STREAMS = 255; // stream ids 1..255; 0 = default stream
 /** Client-side session pool: eligible local connections round-robin across
  *  this many shared sessions (each an independent window and loss domain).
@@ -154,6 +158,64 @@ export const ACK_V2_FLAG_COPY = 0x80;
 /** How many recent ACK signatures the receiver remembers, so a copy that
  *  arrives after a newer ACK still cannot be mistaken for fresh loss evidence. */
 export const ACK_SIG_RING = 4;
+
+// Idle path probe (probe/pathprobe.ts)
+//
+// The tunnel only learns the shape of its path while it is carrying data: FECSTAT
+// needs 256 delivered shards per report, so an idle session measures nothing at
+// all, and the first thing a user does after a long idle period starts from a k/d
+// chosen for a path that may have changed. A probe train is a bounded burst of
+// un-repaired datagrams on the same 5-tuple, so it measures the raw path (which is
+// exactly what k has to cover) without touching stream or ARQ state.
+export const PROBE_MAGIC = Buffer.from('FCPPRB01', 'latin1');
+/** magic8 | type1 | flags1 | token4 | seq2 | total2 | got2 | sentMs4 | size2 |
+ *  reserve4 | aux2 ... = 32 bytes, then zero padding for DAT. */
+export const PROBE_HDR_LEN = 32;
+export const PROBE_TYPE_DAT = 0;
+export const PROBE_TYPE_ECHO = 1;
+export const PROBE_TYPE_SUM = 2;
+export const PROBE_TYPE_DOWN = 3;
+export const PROBE_FLAG_LAST = 0x01;
+/** Set on the DOWN request, so one frame type can never be mistaken for a DAT
+ *  even if a future field changes shape. */
+export const PROBE_FLAG_DOWN = 0x02;
+/** Total DAT payload one measurement may put on the wire, both directions
+ *  together. Echoes are ~67 bytes each on top (see PROBE_HDR_LEN + overhead). */
+export const PROBE_BUDGET_BYTES = 1024 * 1024;
+export const PROBE_INTERVAL_MS = 5 * 60_000;
+/** No application byte in either direction for this long counts as idle. */
+export const PROBE_IDLE_MS = 20_000;
+/** Ramp start. Below this a 512 KiB half-budget finishes before the rate has
+ *  moved at all, so a fresh probe would report the pacing rate, not the path. */
+export const PROBE_RATE_START_BPS = 256 * 1024;
+/** Above this the probe is measuring its own pacing granularity (a 10 ms tick
+ *  cannot space datagrams finer than ~80 KiB/s of burst), so the result is
+ *  reported as "at least this" instead of pretending to resolve more. */
+export const PROBE_RATE_CAP_BPS = 8 * 1024 * 1024;
+/** Datagrams per ramp chunk: 48 x ~1.3 KiB = 63 KiB, which gives a loss
+ *  estimate whose standard error at a 20% baseline is ~5 points — small enough
+ *  to tell "the path loses 20% anyway" from "the path loses 20% because I am
+ *  pacing above capacity", and small enough that 5-6 chunks fit in half the
+ *  budget. */
+export const PROBE_RAMP_ROUND = 48;
+/** A chunk above `baseline + max(this, 2.5 sigma)` ends the ramp. The sigma term
+ *  matters on a lossy path: with 48 datagrams at a 20% baseline, a 20-point jump
+ *  is inside the noise, and a fixed 2-point threshold would stop the ramp at the
+ *  first chunk every single time. */
+export const PROBE_LOSS_LIMIT = 0.02;
+/** Settle pacing as a fraction of the last clean round, so the settle phase
+ *  measures the path instead of re-running the experiment that just failed. */
+export const PROBE_SETTLE_FRACTION = 0.85;
+/** Hard stop for one phase. A 512 KiB half-budget on a 100 KB/s path needs 5 s;
+ *  past this the result is reported with whatever was measured. */
+export const PROBE_TIMEOUT_MS = 15000;
+/** Quiet time after the last datagram before the receiver's summary is built
+ *  and sent: stragglers that arrive inside it are counted, not lost. */
+export const PROBE_DRAIN_MS = 250;
+/** The summary is oob and never retransmitted, so it goes out three times. */
+export const PROBE_SUM_COPIES = 3;
+/** Retry spacing when a probe could not start (no established session yet). */
+export const PROBE_RETRY_MS = 5000;
 
 // Defaults (defaults.h)
 export const DEFAULT_D = 10;

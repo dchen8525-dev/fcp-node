@@ -10,6 +10,7 @@ const el = {
   host: $('host'), port: $('port'), listenHost: $('listenHost'), listenPort: $('listenPort'),
   key: $('key'), keyToggle: $('keyToggle'), remember: $('remember'),
   mtu: $('mtu'), fec: $('fec'), logLevel: $('logLevel'), logFile: $('logFile'), pmtud: $('pmtud'),
+  probeInterval: $('probeInterval'), probeOn: $('probeOn'),
   advToggle: $('advToggle'), advBody: $('advBody'),
   toggleBtn: $('toggleBtn'), actionNote: $('actionNote'),
   stateDot: $('stateDot'), stateText: $('stateText'), stateAddr: $('stateAddr'), stateUptime: $('stateUptime'),
@@ -20,6 +21,12 @@ const el = {
   speedBtn: $('speedBtn'), speedNote: $('speedNote'),
   speedMbps: $('speedMbps'), speedBytes: $('speedBytes'), speedElapsed: $('speedElapsed'),
   speedMiB: $('speedMiB'), speedMeter: $('speedMeter'),
+  probeWhen: $('probeWhen'), probeDown: $('probeDown'), probeDownSub: $('probeDownSub'),
+  probeUp: $('probeUp'), probeUpSub: $('probeUpSub'), probeAt: $('probeAt'),
+  probeRtt: $('probeRtt'), probeJitter: $('probeJitter'), probeQueue: $('probeQueue'),
+  probeRun: $('probeRun'), probeBytes: $('probeBytes'), probeElapsed: $('probeElapsed'),
+  probeMtu: $('probeMtu'), probeFec: $('probeFec'),
+  probeHistory: $('probeHistory'), probeHistoryNote: $('probeHistoryNote'),
   logView: $('logView'), logFilter: $('logFilter'), logClear: $('logClear'), logDir: $('logDir'),
   themeBtn: $('themeBtn'), themeMenu: $('themeMenu'),
 };
@@ -35,6 +42,13 @@ const state = {
   filter: 'all',
   startedAt: 0,
   speedTesting: false,
+  // Newest first. In memory only: a measurement is a property of the tunnel
+  // that produced it, and replaying last week's numbers against today's server
+  // would be worse than an empty list.
+  probes: [],
+  probeRunning: false,
+  probeNextSec: -1,
+  probeCount: 0,
 };
 
 function fmtBytes(n) {
@@ -218,6 +232,9 @@ function collectSettings() {
     logLevel: el.logLevel.value,
     logFile: el.logFile.value.trim(),
     pmtud: el.pmtud.checked,
+    // 秒,与 --probe-interval 同一单位
+    probeInterval: Math.max(1, Number(el.probeInterval.value) || 5) * 60,
+    probe: el.probeOn.checked,
     remember: el.remember.checked,
     speedUrl: el.speedUrl.value.trim(),
     speedSeconds: Number(el.speedSeconds.value) || 10,
@@ -232,6 +249,7 @@ function scheduleSave() {
       remember: false, key: '', host: '', port: 4460, listenHost: '',
       listenPort: 1080, mtu: 1040, fec: '', logLevel: '', logFile: '',
       pmtud: true, speedUrl: '', speedSeconds: 10, speedPort: 1080,
+      probeInterval: 300, probe: true,
     });
     return;
   }
@@ -259,6 +277,8 @@ function applySettings(s) {
   if (s.logLevel) el.logLevel.value = s.logLevel;
   set(el.logFile, s.logFile);
   if (typeof s.pmtud === 'boolean') el.pmtud.checked = s.pmtud;
+  if (typeof s.probeInterval === 'number') el.probeInterval.value = String(Math.max(1, Math.round(s.probeInterval / 60)));
+  if (typeof s.probe === 'boolean') el.probeOn.checked = s.probe;
   if (typeof s.remember === 'boolean') el.remember.checked = s.remember;
   set(el.speedUrl, s.speedUrl);
   set(el.speedSeconds, s.speedSeconds);
@@ -285,6 +305,7 @@ function setRunning(on) {
     state.peak = 0;
     drawChart();
   }
+  renderProbeWhen();
 }
 
 function flashNote(text, kind) {
@@ -375,6 +396,10 @@ window.fcp.onStats((s) => {
   el.kUptime.textContent = fmtUptime(s.uptimeSec * 1000);
   el.stateUptime.textContent = fmtUptime(s.uptimeSec * 1000);
   el.chartPeak.textContent = `峰值 ${fmtBytes(state.peak)}/s`;
+  if (s.probeRun !== undefined) state.probeRunning = s.probeRun;
+  if (s.probeNextSec !== undefined) state.probeNextSec = s.probeNextSec;
+  if (s.probeCount !== undefined) state.probeCount = s.probeCount;
+  renderProbeWhen();
   drawChart();
 });
 
@@ -622,6 +647,111 @@ window.fcp.onSpeed((p) => {
     ts: Date.now() });
 });
 
+// ---------------------------------------------------------------- link probe
+//
+// The tunnel probes itself while idle and prints one `probe {...}` line per run.
+// Nothing here triggers a measurement: the whole point is that it happens when
+// the user is not looking, and the tab is a window onto what it found.
+
+const PROBE_HISTORY = 24;
+
+const fmtMbs = (bps) => (bps > 0 ? (bps / 1048576).toFixed(2) : '—');
+const fmtLoss = (v) => (v < 0 || v === undefined ? '—' : `${(v * 100).toFixed(1)}%`);
+const fmtMs = (v) => (v < 0 || v === undefined ? '—' : `${Math.round(v)} ms`);
+
+function mmss(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function renderProbeWhen() {
+  const node = el.probeWhen;
+  node.classList.remove('is-live', 'is-off');
+  if (!state.running) { node.textContent = '代理未启动'; node.classList.add('is-off'); return; }
+  if (state.probeNextSec < 0) { node.textContent = '已关闭（--no-probe）'; node.classList.add('is-off'); return; }
+  if (state.probeRunning) { node.textContent = '测量中…'; node.classList.add('is-live'); return; }
+  node.textContent = state.probeCount > 0
+    ? `下次 ${mmss(state.probeNextSec)} ｜ 已测 ${state.probeCount} 次`
+    : `首次测量 ${mmss(state.probeNextSec)} 后（需空闲）`;
+}
+
+/** One direction's two cards. `ramp` is the pacing rate the ramp proved clean;
+ *  `rate` is what actually arrived, so a path that loses 20% shows both. */
+function renderProbeDir(valueNode, subNode, d, label) {
+  if (!d) {
+    valueNode.innerHTML = '— <small>MB/s</small>';
+    subNode.textContent = `${label}未测`;
+    return;
+  }
+  const cap = d.capped ? '≥ ' : '';
+  valueNode.innerHTML = `${cap}${fmtMbs(d.ramp)} <small>MB/s</small>`;
+  const loss = d.lossRx >= 0 ? d.lossRx : d.lossTx;
+  // 丢包优先用接收端自己的计数(lossRx);拿不到才退回发送端"回显缺失"。
+  subNode.textContent = `丢包 ${fmtLoss(loss)} · 有效 ${fmtMbs(d.rate)} MB/s ${d.reason === 'timeout' ? '· 超时' : ''}`;
+}
+
+function renderProbe() {
+  const p = state.probes[0];
+  renderProbeWhen();
+  if (!p) {
+    renderProbeDir(el.probeDown, el.probeDownSub, null, '下行');
+    renderProbeDir(el.probeUp, el.probeUpSub, null, '上行');
+    el.probeAt.textContent = '—';
+    for (const k of ['probeRtt', 'probeJitter', 'probeQueue', 'probeRun',
+      'probeBytes', 'probeElapsed', 'probeMtu', 'probeFec']) el[k].textContent = '—';
+    el.probeHistory.textContent = '';
+    el.probeHistoryNote.textContent = '还没有记录';
+    return;
+  }
+  const up = p.up;
+  const down = p.down;
+  renderProbeDir(el.probeDown, el.probeDownSub, down, '下行');
+  renderProbeDir(el.probeUp, el.probeUpSub, up, '上行');
+  el.probeAt.textContent = `${clock(p.recvAt || Date.now())} · ${(p.ms / 1000).toFixed(1)} 秒`;
+  // RTT can only come from the uplink half: its echoes carry the sent timestamp.
+  el.probeRtt.textContent = up && up.rttMin >= 0 ? `${up.rttMin} / ${up.rttAvg}` : '—';
+  el.probeJitter.textContent = fmtMs((up && up.jitter >= 0 ? up.jitter : (down ? down.jitter : -1)));
+  el.probeQueue.textContent = fmtMs(up ? up.queue : (down ? down.queue : -1));
+  const maxRun = Math.max(up ? up.maxRun : -1, down ? down.maxRun : -1);
+  el.probeRun.textContent = maxRun < 0 ? '—' : `${maxRun} 包`;
+  el.probeBytes.textContent = `${fmtBytes(p.used)} / ${fmtBytes(p.budget)}`;
+  el.probeElapsed.textContent = `${(p.ms / 1000).toFixed(1)} 秒`;
+  el.probeMtu.textContent = p.mtu ? `${p.mtu} B` : '—';
+  el.probeFec.textContent = p.k ? `${p.k} / ${p.d}` : '—';
+
+  const rows = state.probes.slice(0, PROBE_HISTORY);
+  const peak = rows.reduce((m, r) => Math.max(m, r.down ? r.down.ramp : 0, r.up ? r.up.ramp : 0), 0) || 1;
+  const every = Math.max(1, Math.round((Number(el.probeInterval.value) || 5)));
+  el.probeHistoryNote.textContent = `${rows.length} 条 · 空闲时每 ${every} 分钟一次`;
+  const frag = document.createDocumentFragment();
+  const head = document.createElement('div');
+  head.className = 'probe-row head';
+  head.innerHTML = '<span class="t">时间</span><span>下行</span><span>上行</span>'
+    + '<span class="n">RTT</span><span class="l">丢包 下/上</span>';
+  frag.appendChild(head);
+  for (const r of rows) {
+    const row = document.createElement('div');
+    row.className = 'probe-row';
+    const bar = (d, cls) => `<div class="bar"><div class="track"><div class="fill ${cls}" style="width:${
+      Math.min(100, ((d && d.ramp ? d.ramp : 0) / peak) * 100).toFixed(0)}%"></div></div>`
+      + `<span class="n">${d && d.capped ? '≥' : ''}${fmtMbs(d ? d.ramp : 0)}</span></div>`;
+    row.innerHTML = `<span class="t">${clock(r.recvAt || Date.now())}</span>`
+      + bar(r.down, 'down') + bar(r.up, 'up')
+      + `<span class="n">${r.up && r.up.rttAvg >= 0 ? `${r.up.rttAvg}ms` : '—'}</span>`
+      + `<span class="l">${fmtLoss(r.down ? r.down.lossRx : -1)} / ${fmtLoss(r.up ? r.up.lossRx : -1)}</span>`;
+    frag.appendChild(row);
+  }
+  el.probeHistory.textContent = '';
+  el.probeHistory.appendChild(frag);
+}
+
+window.fcp.onProbe((p) => {
+  state.probes.unshift(p);
+  while (state.probes.length > PROBE_HISTORY) state.probes.pop();
+  state.probeRunning = false;
+  renderProbe();
+});
+
 // ---------------------------------------------------------------- boot
 
 (async () => {
@@ -643,6 +773,7 @@ window.fcp.onSpeed((p) => {
     el.kListen.textContent = st.listen;
   }
   drawChart();
+  renderProbe();
   if (!el.host.value) el.host.focus();
 })();
 
