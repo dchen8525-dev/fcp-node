@@ -121,7 +121,7 @@ test('adaptive d: shrinks when k would saturate, never below the floor', () => {
   // expected to see k pinned at the ceiling (that path is past what parity can
   // express, not something a group size can fix).
   assert.equal(chooseGroupD({ dMax: 10, p: 6, loss: 0.55, symPerSec: 0 }), D_FLOOR);
-  // A negotiated ceiling below the floor wins: --fec=2:6 runs d = 2.
+  // A negotiated ceiling below the floor wins: --fec-data=2 runs d = 2.
   assert.equal(chooseGroupD({ dMax: 2, p: 6, loss: 0.4, symPerSec: 0 }), 2);
   // p = 0 (framing without repair): group size is cosmetic, leave it alone.
   assert.equal(chooseGroupD({ dMax: 10, p: 0, loss: 0.4, symPerSec: 5000 }), 10);

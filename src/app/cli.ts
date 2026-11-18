@@ -8,7 +8,7 @@ import { createServer, connect } from 'node:net';
 import { randomBytes } from 'node:crypto';
 import {
   PRODUCT_VERSION, DEFAULT_MTU_MIN, DEFAULT_PMTU_MAX_MTU, DEFAULT_D, DEFAULT_P,
-  MAX_INTERLEAVE, MAX_ACK_COPIES,
+  MAX_PARITY, MAX_INTERLEAVE, MAX_ACK_COPIES,
 } from '../constants.ts';
 import { TunnelClient, TunnelServer, type TunnelOptions } from './tunnel.ts';
 import {
@@ -58,12 +58,19 @@ MTU (PMTUD is ON by default):
                         --mtu / -m are rejected on purpose, no compatibility.)
 
 Common:
-  --fec=D:P             frame geometry (default 10:6); P is the per-set parity
-                        CEILING, and it is also the ceiling the adaptive
-                        controller may raise k to. The sender starts at
-                        min(3,P) and adjusts k itself from loss feedback, so
-                        there is no --parity / --k / --fec-budget knob any more
-                        (all three are rejected).
+  --fec-data=N          data symbols per repair set (default 10, 1..256). A set
+                        is repaired once N data symbols plus up to P parity
+                        symbols have gone out.
+  --fec-parity-max=N    the per-set parity CEILING (default 6, 0..7). It is also
+                        the ceiling the adaptive controller may raise k to: the
+                        sender starts at min(3,P) and adjusts k itself from loss
+                        feedback, so there is no --parity / --k / --fec-budget
+                        knob any more (all three are rejected).
+                        --fec-data + --fec-parity-max must not exceed 256, which
+                        is what one byte of symbol index can address.
+                        (--fec=D:P was split into these two; the combined form is
+                        rejected rather than parsed, so a colon can never decide
+                        how the same two numbers are read.)
   --interleave=N        repair groups kept open in parallel (default 1, max 8).
                         With N > 1 consecutive segments are dealt across N
                         groups, so a burst of B datagram losses costs
@@ -141,7 +148,8 @@ const ALIASES: Record<string, string> = {
 // typo used to be dropped in silence (e.g. `--speedtest`, which no code path
 // ever reached because the client branch matched first).
 const KNOWN_OPTS = new Set([
-  'key', 'bind', 'peer', 'mtu-min', 'fec', 'metrics', 'interleave', 'ack-copies',
+  'key', 'bind', 'peer', 'mtu-min', 'fec-data', 'fec-parity-max', 'metrics',
+  'interleave', 'ack-copies',
   'probe-interval', 'probe-budget',
   'log-level', 'log-file', 'seconds', 'speedtest-seconds', 'positional',
 ]);
@@ -153,14 +161,18 @@ const KNOWN_OPTS = new Set([
 // That is the "silently fell back to the default" bug class the CLI contract
 // forbids, and the peer budget it produces does not match what was asked for.
 const VALUE_OPTS = new Set([
-  'key', 'bind', 'peer', 'mtu-min', 'fec', 'metrics', 'interleave', 'ack-copies',
+  'key', 'bind', 'peer', 'mtu-min', 'fec-data', 'fec-parity-max', 'metrics',
+  'interleave', 'ack-copies', 'probe-interval', 'probe-budget',
   'log-level', 'log-file', 'seconds', 'speedtest-seconds',
 ]);
 
 // The numeric ones read a leading-'-' token as their value anyway, so the
 // range check produces the precise diagnostic ("expects an integer in
 // 128..9000") instead of a generic "that looks like another option".
-const NUMERIC_OPTS = new Set(['mtu-min', 'seconds', 'speedtest-seconds', 'fec', 'interleave', 'ack-copies']);
+const NUMERIC_OPTS = new Set([
+  'mtu-min', 'seconds', 'speedtest-seconds', 'fec-data', 'fec-parity-max',
+  'interleave', 'ack-copies', 'probe-interval', 'probe-budget',
+]);
 
 function missingValue(spelling: string, next: string | undefined): Error {
   const shown = next === undefined ? 'it was given without one' : `"${next}" looks like another option`;
@@ -177,9 +189,10 @@ const REMOVED_OPTS: Record<string, { use: string; why: string; short?: boolean }
   'mtu-max': { use: '--mtu-min=N', why: 'the ceiling is not worth a second knob: it follows automatically (1500, raised to the floor when that is higher)' },
   'packet-size': { use: '--mtu-min=N', why: 'packet-size was a hard cap; the budget now starts at a floor and grows by PMTUD' },
   log: { use: '--log-level=LEVEL', why: 'the default info level would silently drop the debug traces' },
-  parity: { use: '--fec=D:P to raise the P ceiling; k itself is automatic', why: 'a pinned k disables the loss-driven adaptation, which is the whole point of the controller' },
-  'fec-budget': { use: '--fec=D:P: P is the ceiling k may climb to', why: 'the ratio never bounded anything (the default 0.8 mapped to k=7, above the agreed P, so the extra parity was dropped by the peer as IndexPastS); the agreed P is the only honest ceiling' },
-  k: { use: '--fec=D:P to raise the P ceiling; k itself is automatic', why: 'the old C++ spelling of --parity; pinning k disables loss-driven adaptation' },
+  fec: { use: '--fec-data=N --fec-parity-max=N', why: 'a "D:P" string cannot be range-checked per number, and it read as one value what are really two independent limits; each half is now its own integer option with its own range' },
+  parity: { use: '--fec-parity-max=N to raise the P ceiling; k itself is automatic', why: 'a pinned k disables the loss-driven adaptation, which is the whole point of the controller' },
+  'fec-budget': { use: '--fec-parity-max=N: P is the ceiling k may climb to', why: 'the ratio never bounded anything (the default 0.8 mapped to k=7, above the agreed P, so the extra parity was dropped by the peer as IndexPastS); the agreed P is the only honest ceiling' },
+  k: { use: '--fec-parity-max=N to raise the P ceiling; k itself is automatic', why: 'the old C++ spelling of --parity; pinning k disables loss-driven adaptation' },
   pmtud: { use: '--no-pmtud, and only if you want probing OFF', why: 'probing is already the default, so the switch only restated it and invited the opposite reading' },
   'key-file': { use: '--key=HEX32', why: 'a file only wrapped the same 32 hex chars in a path that could fail with ENOENT' },
   'psk-file': { use: '--key=HEX32', why: 'a file only wrapped the same 32 hex chars in a path that could fail with ENOENT' },
@@ -300,12 +313,23 @@ function intOpt(opts: Map<string, string>, name: string, def: number, min: numbe
   return n;
 }
 
-function parseFec(v: string | undefined): { d: number; p: number } {
-  if (!v) return { d: DEFAULT_D, p: DEFAULT_P };
-  const m = /^(\d+):(\d+)$/.exec(v);
-  if (!m) throw new Error(`--fec expects D:P, got ${v}`);
-  const d = Number(m[1]), p = Number(m[2]);
-  if (d < 1 || d > 256 || p < 0 || p > 7 || d + p > 256) throw new Error(`--fec out of range: ${v}`);
+/**
+ * FEC geometry as two integers.
+ *
+ * This used to be one `--fec=D:P` string, which meant the only validation
+ * available was a regex plus one combined message. Split apart, each half gets
+ * the same `intOpt` contract every other numeric flag has: its own range, and a
+ * diagnostic that quotes the offending number. The two are still coupled by one
+ * wire fact — a symbol index is one byte, so D + P ≤ 256 — and that is the only
+ * check that needs both values at once.
+ */
+function fecGeometry(opts: Map<string, string>): { d: number; p: number } {
+  const d = intOpt(opts, 'fec-data', DEFAULT_D, 1, 256);
+  const p = intOpt(opts, 'fec-parity-max', DEFAULT_P, 0, MAX_PARITY);
+  if (d + p > 256) {
+    throw new Error('--fec-data + --fec-parity-max must not exceed 256 ' +
+      `(a symbol index is one byte), got ${d} + ${p} = ${d + p}`);
+  }
   return { d, p };
 }
 
@@ -449,7 +473,7 @@ async function main(): Promise<void> {
   // only thing the old flag did was let one end forget it and halve SACK
   // coverage without any visible symptom. The epoch key roll is offered on the
   // same terms — one extra empty TLV, gated by the peer's answer.
-  const fecGeo = parseFec(opts.get('fec'));
+  const fecGeo = fecGeometry(opts);
   // Interleaving and ACK redundancy are opt-in: both trade a little bandwidth
   // (and, for interleaving, a little repair latency) for burst tolerance, and
   // on a path whose loss is random they buy nothing. Defaults keep the wire

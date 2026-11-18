@@ -54,8 +54,9 @@ PSK 在本项目的部署方式里是**直接内联**的（两端同一个值，
 | `-p, --port=N` | ~~已删除~~ | **写端口要用地址里的 `:P`**（`-b 0.0.0.0:4461` / `--peer=IP:4461`）。原来是第二个说法，写错时会静默覆盖地址里的端口 |
 | `--mtu-min=N` | `1040` | PMTUD 的**起点（下限）**，也是 `--no-pmtud` 时的固定预算。含 20 B IP + 8 B UDP 头，允许 128..9000。它是下限不是上限：探测会从这里向上走。探测**上限不再单独设参**：固定为 1500，起点高于 1500 时跟随起点。旧名 `--packet-size` / `--mtu` / `-m` 已移除（明确不做兼容），写了会直接报错 |
 | `--mtu-max=N` | ~~已删除~~ | 探测上限已并入 `--mtu-min=N`（固定 1500，起点高于它时跟随起点），不再有独立参数 |
-| `--fec=D:P` | `10:6` | 每集合 D 个数据 symbol，P 既是冗余**槽位上限**，也是控制器能把 k 涨到的上限（取协商后的 `min(本端P, 对端P)`）。发送端从 `min(3,P)` 起步，之后按丢包反馈自行增减 k；`--parity` / `--k` / `--fec-budget` 已移除（写了会直接报错） |
-| `--fec-budget=R` | ~~已删除~~ | 冗余上限就是 `--fec=D:P` 里的 P：控制器最高只能把 k 涨到协商后的 P，超过的冗余包对端会当 `IndexPastS` 丢弃 |
+| `--fec-data=N` | `10` | 每个修复集合里的数据 symbol 数（1..256）。 |
+| `--fec-parity-max=N` | `6` | 每集合的冗余**槽位上限**（0..7），也是控制器能把 k 涨到的上限（取协商后的 `min(本端P, 对端P)`）。发送端从 `min(3,P)` 起步，之后按丢包反馈自行增减 k。两者之和不得超过 256 —— 那是 symbol 索引一个字节能寻址的范围。`--fec=D:P` / `--parity` / `--k` / `--fec-budget` 全部拒绝（写了会直接报错），`D:P` 不再被解析：一个冒号不该决定两个数字怎么读 |
+| `--fec-budget=R` | ~~已删除~~ | 冗余上限就是 `--fec-parity-max`：控制器最高只能把 k 涨到协商后的 P，超过的冗余包对端会当 `IndexPastS` 丢弃 |
 | `--interleave=N` | `1` | 发送端并行保持 N 个修复集合，段按轮转摊到各 lane：一串长度 B 的连续丢包变成每个 lane `ceil(B/N)` 个，同样的 k 能扛 N 倍长的突发，冗余率不变。代价是 lane 填满要 N 倍时间（组冲刷超时按 N×D 算）。实测 200 ms RTT、4% 突发丢包下 L=4 对 L=1 是 1.80 vs 0.74 MB/s（20MB 下载，各 4 趟交错）；干净链路上没有代价 |
 | `--ack-copies=N` | `1` | 每个 ACK v2 额外发 N-1 份（副本带标记位，接收端按内容签名去重，不会触发无谓快速重传）。副本走数据 lane，被交织摊开并与数据共享 parity。默认关闭是实测结论：200 ms 路径上 1 份与 2 份没有差别，而 loopback 7–10k 包/s 时 2 份会把 goodput 从 11–15 MB/s 压到 5.6–8.7 MB/s。上行才是丢包重灾区时才值得打开 |
 | `--probe-interval=SEC` | `300` | 空闲时多久做一次链路体检（30..86400）。体检和 PMTUD 一样走 oob、不碰数据路径：不动序列号、不唤醒 ARQ，所以量到的是**裸路径**的 RTT / 抖动 / 排队增量 / 双向丢包 / 最长连续丢 / 可用速率。**只有两端的 TLV 6 都发布时才启用**，一端写了 `--no-probe` 就整条链路都不测（否则对端会把探测包当 FECSTAT 丢掉，报出 100% 丢包）。周期只在**空闲**时消耗：任一端 20 s 内有过应用层字节就顺延，探测自己的字节不算活动 |
@@ -80,7 +81,7 @@ node src/app/cli.ts speedtest --seconds=8 --key=00112233445566778899aabbccddeeff
 
 - 布尔开关（`--no-pmtud --help`）**永不吞下一个 token**；
   带值选项写 `--name=value` 或 `--name value`。
-- 数值选项越界或非数字**立即报错退出**（`--mtu-min=abc`、`--fec=10:9` 都不会静默回退默认值）。
+- 数值选项越界或非数字**立即报错退出**（`--mtu-min=abc`、`--fec-parity-max=9` 都不会静默回退默认值）。
 - 未知选项/开关打 `WARN unknown option --x ignored`，不再静默丢弃。
 - 已删除的参数不是“忽略”，而是**直接报错退出**（`--port` / `-p` / `--tlv` / `--ack-v2` / `--key-update` / `--version` 等），报错里给替代写法。
 
@@ -202,7 +203,7 @@ fcp-client-<ver>.exe --key=<HEX32> --peer=<SERVER_IP>:4461 -b 127.0.0.1:1080
 | 服务日志 | `/var/log/fcp-server/server.log`（`--log-level=debug`），另见 `journalctl -u fcp-server -f` |
 | PSK | 两端**内联同一个** `--key=00112233445566778899aabbccddeeff`（示例占位密钥，部署时替换为你的真实 PSK）；VPS unit 现为 `chmod 600`（明文含密钥），旧 `/etc/fcp-node.env` 已删除 |
 | 本机客户端 | `127.0.0.1:1080`，日志 `logs/client.log`，一键启动 `scripts/start-client.cmd` |
-| 两端参数 | `--key=11c1…c9a --mtu=1040 --fec=10:3 --log-level=debug` |
+| 两端参数 | `--key=11c1…c9a --mtu-min=1040 --fec-data=10 --fec-parity-max=3 --log-level=debug` |
 | 防火墙 | 无 ufw/iptables 规则，UDP 4461 直通 |
 
 服务端 `ExecStart`（唯一权威版本，改参数只改这里与本机 `start-client.cmd`）：
@@ -210,9 +211,13 @@ fcp-client-<ver>.exe --key=<HEX32> --peer=<SERVER_IP>:4461 -b 127.0.0.1:1080
 ```
 /usr/local/bin/node /opt/fcp-server/src/app/server.ts \
   --key=00112233445566778899aabbccddeeff \
-  -b 0.0.0.0:4461 --mtu=1040 --fec=10:3 \
+  -b 0.0.0.0:4461 --mtu-min=1040 --fec-data=10 --fec-parity-max=3 \
   --log-level=debug --log-file=/var/log/fcp-server/server.log
 ```
+
+> **改名提醒**：`--fec=D:P` 已拆成 `--fec-data=D --fec-parity-max=P`，`--fec=` 会被**直接拒绝**。
+> VPS 上现在跑的还是改名前的代码，配置里仍是旧写法；下次同步 `src/` 时必须同时改 `ExecStart`，
+> 否则服务启动即报错（不是静默回退）。
 
 `--mtu-min` 是**探测起点**：会话建立后两端各自以 100 B 为步长向上探，收到 ACK 就把发送预算抬上去，
 5 步左右（≈5–10 s）到达探测上限（1500，起点高于它时跟随起点），日志会出现
@@ -275,10 +280,10 @@ D:\work\fcp-node\scripts\start-client.cmd
 | 门禁 | Node 19 模块 / 72 tests ALL GATES PASSED；C++ Debug / Release ctest 各 46/46 |
 
 线上跑的是 Node 实现，C++ 侧 #91/#92 的修复**无需部署到 VPS**。VPS 上
-`scripts/start-client.cmd` 仍残留旧 `--fec=10:3`；那是 Windows 本地客户端脚本，Linux 侧
-不执行，实际生效的 systemd `ExecStart` 已是 `--fec=10:6`。下次同步部署包时应一并覆盖，
-避免有人照旧脚本启动本地客户端时用了错的参数。
+`scripts/start-client.cmd` 与本机脚本用的是同一份源码，改名后已是
+`--fec-data=10 --fec-parity-max=6`；systemd `ExecStart` 也要在下次同步时一并改成这个写法
+（旧 `--fec=10:6` 会被拒绝）。
 
 历史候选（**均未实测，不默认改动**）：把 `--mtu-min` 提到 `1400` 省掉爬升窗口，
-或 `--fec=20:2` 降低固定冗余上限。当前两端已统一为
-`--mtu-min=1040 --fec=10:6`，改任何一项都必须两端同时改并重新实测。
+或 `--fec-data=20 --fec-parity-max=2` 降低固定冗余上限。当前两端已统一为
+`--mtu-min=1040 --fec-data=10 --fec-parity-max=6`，改任何一项都必须两端同时改并重新实测。

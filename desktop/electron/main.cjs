@@ -186,7 +186,10 @@ function statsArgs(cfg) {
     `--bind=${cfg.listenHost}:${cfg.listenPort}`];
   if (cfg.mtu) args.push(`--mtu-min=${cfg.mtu}`);
   if (cfg.pmtud === false) args.push('--no-pmtud');
-  args.push(`--fec=${cfg.fec || '10:6'}`);
+  // 两半各自透传。旧版的 `fec: "10:4"` 不再被识别,--fec= 在 CLI 侧已被拒绝。
+  // 兜底值取渲染层的默认(10/4),不是 CLI 的 10/6:GUI 一直发的是 4,这里不偷偷改。
+  args.push(`--fec-data=${Number.isInteger(cfg.fecData) ? cfg.fecData : 10}`);
+  args.push(`--fec-parity-max=${Number.isInteger(cfg.fecParityMax) ? cfg.fecParityMax : 4}`);
   if (cfg.probeInterval) args.push(`--probe-interval=${cfg.probeInterval}`);
   if (cfg.probe === false) args.push('--no-probe');
   args.push(`--log-level=${cfg.logLevel || 'info'}`);

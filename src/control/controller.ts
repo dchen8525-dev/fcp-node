@@ -274,7 +274,8 @@ export function chooseGroupD(o: {
   }
   if (d > dMax) d = dMax;
   // D_FLOOR is a preference, not a licence to exceed the negotiated ceiling:
-  // with --fec=2:6 the session runs d=2 and every bound above must respect it.
+  // with --fec-data=2 --fec-parity-max=6 the session runs d=2, and every bound
+  // above must respect it.
   return Math.max(1, Math.min(dMax, d));
 }
 

@@ -275,7 +275,7 @@ try {
   });
   await new Promise((r) => origin.listen(originPort, '127.0.0.1', r));
 
-  const common = ['--fec=10:3', '--log-level=debug'];
+  const common = ['--fec-data=10', '--fec-parity-max=3', '--log-level=debug'];
   run('server', ['src/app/server.ts', `--key=${KEY}`, '-b', `127.0.0.1:${udpPort}`, ...common]);
   run('client', ['src/app/client.ts', `--key=${KEY}`, `--peer=127.0.0.1:${udpPort}`,
     '-b', `127.0.0.1:${proxyPort}`, ...common]);

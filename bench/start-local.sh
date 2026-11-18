@@ -6,7 +6,8 @@ cd /d/work/fcp-node || exit 1
 mkdir -p /tmp/benchpids
 
 node src/app/client.ts --key=00112233445566778899aabbccddeeff \
-  --peer=144.34.186.164:4461 -b 127.0.0.1:1080 --fec=10:3 --log-level=error \
+  --peer=144.34.186.164:4461 -b 127.0.0.1:1080 \
+  --fec-data=10 --fec-parity-max=3 --log-level=error \
   >/tmp/l-fcp.log 2>&1 &
 echo $! > /tmp/benchpids/fcp
 

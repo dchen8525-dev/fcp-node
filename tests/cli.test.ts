@@ -81,11 +81,25 @@ test('CLI: integer options reject out-of-range and non-integer values', () => {
   expectReject(['speedtest', `--key=${KEY}`, '--mtu-min=1.5'], /--mtu-min expects an integer/);
 });
 
-test('CLI: --fec rejects a malformed shape, an oversized D, and an out-of-range P', () => {
-  expectReject(['server', `--key=${KEY}`, '--fec=10'], /--fec expects D:P/);
-  expectReject(['server', `--key=${KEY}`, '--fec=257:6'], /--fec out of range/);
-  expectReject(['server', `--key=${KEY}`, '--fec=10:8'], /--fec out of range/);
-  expectReject(['server', `--key=${KEY}`, '--fec=250:7'], /--fec out of range/);
+test('CLI: the two FEC halves are range-checked separately, then against each other', () => {
+  // Each half now has its own integer contract, so the diagnostic quotes the
+  // number that is wrong instead of the whole "D:P" blob.
+  expectReject(['server', `--key=${KEY}`, '--fec-data=0'], /--fec-data expects an integer in 1\.\.256/);
+  expectReject(['server', `--key=${KEY}`, '--fec-data=257'], /--fec-data expects an integer in 1\.\.256/);
+  expectReject(['server', `--key=${KEY}`, '--fec-data=abc'], /--fec-data expects an integer/);
+  expectReject(['server', `--key=${KEY}`, '--fec-parity-max=8'], /--fec-parity-max expects an integer in 0\.\.7/);
+  expectReject(['server', `--key=${KEY}`, '--fec-parity-max=-1'], /--fec-parity-max expects an integer in 0\.\.7/);
+  // The only rule that needs both halves: a symbol index is one byte.
+  expectReject(['server', `--key=${KEY}`, '--fec-data=250', '--fec-parity-max=7'],
+    /--fec-data \+ --fec-parity-max must not exceed 256.*250 \+ 7 = 257/);
+  // The legal edges must parse, not merely "not fail on the sum": P=0 (no parity)
+  // and the largest legal pair (249+7=256). Bind parsing runs after the FEC
+  // options, so failing on the bind address proves the FEC pair got through.
+  for (const pair of [['249', '7'], ['1', '0'], ['10', '6']]) {
+    const r = run(['server', `--key=${KEY}`, `--fec-data=${pair[0]}`, `--fec-parity-max=${pair[1]}`,
+      '--bind=0.0.0.0:0']);
+    assert.match(r.stderr ?? '', /invalid port/, `FEC pair ${pair.join(':')} must parse`);
+  }
 });
 
 test('CLI: a space-separated value that looks like an option fails loudly', () => {
@@ -113,8 +127,10 @@ test('CLI: every renamed knob fails loudly with its replacement, never ignored',
     ['--mtu=1400', /--mtu is no longer accepted.*--mtu-min=N/],
     ['--mtu-max=1500', /--mtu-max is no longer accepted.*--mtu-min=N/],
     ['--log=debug', /--log is no longer accepted.*--log-level=LEVEL/],
-    ['--parity=5', /--parity is no longer accepted.*--fec=D:P/],
-    ['--fec-budget=0.8', /--fec-budget is no longer accepted/],
+    ['--fec=20:7', /--fec is no longer accepted.*--fec-data=N --fec-parity-max=N/],
+    ['--parity=5', /--parity is no longer accepted.*--fec-parity-max=N/],
+    ['--fec-budget=0.8', /--fec-budget is no longer accepted.*--fec-parity-max=N/],
+    ['--k=5', /--k is no longer accepted.*--fec-parity-max=N/],
     ['--key-env=FCP_KEY', /--key-env is no longer accepted.*--key=HEX32/],
     ['--host=1.2.3.4', /--host is no longer accepted.*--peer=IP\[:P\]/],
     ['--version', /--version is no longer accepted.*-h/],

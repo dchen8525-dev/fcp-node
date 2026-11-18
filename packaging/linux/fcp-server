@@ -8,11 +8,22 @@ set -eu
 
 : "${FCP_KEY:?FCP_KEY is not set; edit /etc/fcp-server/server.conf (32 hex chars)}"
 
+# FEC geometry used to be one FCP_FEC=10:6 string. It is two independent knobs
+# now, and this wrapper refuses the old variable instead of splitting it: a
+# "D:P" split here would keep alive exactly the ambiguity the CLI dropped, and
+# an operator editing FCP_FEC would see it silently ignored. Failing means the
+# upgrade shows up in journalctl instead of quietly running different geometry.
+if [ -n "${FCP_FEC:-}" ]; then
+  echo "fcp-server: FCP_FEC is no longer used; set FCP_FEC_DATA and FCP_FEC_PARITY_MAX in /etc/fcp-server/server.conf" >&2
+  exit 1
+fi
+
 exec /opt/fcp-server/node/bin/node /opt/fcp-server/fcp-server.mjs \
   --key="${FCP_KEY}" \
   -b "${FCP_BIND:-0.0.0.0:4461}" \
   --mtu-min="${FCP_MTU_MIN:-1040}" \
-  --fec="${FCP_FEC:-10:6}" \
+  --fec-data="${FCP_FEC_DATA:-10}" \
+  --fec-parity-max="${FCP_FEC_PARITY_MAX:-6}" \
   --log-level="${FCP_LOG_LEVEL:-info}" \
   --log-file="${FCP_LOG_FILE:-/var/log/fcp-server/server.log}" \
   "$@"

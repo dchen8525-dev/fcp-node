@@ -9,7 +9,8 @@ const el = {
   pages: document.querySelectorAll('.page'),
   host: $('host'), port: $('port'), listenHost: $('listenHost'), listenPort: $('listenPort'),
   key: $('key'), keyToggle: $('keyToggle'), remember: $('remember'),
-  mtu: $('mtu'), fec: $('fec'), logLevel: $('logLevel'), logFile: $('logFile'), pmtud: $('pmtud'),
+  mtu: $('mtu'), fecData: $('fecData'), fecParityMax: $('fecParityMax'),
+  logLevel: $('logLevel'), logFile: $('logFile'), pmtud: $('pmtud'),
   probeInterval: $('probeInterval'), probeOn: $('probeOn'),
   advToggle: $('advToggle'), advBody: $('advBody'),
   toggleBtn: $('toggleBtn'), actionNote: $('actionNote'),
@@ -228,7 +229,10 @@ function collectSettings() {
     listenHost: el.listenHost.value.trim() || '127.0.0.1',
     listenPort: Number(el.listenPort.value) || 1080,
     mtu: Number(el.mtu.value) || 1040,
-    fec: el.fec.value.trim() || '10:4',
+    // 两半是独立的整数,与 --fec-data / --fec-parity-max 一一对应。
+    // 空框才落回默认值:0 是合法的 P,不能用 `|| 默认` 吞掉。
+    fecData: el.fecData.value === '' ? 10 : Number(el.fecData.value),
+    fecParityMax: el.fecParityMax.value === '' ? 4 : Number(el.fecParityMax.value),
     logLevel: el.logLevel.value,
     logFile: el.logFile.value.trim(),
     pmtud: el.pmtud.checked,
@@ -247,7 +251,7 @@ function scheduleSave() {
     // Wipe every stored field, including the key, so unchecking really forgets.
     window.fcp.saveSettings({
       remember: false, key: '', host: '', port: 4460, listenHost: '',
-      listenPort: 1080, mtu: 1040, fec: '', logLevel: '', logFile: '',
+      listenPort: 1080, mtu: 1040, fecData: 10, fecParityMax: 4, logLevel: '', logFile: '',
       pmtud: true, speedUrl: '', speedSeconds: 10, speedPort: 1080,
       probeInterval: 300, probe: true,
     });
@@ -273,7 +277,10 @@ function applySettings(s) {
   set(el.listenHost, s.listenHost);
   set(el.listenPort, s.listenPort);
   set(el.mtu, s.mtu);
-  set(el.fec, s.fec);
+  // 旧版存的是字符串 "10:4";这里不迁移,直接忽略(与 CLI 一样不做兼容),
+  // 读不到就留在 HTML 的默认值上。
+  if (typeof s.fecData === 'number') el.fecData.value = String(s.fecData);
+  if (typeof s.fecParityMax === 'number') el.fecParityMax.value = String(s.fecParityMax);
   if (s.logLevel) el.logLevel.value = s.logLevel;
   set(el.logFile, s.logFile);
   if (typeof s.pmtud === 'boolean') el.pmtud.checked = s.pmtud;
@@ -322,11 +329,15 @@ async function start() {
   if (!(cfg.mtu >= 128 && cfg.mtu <= 9000)) return flashNote('MTU 需在 128..9000', 'error');
   const key = el.key.value.replace(/\s+/g, '').replace(/^0x/i, '');
   if (!HEX32.test(key)) return flashNote('密钥需为 32 位十六进制', 'error');
-  const fecMatch = /^(\d+):(\d+)$/.exec(cfg.fec);
-  if (!fecMatch) return flashNote('FEC 需形如 10:4', 'error');
-  const fecD = Number(fecMatch[1]), fecP = Number(fecMatch[2]);
-  if (fecD < 1 || fecD > 256 || fecP < 0 || fecP > 7 || fecD + fecP > 256) {
-    return flashNote('FEC 超出范围（D 1..256，P 0..7，D+P≤256）', 'error');
+  // 两个整数各自的区间,再加唯一需要两者一起判的约束(索引一字节)
+  if (!Number.isInteger(cfg.fecData) || cfg.fecData < 1 || cfg.fecData > 256) {
+    return flashNote('FEC 数据 symbol 需为 1..256 的整数', 'error');
+  }
+  if (!Number.isInteger(cfg.fecParityMax) || cfg.fecParityMax < 0 || cfg.fecParityMax > 7) {
+    return flashNote('FEC 冗余上限需为 0..7 的整数', 'error');
+  }
+  if (cfg.fecData + cfg.fecParityMax > 256) {
+    return flashNote('FEC 数据 + 冗余上限不能超过 256', 'error');
   }
 
   el.toggleBtn.disabled = true;

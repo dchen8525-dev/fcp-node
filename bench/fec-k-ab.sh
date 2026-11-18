@@ -47,7 +47,7 @@ for i in $(seq 1 "$LEGS"); do
   sleep 1
   node dist/fcp-bench-client.mjs client --key="$KEY" \
     --peer=144.34.186.164:4462 -b 127.0.0.1:1080 \
-    --mtu-min=1040 --fec=10:6 --log-level=info \
+    --mtu-min=1040 --fec-data=10 --fec-parity-max=6 --log-level=info \
     --log-file="$OUT/leg$i-client.log" --metrics="$OUT/leg$i/client" \
     >/dev/null 2>&1 &
   CLI=$!
