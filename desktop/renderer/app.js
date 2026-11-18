@@ -7,11 +7,10 @@ const el = {
   nav: $('nav'),
   appVersion: $('appVersion'),
   pages: document.querySelectorAll('.page'),
-  host: $('host'), port: $('port'), listenHost: $('listenHost'), listenPort: $('listenPort'),
+  server: $('server'), proxy: $('proxy'),
   key: $('key'), keyToggle: $('keyToggle'), remember: $('remember'),
   mtu: $('mtu'), fecData: $('fecData'), fecParityMax: $('fecParityMax'),
-  logLevel: $('logLevel'), logFile: $('logFile'), pmtud: $('pmtud'),
-  probeInterval: $('probeInterval'), probeOn: $('probeOn'),
+  logLevel: $('logLevel'), pmtud: $('pmtud'), probeInterval: $('probeInterval'),
   advToggle: $('advToggle'), advBody: $('advBody'),
   toggleBtn: $('toggleBtn'), actionNote: $('actionNote'),
   stateDot: $('stateDot'), stateText: $('stateText'), stateAddr: $('stateAddr'), stateUptime: $('stateUptime'),
@@ -220,25 +219,41 @@ document.addEventListener('keydown', (e) => {
 
 let saveTimer = null;
 
+// "地址:端口" -> [host, port]。用最后一个冒号分割,因此 IPv4/域名没问题;
+// IPv6 请用方括号 [::1]:1080。返回 NaN 端口交给 start() 的校验去报错。
+function splitEndpoint(text, defaultPort) {
+  const s = String(text || '').trim();
+  const i = s.lastIndexOf(':');
+  if (i < 0) return [s, defaultPort];
+  const host = s.slice(0, i).trim();
+  const raw = s.slice(i + 1).trim();
+  const port = raw === '' ? defaultPort : Number(raw);
+  return [host, port];
+}
+
 function collectSettings() {
   const key = el.key.value.replace(/\s+/g, '').replace(/^0x/i, '');
+  const [host, port] = splitEndpoint(el.server.value, 4460);
+  const [listenHost, listenPort] = splitEndpoint(el.proxy.value, 1080);
+  const probeMin = el.probeInterval.value === '' ? 0 : Number(el.probeInterval.value);
   return {
     key: el.remember.checked ? key : '',
-    host: el.host.value.trim(),
-    port: Number(el.port.value) || 4460,
-    listenHost: el.listenHost.value.trim() || '127.0.0.1',
-    listenPort: Number(el.listenPort.value) || 1080,
+    host, port,
+    listenHost: listenHost || '127.0.0.1',
+    listenPort,
     mtu: Number(el.mtu.value) || 1040,
     // 两半是独立的整数,与 --fec-data / --fec-parity-max 一一对应。
     // 空框才落回默认值:0 是合法的 P,不能用 `|| 默认` 吞掉。
     fecData: el.fecData.value === '' ? 10 : Number(el.fecData.value),
     fecParityMax: el.fecParityMax.value === '' ? 4 : Number(el.fecParityMax.value),
     logLevel: el.logLevel.value,
-    logFile: el.logFile.value.trim(),
     pmtud: el.pmtud.checked,
-    // 秒,与 --probe-interval 同一单位
-    probeInterval: Math.max(1, Number(el.probeInterval.value) || 5) * 60,
-    probe: el.probeOn.checked,
+    // 分钟 -> 秒,与 --probe-interval 同一单位。≤0 一律记 0,由 probe=false
+    // 让主进程发 --no-probe;不要把 0 吞成默认值。
+    // 正数钳到 CLI 接受的 30..86400 秒,这样"填 >0 就体检"不会被边界值拒绝。
+    probeInterval: probeMin > 0
+      ? Math.min(86400, Math.max(30, Math.round(probeMin * 60))) : 0,
+    probe: probeMin > 0,
     remember: el.remember.checked,
     speedUrl: el.speedUrl.value.trim(),
     speedSeconds: Number(el.speedSeconds.value) || 10,
@@ -250,8 +265,8 @@ function scheduleSave() {
   if (!el.remember.checked) {
     // Wipe every stored field, including the key, so unchecking really forgets.
     window.fcp.saveSettings({
-      remember: false, key: '', host: '', port: 4460, listenHost: '',
-      listenPort: 1080, mtu: 1040, fecData: 10, fecParityMax: 4, logLevel: '', logFile: '',
+      remember: false, key: '', host: '', port: 4460, listenHost: '127.0.0.1',
+      listenPort: 1080, mtu: 1040, fecData: 10, fecParityMax: 4, logLevel: '',
       pmtud: true, speedUrl: '', speedSeconds: 10, speedPort: 1080,
       probeInterval: 300, probe: true,
     });
@@ -272,20 +287,24 @@ function applySettings(s) {
   if (typeof s.key === 'string' && s.key) {
     el.key.value = s.key;
   }
-  set(el.host, s.host);
-  set(el.port, s.port);
-  set(el.listenHost, s.listenHost);
-  set(el.listenPort, s.listenPort);
+  // 存档仍按拆开的四字段写,这里拼回两个合并框。旧存档也是这四字段,
+  // 所以升级后密钥/地址不丢。
+  if (s.host) el.server.value = `${s.host}:${s.port || 4460}`;
+  if (s.listenHost || s.listenPort) {
+    el.proxy.value = `${s.listenHost || '127.0.0.1'}:${s.listenPort || 1080}`;
+  }
   set(el.mtu, s.mtu);
   // 旧版存的是字符串 "10:4";这里不迁移,直接忽略(与 CLI 一样不做兼容),
   // 读不到就留在 HTML 的默认值上。
   if (typeof s.fecData === 'number') el.fecData.value = String(s.fecData);
   if (typeof s.fecParityMax === 'number') el.fecParityMax.value = String(s.fecParityMax);
   if (s.logLevel) el.logLevel.value = s.logLevel;
-  set(el.logFile, s.logFile);
   if (typeof s.pmtud === 'boolean') el.pmtud.checked = s.pmtud;
-  if (typeof s.probeInterval === 'number') el.probeInterval.value = String(Math.max(1, Math.round(s.probeInterval / 60)));
-  if (typeof s.probe === 'boolean') el.probeOn.checked = s.probe;
+  // 秒 -> 分钟。旧存档用 probe:false 表示关闭,这里一并折算成 0。
+  if (typeof s.probeInterval === 'number') {
+    el.probeInterval.value = String(Math.round(s.probeInterval / 60));
+  }
+  if (s.probe === false) el.probeInterval.value = '0';
   if (typeof s.remember === 'boolean') el.remember.checked = s.remember;
   set(el.speedUrl, s.speedUrl);
   set(el.speedSeconds, s.speedSeconds);
@@ -323,9 +342,13 @@ function flashNote(text, kind) {
 
 async function start() {
   const cfg = collectSettings();
-  if (!cfg.host) return flashNote('请填写服务器地址', 'error');
-  if (!(cfg.port >= 1 && cfg.port <= 65535)) return flashNote('UDP 端口需在 1..65535', 'error');
-  if (!(cfg.listenPort >= 1 && cfg.listenPort <= 65535)) return flashNote('本地代理端口需在 1..65535', 'error');
+  if (!cfg.host) return flashNote('请填写服务器地址，格式：地址:UDP 端口', 'error');
+  if (!Number.isInteger(cfg.port) || !(cfg.port >= 1 && cfg.port <= 65535)) {
+    return flashNote('服务器 UDP 端口需在 1..65535', 'error');
+  }
+  if (!Number.isInteger(cfg.listenPort) || !(cfg.listenPort >= 1 && cfg.listenPort <= 65535)) {
+    return flashNote('本地代理端口需在 1..65535', 'error');
+  }
   if (!(cfg.mtu >= 128 && cfg.mtu <= 9000)) return flashNote('MTU 需在 128..9000', 'error');
   const key = el.key.value.replace(/\s+/g, '').replace(/^0x/i, '');
   if (!HEX32.test(key)) return flashNote('密钥需为 32 位十六进制', 'error');
@@ -628,7 +651,7 @@ el.speedBtn.addEventListener('click', async () => {
   // The proxy may be bound to a specific address; hardcoding 127.0.0.1 made
   // every speed test fail with ECONNREFUSED unless the bind was loopback.
   // Wildcard binds are reachable on loopback.
-  const bind = el.listenHost.value.trim() || '127.0.0.1';
+  const bind = splitEndpoint(el.proxy.value, 1080)[0] || '127.0.0.1';
   const socksHost = (bind === '0.0.0.0' || bind === '::' || bind === '[::]') ? '127.0.0.1' : bind;
   await window.fcp.speedStart({
     url, seconds: Number(el.speedSeconds.value) || 10,
@@ -732,8 +755,10 @@ function renderProbe() {
 
   const rows = state.probes.slice(0, PROBE_HISTORY);
   const peak = rows.reduce((m, r) => Math.max(m, r.down ? r.down.ramp : 0, r.up ? r.up.ramp : 0), 0) || 1;
-  const every = Math.max(1, Math.round((Number(el.probeInterval.value) || 5)));
-  el.probeHistoryNote.textContent = `${rows.length} 条 · 空闲时每 ${every} 分钟一次`;
+  const probeMin = Number(el.probeInterval.value);
+  el.probeHistoryNote.textContent = !(probeMin > 0)
+    ? `${rows.length} 条 · 体检已关闭`
+    : `${rows.length} 条 · 空闲时每 ${probeMin} 分钟一次`;
   const frag = document.createDocumentFragment();
   const head = document.createElement('div');
   head.className = 'probe-row head';
@@ -785,7 +810,7 @@ window.fcp.onProbe((p) => {
   }
   drawChart();
   renderProbe();
-  if (!el.host.value) el.host.focus();
+  if (!el.server.value) el.server.focus();
 })();
 
 window.addEventListener('resize', () => drawChart());

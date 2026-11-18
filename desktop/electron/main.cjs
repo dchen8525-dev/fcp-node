@@ -193,7 +193,9 @@ function statsArgs(cfg) {
   if (cfg.probeInterval) args.push(`--probe-interval=${cfg.probeInterval}`);
   if (cfg.probe === false) args.push('--no-probe');
   args.push(`--log-level=${cfg.logLevel || 'info'}`);
-  if (cfg.logFile) args.push(`--log-file=${cfg.logFile}`);
+  // 日志默认开启、固定落在用户数据目录,界面不再提供路径框。
+  // openLogDir() 会 mkdirSync,所以这里直接用它的返回值。
+  args.push(`--log-file=${path.join(openLogDir(), 'client.log')}`);
   return args;
 }
 

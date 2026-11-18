@@ -96,20 +96,12 @@
           <div class="card-title">服务器与本地代理</div>
           <div class="grid two">
             <label class="field">
-              <span class="field-label">服务器地址</span>
-              <input id="host" type="text" placeholder="例如 144.34.186.164" spellcheck="false" />
+              <span class="field-label">服务器地址（地址:UDP 端口）</span>
+              <input id="server" type="text" placeholder="例如 144.34.186.164:4461" spellcheck="false" />
             </label>
             <label class="field">
-              <span class="field-label">UDP 端口</span>
-              <input id="port" type="number" min="1" max="65535" value="4460" />
-            </label>
-            <label class="field">
-              <span class="field-label">本地监听地址</span>
-              <input id="listenHost" type="text" value="127.0.0.1" spellcheck="false" />
-            </label>
-            <label class="field">
-              <span class="field-label">本地代理端口</span>
-              <input id="listenPort" type="number" min="1" max="65535" value="1080" />
+              <span class="field-label">本地代理（监听地址:端口）</span>
+              <input id="proxy" type="text" value="127.0.0.1:1080" placeholder="例如 127.0.0.1:1080" spellcheck="false" />
             </label>
           </div>
         </div>
@@ -159,10 +151,6 @@
                   <option value="off">off</option>
                 </select>
               </label>
-              <label class="field">
-                <span class="field-label">日志文件</span>
-                <input id="logFile" type="text" placeholder="留空则不落盘" spellcheck="false" />
-              </label>
             </div>
             <label class="check">
               <input id="pmtud" type="checkbox" checked />
@@ -170,14 +158,10 @@
             </label>
             <div class="grid two">
               <label class="field">
-                <span class="field-label">空闲体检间隔（分钟）</span>
-                <input id="probeInterval" type="number" min="1" max="1440" value="5" />
+                <span class="field-label">空闲体检间隔（分钟，≤0 关闭）</span>
+                <input id="probeInterval" type="number" min="0" max="1440" value="5" />
               </label>
             </div>
-            <label class="check">
-              <input id="probeOn" type="checkbox" checked />
-              <span>空闲时自动体检链路（单次最多 1 MB，忙碌时不测）</span>
-            </label>
           </div>
         </div>
 
