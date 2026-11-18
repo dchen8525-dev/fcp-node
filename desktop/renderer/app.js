@@ -17,10 +17,7 @@ const el = {
   rxRate: $('rxRate'), rxTotal: $('rxTotal'), txRate: $('txRate'), txTotal: $('txTotal'),
   chart: $('chart'), chartPeak: $('chartPeak'),
   kSessions: $('kSessions'), kUp: $('kUp'), kUptime: $('kUptime'), kListen: $('kListen'),
-  speedUrl: $('speedUrl'), speedSeconds: $('speedSeconds'), speedPort: $('speedPort'),
-  speedBtn: $('speedBtn'), speedNote: $('speedNote'),
-  speedMbps: $('speedMbps'), speedBytes: $('speedBytes'), speedElapsed: $('speedElapsed'),
-  speedMiB: $('speedMiB'), speedMeter: $('speedMeter'),
+  probeNowBtn: $('probeNowBtn'),
   probeWhen: $('probeWhen'), probeDown: $('probeDown'), probeDownSub: $('probeDownSub'),
   probeUp: $('probeUp'), probeUpSub: $('probeUpSub'), probeAt: $('probeAt'),
   probeRtt: $('probeRtt'), probeJitter: $('probeJitter'), probeQueue: $('probeQueue'),
@@ -41,7 +38,6 @@ const state = {
   logs: [],                         // { level, line, ts }
   filter: 'all',
   startedAt: 0,
-  speedTesting: false,
   // Newest first. In memory only: a measurement is a property of the tunnel
   // that produced it, and replaying last week's numbers against today's server
   // would be worse than an empty list.
@@ -255,9 +251,6 @@ function collectSettings() {
       ? Math.min(86400, Math.max(30, Math.round(probeMin * 60))) : 0,
     probe: probeMin > 0,
     remember: el.remember.checked,
-    speedUrl: el.speedUrl.value.trim(),
-    speedSeconds: Number(el.speedSeconds.value) || 10,
-    speedPort: Number(el.speedPort.value) || 1080,
   };
 }
 
@@ -267,8 +260,7 @@ function scheduleSave() {
     window.fcp.saveSettings({
       remember: false, key: '', host: '', port: 4460, listenHost: '127.0.0.1',
       listenPort: 1080, mtu: 1040, fecData: 10, fecParityMax: 4, logLevel: '',
-      pmtud: true, speedUrl: '', speedSeconds: 10, speedPort: 1080,
-      probeInterval: 300, probe: true,
+      pmtud: true, probeInterval: 300, probe: true,
     });
     return;
   }
@@ -306,9 +298,6 @@ function applySettings(s) {
   }
   if (s.probe === false) el.probeInterval.value = '0';
   if (typeof s.remember === 'boolean') el.remember.checked = s.remember;
-  set(el.speedUrl, s.speedUrl);
-  set(el.speedSeconds, s.speedSeconds);
-  set(el.speedPort, s.speedPort);
 }
 
 document.querySelectorAll('input, select').forEach((node) => {
@@ -368,7 +357,6 @@ async function start() {
     const r = await window.fcp.start({ ...cfg, key });
     if (!r || r.ok === false) return flashNote(r && r.error ? r.error : '启动失败', 'error');
     setRunning(true);
-    el.speedPort.value = cfg.listenPort;
     flashNote('已启动');
   } finally {
     el.toggleBtn.disabled = false;
@@ -610,82 +598,11 @@ el.logDir.addEventListener('click', async () => {
   if (dir) addLog({ level: 'info', line: `log dir: ${dir}`, ts: Date.now() });
 });
 
-// ---------------------------------------------------------------- speed
-
-let speedTimer = null;
-
-// 与主开关同一套"一按钮双向"模式:标签与颜色跟随测速状态
-function setSpeedTesting(on) {
-  state.speedTesting = on;
-  el.speedBtn.textContent = on ? '停止' : '开始测速';
-  el.speedBtn.classList.toggle('is-stop', on);
-}
-
-el.speedBtn.addEventListener('click', async () => {
-  if (state.speedTesting) {
-    await window.fcp.speedStop();
-    clearInterval(speedTimer);
-    setSpeedTesting(false);
-    el.speedNote.textContent = '已停止';
-    return;
-  }
-  const url = el.speedUrl.value.trim();
-  if (!/^https?:\/\//i.test(url)) { el.speedNote.textContent = 'URL 需以 http:// 或 https:// 开头'; return; }
-  if (!state.running) { el.speedNote.textContent = '请先启动代理'; return; }
-  setSpeedTesting(true);
-  el.speedMbps.parentElement.classList.remove('is-empty');
-  el.speedMbps.textContent = '0.00';
-  el.speedBytes.textContent = '—';
-  el.speedElapsed.textContent = '—';
-  el.speedMiB.textContent = '—';
-  el.speedMeter.style.width = '0%';
-  el.speedNote.textContent = '测速中…';
-  state.speedStart = Date.now();
-  clearInterval(speedTimer);
-  speedTimer = setInterval(() => {
-    const s = (Date.now() - state.speedStart) / 1000;
-    el.speedElapsed.textContent = `${s.toFixed(1)} s`;
-    const total = Number(el.speedSeconds.value) || 10;
-    el.speedMeter.style.width = `${Math.min(100, (s / total) * 100).toFixed(1)}%`;
-  }, 200);
-  // The proxy may be bound to a specific address; hardcoding 127.0.0.1 made
-  // every speed test fail with ECONNREFUSED unless the bind was loopback.
-  // Wildcard binds are reachable on loopback.
-  const bind = splitEndpoint(el.proxy.value, 1080)[0] || '127.0.0.1';
-  const socksHost = (bind === '0.0.0.0' || bind === '::' || bind === '[::]') ? '127.0.0.1' : bind;
-  await window.fcp.speedStart({
-    url, seconds: Number(el.speedSeconds.value) || 10,
-    socksHost, socksPort: Number(el.speedPort.value) || 1080,
-  });
-});
-
-window.fcp.onSpeed((p) => {
-  if (!p.done) return;
-  clearInterval(speedTimer);
-  setSpeedTesting(false);
-  el.speedMeter.style.width = '100%';
-  if (p.error) {
-    el.speedNote.textContent = p.error;
-    el.speedMbps.parentElement.classList.add('is-empty');
-    el.speedMbps.textContent = '—';
-    addLog({ level: 'error', line: `speedtest: ${p.error}`, ts: Date.now() });
-    return;
-  }
-  el.speedMbps.textContent = p.mbps.toFixed(2);
-  el.speedBytes.textContent = fmtBytes(p.bytes);
-  el.speedElapsed.textContent = `${p.seconds.toFixed(1)} s`;
-  el.speedMiB.textContent = `${p.mbPerSec.toFixed(2)} MiB/s`;
-  el.speedNote.textContent = '完成';
-  addLog({ level: 'info',
-    line: `speedtest: ${p.mbPerSec.toFixed(2)} MiB/s (${fmtBytes(p.bytes)} / ${p.seconds.toFixed(1)}s) ${p.url}`,
-    ts: Date.now() });
-});
-
 // ---------------------------------------------------------------- link probe
 //
 // The tunnel probes itself while idle and prints one `probe {...}` line per run.
-// Nothing here triggers a measurement: the whole point is that it happens when
-// the user is not looking, and the tab is a window onto what it found.
+// The button asks for one immediately (bypassing the idle gate); every result
+// is also appended to probe.jsonl next to client.log by the main process.
 
 const PROBE_HISTORY = 24;
 
@@ -702,7 +619,7 @@ function renderProbeWhen() {
   const node = el.probeWhen;
   node.classList.remove('is-live', 'is-off');
   if (!state.running) { node.textContent = '代理未启动'; node.classList.add('is-off'); return; }
-  if (state.probeNextSec < 0) { node.textContent = '已关闭（--no-probe）'; node.classList.add('is-off'); return; }
+  if (state.probeNextSec < 0) { node.textContent = '自动体检已关闭（仍可手动测）'; node.classList.add('is-off'); return; }
   if (state.probeRunning) { node.textContent = '测量中…'; node.classList.add('is-live'); return; }
   node.textContent = state.probeCount > 0
     ? `下次 ${mmss(state.probeNextSec)} ｜ 已测 ${state.probeCount} 次`
@@ -781,7 +698,35 @@ function renderProbe() {
   el.probeHistory.appendChild(frag);
 }
 
+// 立即体检:绕过空闲与排期,由隧道在下一次 tick 触发。按钮只在运行且有
+// 代理时可点;请求发出后先把状态显示成"测量中",结果回来由 onProbe 收尾。
+let probeNowTimer = null;
+el.probeNowBtn.addEventListener('click', async () => {
+  if (!state.running) { renderProbeWhen(); return; }
+  el.probeNowBtn.disabled = true;
+  try {
+    const r = await window.fcp.probeNow();
+    if (!r || r.ok === false) {
+      el.probeWhen.textContent = r && r.error ? r.error : '发起失败';
+      el.probeWhen.classList.add('is-off');
+      return;
+    }
+    state.probeRunning = true;
+    renderProbeWhen();
+    // 隧道可能拒绝(正在测/会话未就绪);8 s 还没出结果就恢复按钮,
+    // 避免按钮永久转圈。结果到达时 onProbe 会清掉这个计时器。
+    clearTimeout(probeNowTimer);
+    probeNowTimer = setTimeout(() => {
+      state.probeRunning = false;
+      renderProbeWhen();
+    }, 8000);
+  } finally {
+    el.probeNowBtn.disabled = false;
+  }
+});
+
 window.fcp.onProbe((p) => {
+  clearTimeout(probeNowTimer);
   state.probes.unshift(p);
   while (state.probes.length > PROBE_HISTORY) state.probes.pop();
   state.probeRunning = false;

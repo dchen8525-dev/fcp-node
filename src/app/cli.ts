@@ -88,9 +88,11 @@ Common:
                         Copies carry a "redundant copy" bit so the peer does
                         not mistake them for duplicate-ACK loss evidence, and
                         they ride the data lanes so the interleave spreads them.
-  --no-probe            disable the idle path probe. Both ends must offer TLV 6,
-                        so this removes the feature end to end instead of
-                        leaving one end sending trains into silence.
+  --no-probe            stop the automatic idle path probe. TLV 6 negotiation
+                        stays on, so the desktop shell's "measure now" button
+                        still works: this flag kills only the periodic timer.
+                        To drop the protocol entirely (legacy interop), the
+                        session's probeNegotiate must be set false in code.
   --probe-interval=SEC  how often an idle tunnel measures its path (default 300,
                         30..86400). Idle means no application byte for 20 s in
                         either direction: a busy tunnel is never probed, and the
@@ -480,9 +482,8 @@ async function main(): Promise<void> {
   // exactly as it was before these knobs existed.
   const interleave = intOpt(opts, 'interleave', 1, 1, MAX_INTERLEAVE);
   const ackCopies = intOpt(opts, 'ack-copies', 1, 1, MAX_ACK_COPIES);
-  // Idle path probe. Both ends must offer TLV 6, so --no-probe on either side
-  // removes the feature end to end rather than leaving one end sending trains
-  // into silence.
+  // Idle path probe. --no-probe stops only the periodic scheduler; TLV 6 is
+  // still offered so the desktop shell's manual "measure now" can run.
   const probeIntervalSec = intOpt(opts, 'probe-interval', 300, 30, 86400);
   const probeBudgetKiB = intOpt(opts, 'probe-budget', 1024, 64, 8192);
   const debugLog = logLevel === 'debug' ? (l: string) => log(`DBG ${l}`) : undefined;
@@ -565,6 +566,28 @@ async function main(): Promise<void> {
   }
 
   await tunnel.start();
+
+  // Machine command channel from the desktop shell (mirror of the stdout
+  // stats/probe channel). One command per line, currently just "probe": force
+  // a path measurement now, ignoring the idle gate. Kept off the wire — stdin
+  // is a local pipe to the parent process, never a remote input.
+  if (mode === 'client' && !process.stdin.isPaused()) {
+    let stdinBuf = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk: string) => {
+      stdinBuf += chunk;
+      let nl: number;
+      while ((nl = stdinBuf.indexOf('\n')) >= 0) {
+        const cmd = stdinBuf.slice(0, nl).trim();
+        stdinBuf = stdinBuf.slice(nl + 1);
+        if (cmd === 'probe') {
+          const ok = (tunnel as TunnelClient).probeNow();
+          process.stdout.write(ok ? 'cmd probe: queued\n' : 'cmd probe: busy\n');
+        }
+      }
+    });
+  }
+
   let stopping = false;
   const shutdown = () => {
     if (stopping) return; // a second Ctrl-C must not re-enter the flush

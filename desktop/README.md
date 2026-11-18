@@ -9,28 +9,21 @@
 | 项 | Qt 版 | 这里 |
 |---|---|---|
 | 配色 | 浅色 `#f4f7f5` / `#e6ede9` / `#0f9d76` / `#f0b46a` | 近黑绿底、翡翠绿强调、琥珀色上行；`nativeTheme` 同步深色标题栏 |
-| 页面 | 连接 / 状态 / 测速 / 日志 | 同四页 |
+| 页面 | 连接 / 状态 / 链路体检 / 日志 | 连接 / 状态 / 链路体检 / 日志 |
 | 图表 | `QPainter` sparkline | Canvas 双线 + 渐变填充 |
-| 测速 | `fcp-client --speedtest` 对远端打流 | 经本地 SOCKS 真实下载（见下） |
+| 链路体检 | — | 空闲自动测 + 手动「立即体检」；结果写 `log/probe.jsonl` |
 
-## 为什么测速要自己实现
-
-Node 版的 `speedtest` 子命令是**进程内自环**（自己起 echo server 再自己连），
-测的是本机回环，与用户关心的链路无关。C++ 版没有这个问题，因为它的测速是
-对远端 server 打流。
-
-所以测速页不复用子命令，而是由主进程写一个最小 SOCKS5 客户端，经当前本地
-代理真实下载用户给的 URL，统计 5 秒/10 秒窗口内的字节数。TLS 走
-`tls.connect({ socket })`，明文 HTTP 直接写请求行。
+测速页已移除。CLI 的 `speedtest` 子命令是进程内自环（测不到真实链路），
+GUI 侧也不再提供经本地 SOCKS 的下载测速；链路质量统一由「链路体检」页呈现。
 
 ## 目录
 
 ```
-electron/main.cjs     窗口、托盘、子进程管理、stats 解析、SOCKS 测速
+electron/main.cjs     窗口、托盘、子进程管理、stats 解析、体检结果落盘
 electron/preload.cjs  contextBridge 暴露的 IPC 面
-renderer/index.html   四页结构
+renderer/index.html   四页结构（连接 / 状态 / 链路体检 / 日志）
 renderer/styles.css   视觉（深色控制台主题、卡片分层、等宽数字）
-renderer/app.js       导航、表单校验、图表、日志、测速交互
+renderer/app.js       导航、表单校验、图表、日志、体检交互
 scripts/build-tunnel.mjs  esbuild 把 src/app/cli.ts 打成一个 ESM
 scripts/cdp.mjs           自测用：CDP eval / reload / 截图
 ```

@@ -1,14 +1,12 @@
-// Electron main process: window + tunnel child process + a real SOCKS download
-// speed test. The tunnel never runs in this process -- it is spawned exactly the
-// way the Qt shell spawns fcp-client, so a tunnel crash cannot take the UI down.
+// Electron main process: window + tunnel child process. The tunnel never runs
+// in this process -- it is spawned exactly the way the Qt shell spawns
+// fcp-client, so a tunnel crash cannot take the UI down.
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, nativeTheme } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, nativeTheme } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
-const net = require('node:net');
-const tls = require('node:tls');
 
 const CLI_PATH = path.join(__dirname, '..', 'resources', 'cli.mjs');
 const ICON_PATH = path.join(__dirname, '..', 'resources', 'icon.png');
@@ -21,11 +19,6 @@ let isQuitting = false;
 let trayHintShown = false;
 let child = null;
 let childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
-let speedJob = null;
-// Every run gets a sequence number: destroying a superseded job makes its
-// close handler fire later, and it must not report a result for the new run.
-let speedSeq = 0;
-let speedCancelRequested = false;
 
 // ---------------------------------------------------------------- theme
 
@@ -99,6 +92,17 @@ function openLogDir() {
   const dir = path.join(app.getPath('userData'), 'log');
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+// 体检记录与日志同目录,一行一个 JSON(JSONL),按到达时间排序。保留全部字段,
+// 这样能用 jq / 文本工具按小时筛出丢包时段;写失败不能影响实时 UI。
+const PROBE_LOG = () => path.join(openLogDir(), 'probe.jsonl');
+function appendProbeLog(report) {
+  try {
+    fs.appendFileSync(PROBE_LOG(), JSON.stringify(report) + '\n', 'utf8');
+  } catch (e) {
+    send('fcp:log', { level: 'warn', line: `probe log: ${e.message}` });
+  }
 }
 
 async function revealLogDir() {
@@ -229,7 +233,8 @@ function startTunnel(cfg) {
     // bundle is plain ESM.
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
     windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    // stdin is a local command channel (probe-now); never a remote input.
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
   child = proc;
   childState = { running: true, pid: proc.pid || 0, startedAt: Date.now(),
@@ -270,8 +275,13 @@ function startTunnel(cfg) {
       if (line.startsWith('probe ')) {
         try {
           // `at` is the tunnel's monotonic clock (process uptime), useless as a
-          // timestamp; the shelf stamps the arrival time instead.
-          send('fcp:probe', { ...JSON.parse(line.slice(6)), recvAt: Date.now() });
+          // timestamp; the shelf stamps the arrival time instead. Both the ms
+          // epoch and an ISO string go out: the UI needs the number, the JSONL
+          // log is meant to be read by humans/tools by hour of day.
+          const recvAt = Date.now();
+          const report = { ...JSON.parse(line.slice(6)), recvAt, atIso: new Date(recvAt).toISOString() };
+          appendProbeLog(report);
+          send('fcp:probe', report);
         } catch {
           send('fcp:log', { level: 'warn', line: `probe: unparsable result ${line.slice(6, 120)}` });
         }
@@ -330,162 +340,6 @@ function stopTunnel() {
   return { ok: true };
 }
 
-// ---------------------------------------------------------------- speed test
-//
-// The Node port's `speedtest` subcommand measures an in-process loopback, which
-// says nothing about the path the user cares about. This one dials the local
-// SOCKS listener the tunnel exposes and pulls a real URL through it.
-
-function socksConnect(socksHost, socksPort, host, port, timeoutMs = 8000) {
-  return new Promise((resolve, reject) => {
-    const sock = net.connect(socksPort, socksHost);
-    let stage = 0;
-    const fail = (e) => { sock.destroy(); reject(e); };
-    const timer = setTimeout(() => fail(new Error('SOCKS handshake timeout')), timeoutMs);
-    sock.setNoDelay(true);
-    sock.on('error', fail);
-    sock.on('close', () => { if (stage < 2) fail(new Error('SOCKS closed early')); });
-    sock.on('connect', () => sock.write(Buffer.from([0x05, 0x01, 0x00])));
-    sock.on('data', function onData(buf) {
-      if (stage === 0) {
-        if (buf[0] !== 0x05 || buf[1] !== 0x00) return fail(new Error('SOCKS greeting rejected'));
-        stage = 1;
-        const name = Buffer.from(host, 'utf8');
-        const req = Buffer.alloc(7 + name.length);
-        req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-        req[4] = name.length; name.copy(req, 5);
-        req.writeUInt16BE(port, 5 + name.length);
-        sock.write(req);
-        sock.removeListener('data', onData);
-        sock.once('data', (reply) => {
-          if (reply[0] !== 0x05 || reply[1] !== 0x00) {
-            return fail(new Error(`SOCKS connect failed (rep=${reply[1]})`));
-          }
-          clearTimeout(timer);
-          stage = 2;
-          sock.removeAllListeners('close');
-          resolve(sock);
-        });
-        return;
-      }
-    });
-  });
-}
-
-async function runSpeedTest(cfg, onDone) {
-  // An invalid URL used to escape as an unhandled promise rejection, which the
-  // Node runtime treats as fatal in the main process. Every failure must land
-  // in finish() so the renderer gets a result instead of a dead app.
-  try {
-    await speedTestInner(cfg, onDone);
-  } catch (e) {
-    send('fcp:speed', { done: true, ok: false, bytes: 0, seconds: 0,
-      mbps: 0, mbPerSec: 0, error: e.message || String(e), url: cfg && cfg.url });
-  }
-}
-
-async function speedTestInner(cfg, onDone) {
-  const seq = ++speedSeq;
-  const started = Date.now();
-  const target = new URL(cfg.url);
-  const host = target.hostname;
-  const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
-  const tlsTarget = target.protocol === 'https:';
-  let total = 0, headerBytes = 0, ended = false;
-  let headerBuf = '', bodySeen = false, contentLength = -1, hardTimer = null;
-
-  const finish = (message) => {
-    if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
-    if (ended || seq !== speedSeq) return; // superseded by a newer run
-    ended = true;
-    // A user-requested stop is not a measurement: close/destroy used to report
-    // the partial byte count as a successful run.
-    const reason = message || (speedCancelRequested ? '已停止' : '');
-    const elapsed = Math.max(0.2, (Date.now() - started) / 1000);
-    const body = Math.max(0, total - headerBytes);
-    const result = {
-      ok: !reason, bytes: body, seconds: elapsed,
-      mbps: body * 8 / elapsed / 1e6, mbPerSec: body / elapsed / 1048576,
-      error: reason, url: cfg.url,
-    };
-    send('fcp:speed', { done: true, ...result });
-    if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
-    if (onDone) onDone(result);
-  };
-
-  let sock;
-  try {
-    sock = await socksConnect(cfg.socksHost || '127.0.0.1', cfg.socksPort || 1080, host, port);
-  } catch (e) {
-    finish(`SOCKS: ${e.message}`);
-    return;
-  }
-  speedJob = sock;
-  if (tlsTarget) {
-    sock = tls.connect({ socket: sock, servername: host },
-      () => sock.write(buildRequest(target, host, port)));
-    sock.on('error', (e) => finish(`TLS: ${e.message}`));
-  } else {
-    sock.write(buildRequest(target, host, port));
-    sock.on('error', (e) => finish(`HTTP: ${e.message}`));
-  }
-  sock.on('data', (b) => {
-    total += b.length;
-    if (!bodySeen) {
-      // Accumulate across reads: a header split over two TCP segments used to
-      // leave its first part counted as body, and a >2048 B header was never
-      // recognised at all.
-      headerBuf += b.toString('latin1');
-      const idx = headerBuf.indexOf('\r\n\r\n');
-      if (idx >= 0) {
-        headerBytes = idx + 4;
-        const statusMatch = /^HTTP\/\d\.\d\s+(\d{3})/.exec(headerBuf);
-        if (!statusMatch) {
-          finish('HTTP: malformed status line');
-          try { sock.destroy(); } catch { /* closed */ }
-          return;
-        }
-        const status = Number(statusMatch[1]);
-        if (status < 200 || status >= 300) {
-          // A 403/404/301 body is not a throughput measurement.
-          finish(`HTTP ${status}`);
-          try { sock.destroy(); } catch { /* closed */ }
-          return;
-        }
-        const cl = /content-length:\s*(\d+)/i.exec(headerBuf.slice(0, idx));
-        if (cl) contentLength = Number(cl[1]);
-        bodySeen = true;
-      } else if (headerBuf.length > 8192) {
-        finish('HTTP: response headers too large');
-        try { sock.destroy(); } catch { /* closed */ }
-        return;
-      }
-    }
-    if (bodySeen && contentLength >= 0 && total - headerBytes >= contentLength) {
-      finish('');
-      try { sock.destroy(); } catch { /* closed */ }
-      return;
-    }
-    if (Date.now() - started > (cfg.seconds || 10) * 1000) finish('');
-  });
-  sock.on('close', () => { if (!ended) finish(''); });
-  sock.on('end', () => { if (!ended) finish(''); });
-  hardTimer = setTimeout(() => finish(''), (cfg.seconds || 10) * 1000 + 250);
-  send('fcp:speed', { done: false, url: cfg.url, seconds: (cfg.seconds || 10) });
-}
-
-function buildRequest(target, host, port) {
-  const pathAndQuery = `${target.pathname || '/'}${target.search || ''}`;
-  const defaultPort = target.protocol === 'https:' ? 443 : 80;
-  const hostHeader = port === defaultPort ? host : `${host}:${port}`;
-  return `GET ${pathAndQuery} HTTP/1.1\r\n` +
-    `Host: ${hostHeader}\r\n` +
-    `User-Agent: fcp-desktop/${app.getVersion()}\r\n` +
-    'Accept: */*\r\n' +
-    'Accept-Encoding: identity\r\n' +
-    'Connection: close\r\n\r\n';
-}
-
 // ---------------------------------------------------------------- window
 
 function createWindow() {
@@ -536,28 +390,15 @@ ipcMain.handle('fcp:start', (_e, cfg) => startTunnel(cfg || {}));
 ipcMain.handle('fcp:stop', () => stopTunnel());
 ipcMain.handle('fcp:state', () => childState);
 ipcMain.handle('fcp:version', () => app.getVersion());
-ipcMain.handle('fcp:speed:start', (_e, cfg) => {
-  if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
-  speedCancelRequested = false;
-  runSpeedTest(cfg || {});
-  return { ok: true };
-});
-ipcMain.handle('fcp:speed:stop', () => {
-  speedCancelRequested = true;
-  if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
+// Manual "measure now": a line on the child's stdin. The tunnel queues it on
+// its next tick and bypasses the idle/schedule gates; the result comes back on
+// the normal probe channel (and is appended to probe.jsonl).
+ipcMain.handle('fcp:probe:now', () => {
+  if (!child || !child.stdin || childState.running === false) return { ok: false, error: '代理未运行' };
+  child.stdin.write('probe\n');
   return { ok: true };
 });
 ipcMain.handle('fcp:open-log-dir', async () => revealLogDir());
-ipcMain.handle('fcp:pick-url', async () => {
-  const r = await dialog.showMessageBox(win, {
-    type: 'question',
-    buttons: ['取消', '使用默认测速地址'],
-    message: '测速地址',
-    detail: '测速会经本地 SOCKS 代理真实下载该 URL。',
-  });
-  return r.response === 1 ? 'https://downloads.claude.ai/claude-code-releases/2.1.319/win32-x64/claude.exe' : '';
-});
-
 app.on('second-instance', () => { showWindow(); });
 
 const gotLock = app.requestSingleInstanceLock();

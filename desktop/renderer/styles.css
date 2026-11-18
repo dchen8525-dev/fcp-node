@@ -62,7 +62,6 @@
   --accent-soft: rgba(var(--accent-rgb), 0.10);
   --accent-line: rgba(var(--accent-rgb), 0.26);
   --btn-from: #4ade9f;
-  --speed-from: #b8f5dc;
   --sand: #fbbf24;
   --sand-rgb: 251, 191, 36;
   --sand-deep: #f59e0b;
@@ -129,7 +128,6 @@
   --accent-soft: rgba(var(--accent-rgb), 0.12);
   --accent-line: rgba(var(--accent-rgb), 0.30);
   --btn-from: #a8c2ff;
-  --speed-from: #d6e4ff;
   --sand: #f6bd6b;
   --sand-rgb: 246, 189, 107;
   --sand-deep: #dd9c45;
@@ -196,7 +194,6 @@
   --accent-soft: rgba(var(--accent-rgb), 0.12);
   --accent-line: rgba(var(--accent-rgb), 0.30);
   --btn-from: #fbbf24;
-  --speed-from: #fde3ad;
   --sand: #7cc4ff;
   --sand-rgb: 124, 196, 255;
   --sand-deep: #4aa3f0;
@@ -263,7 +260,6 @@
   --accent-soft: rgba(var(--accent-rgb), 0.10);
   --accent-line: rgba(var(--accent-rgb), 0.28);
   --btn-from: #21835f;
-  --speed-from: #0a5138;
   --sand: #a35f0a;
   --sand-rgb: 163, 95, 10;
   --sand-deep: #8a4f06;
@@ -332,7 +328,6 @@
   --accent-soft: rgba(var(--accent-rgb), 0.10);
   --accent-line: rgba(var(--accent-rgb), 0.28);
   --btn-from: #3168ff;
-  --speed-from: #16307f;
   --sand: #9a5f00;
   --sand-rgb: 154, 95, 0;
   --sand-deep: #7f4d00;
@@ -901,42 +896,6 @@ select option { background: var(--card); color: var(--ink); }
 }
 .kv-grid .mono { font-family: var(--mono); font-size: 12px; font-weight: 500; }
 
-/* ---------------------------------------------------------------- speed */
-
-.speed-result { display: flex; flex-direction: column; gap: 15px; }
-.speed-big {
-  font-size: 48px; font-weight: 650; letter-spacing: -1.6px;
-  font-variant-numeric: tabular-nums;
-  line-height: 1.02;
-  background: linear-gradient(180deg, var(--speed-from), var(--accent) 55%, var(--accent-deep));
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  filter: drop-shadow(0 6px 22px var(--halo-soft));
-}
-.speed-big.is-empty {
-  background: none;
-  -webkit-text-fill-color: var(--muted-2);
-  filter: none;
-}
-.speed-big small {
-  font-size: 13px; font-weight: 500; letter-spacing: 0;
-  color: var(--muted-2); margin-left: 8px;
-  -webkit-text-fill-color: var(--muted-2);
-}
-.speed-detail { display: flex; gap: 38px; }
-.speed-detail > div { display: flex; flex-direction: column; gap: 4px; }
-.speed-detail span { font-size: 11px; color: var(--muted-2); }
-.speed-detail strong { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--ink); }
-.meter { height: 5px; border-radius: 999px; background: var(--track); overflow: hidden; }
-.meter-fill {
-  height: 100%; width: 0;
-  border-radius: 999px;
-  background: linear-gradient(90deg, var(--accent-deep), var(--accent-bright));
-  box-shadow: 0 0 10px var(--halo);
-  transition: width 220ms ease;
-}
-
 /* ---------------------------------------------------------------- log */
 
 .log-tools { display: flex; align-items: center; gap: 9px; flex: none; }
@@ -1037,6 +996,12 @@ select option { background: var(--card); color: var(--ink); }
   background: var(--accent-soft);
 }
 .probe-when.is-off { color: var(--faint); }
+/* 体检页头部右侧:状态胶囊 + 立即体检按钮 */
+.probe-head-actions {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 10px;
+  flex: none;
+}
+.probe-head-actions .primary { padding: 6px 16px; white-space: nowrap; }
 
 .probe-history { display: flex; flex-direction: column; }
 .probe-row {

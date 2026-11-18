@@ -94,8 +94,13 @@ export interface TunnelOptions {
    *  answers trains but never starts one (it cannot know whether the user is
    *  working, and two ends probing each other would double the cost). */
   onProbe?: (r: ProbeReport) => void;
-  /** Idle path probe: false disables it entirely (the peer still answers). */
+  /** Automatic idle path probe: false stops the periodic scheduler. Manual
+   *  probeNow() still works — protocol negotiation is offered independently
+   *  via probeNegotiate so the button is never dead. */
   probe?: boolean;
+  /** Offer TLV 6 at handshake. Defaults to true; only set false if the peer
+   *  cannot speak PROBE (legacy interop). --no-probe does NOT set this. */
+  probeNegotiate?: boolean;
   probeIntervalMs?: number;
   probeBudgetBytes?: number;
   tracePrefix?: string;
@@ -285,6 +290,10 @@ export class TunnelClient {
   private probeRunning = false;
   private probeCount = 0;
   private lastAppByteMs = 0;
+  /** Manual "measure now" request. Set by probeNow(), consumed on the next
+   *  tick; bypasses both the idle gate and the schedule, but still needs a
+   *  ready session (one is created if the pool is empty). */
+  private probePending = false;
 
   constructor(opts: TunnelOptions) {
     this.opts = opts;
@@ -348,6 +357,23 @@ export class TunnelClient {
 
   get sessionCount(): number { return this.sessions.size; }
 
+  /**
+   * Ask for one path probe immediately, ignoring both the idle-time gate and
+   * the schedule. Queued on the next tick so session setup stays on the single
+   * reactor thread. Returns false only if a probe is already in flight.
+   *
+   * The protocol negotiation itself is always offered (see ensurePoolEntry),
+   * so an explicit "measure now" works even when automatic probing is off via
+   * --no-probe. That is the point: the user disabled *periodic* measurement,
+   * not the ability to ask for one.
+   */
+  probeNow(): boolean {
+    if (!this.running || this.probeRunning || this.probePending) return false;
+    this.probePending = true;
+    this.armTick();
+    return true;
+  }
+
   /** Wire-side byte totals since start(); the desktop shell reads these too. */
   get counters(): { tx: number; rx: number; sessions: number; uptimeMs: number } {
     return {
@@ -371,7 +397,9 @@ export class TunnelClient {
       role: HandshakeRole.Client,
       d: this.opts.d ?? DEFAULT_D, p: this.opts.p ?? DEFAULT_P,
       interleave: this.opts.interleave, ackCopies: this.opts.ackCopies,
-      probe: this.opts.probe,
+      // Negotiation stays on for --no-probe so an explicit probeNow() can run;
+      // only the automatic scheduler reads opts.probe.
+      probe: this.opts.probeNegotiate !== false,
       mtu: this.opts.mtu ?? DEFAULT_MTU_MIN,
       pmtuMaxMtu: this.opts.pmtuMaxMtu,
       pinnedK: this.opts.pinnedK,
@@ -525,7 +553,11 @@ export class TunnelClient {
    * session would never run when it matters.
    */
   private maybeProbe(now: number): void {
-    if (this.opts.probe === false) return;
+    // Manual request bypasses both the feature switch and the idle/schedule
+    // gates. Automatic probing still respects all three.
+    const manual = this.probePending;
+    if (manual) this.probePending = false;
+    if (!manual && this.opts.probe === false) return;
     if (this.probeRunning) {
       // The session carrying the run can die mid-train; without this the flag
       // would stay set and no later probe would ever start.
@@ -535,34 +567,43 @@ export class TunnelClient {
       this.probeRunning = false;
     }
     const interval = this.opts.probeIntervalMs ?? PROBE_INTERVAL_MS;
-    if (this.probeNextMs === 0) {
-      this.probeNextMs = Math.max(now, this.lastAppByteMs) + interval;
-      return;
-    }
-    if (now < this.probeNextMs) return;
-    if (now - this.lastAppByteMs < PROBE_IDLE_MS) {
-      // Busy: do not consume the schedule, come back when it might be idle.
-      this.probeNextMs = now + Math.min(interval, PROBE_RETRY_MS * 6);
-      return;
+    if (!manual) {
+      if (this.probeNextMs === 0) {
+        this.probeNextMs = Math.max(now, this.lastAppByteMs) + interval;
+        return;
+      }
+      if (now < this.probeNextMs) return;
+      if (now - this.lastAppByteMs < PROBE_IDLE_MS) {
+        // Busy: do not consume the schedule, come back when it might be idle.
+        this.probeNextMs = now + Math.min(interval, PROBE_RETRY_MS * 6);
+        return;
+      }
     }
     let target: Session | null = null;
     for (const entry of this.pool) {
       const s = entry.session;
       if (!s.pathProbeReady || s.pathProbeRunning) continue;
-      if (s.inflightBytes > 0 || s.queuedBytes > 0) continue;
+      if (!manual && (s.inflightBytes > 0 || s.queuedBytes > 0)) continue;
       target = s;
       break;
     }
     if (!target) {
+      // A manual ask with no live session creates one and retries on the next
+      // tick, once the handshake has had a chance to complete.
       if (this.pool.length === 0) this.ensurePoolEntry();
+      if (manual) this.probePending = true;
       this.probeNextMs = now + PROBE_RETRY_MS;
       return;
     }
     const budget = this.opts.probeBudgetBytes ?? PROBE_BUDGET_BYTES;
-    if (!target.startPathProbe(budget)) { this.probeNextMs = now + PROBE_RETRY_MS; return; }
+    if (!target.startPathProbe(budget)) {
+      if (manual) this.probePending = true;
+      this.probeNextMs = now + PROBE_RETRY_MS;
+      return;
+    }
     this.probeRunning = true;
     this.probeNextMs = now + interval;
-    this.log(`path probe: ${Math.round(budget / 1024)} KiB train, idle ${Math.round((now - this.lastAppByteMs) / 1000)}s, mtu=${target.mtuLimits.mtu}`);
+    this.log(`path probe: ${Math.round(budget / 1024)} KiB train, ${manual ? 'manual' : `idle ${Math.round((now - this.lastAppByteMs) / 1000)}s`}, mtu=${target.mtuLimits.mtu}`);
   }
 
   private onPathProbe(r: SessionProbeResult): void {
@@ -1308,7 +1349,9 @@ export class TunnelServer {
       role: HandshakeRole.Server,
       d: this.opts.d ?? DEFAULT_D, p: this.opts.p ?? DEFAULT_P,
       interleave: this.opts.interleave, ackCopies: this.opts.ackCopies,
-      probe: this.opts.probe,
+      // Negotiation stays on for --no-probe so an explicit probeNow() can run;
+      // only the automatic scheduler reads opts.probe.
+      probe: this.opts.probeNegotiate !== false,
       mtu: this.opts.mtu ?? DEFAULT_MTU_MIN,
       pmtuMaxMtu: this.opts.pmtuMaxMtu,
       pinnedK: this.opts.pinnedK,

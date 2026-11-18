@@ -61,10 +61,6 @@
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 10.5h3l2-5 2.5 9.5 2-6.5 1.4 2h4.1"/></svg>
           <span>链路体检</span>
         </button>
-        <button class="nav-item" data-page="speed" type="button">
-          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 15a7 7 0 1 1 12 0M10 12l3.2-3.2"/></svg>
-          <span>链路测速</span>
-        </button>
         <button class="nav-item" data-page="log" type="button">
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.5 5.5h11M4.5 10h11M4.5 14.5h7"/></svg>
           <span>日志</span>
@@ -216,9 +212,12 @@
         <header class="page-head">
           <div>
             <h1>链路体检</h1>
-            <p>空闲时两端自动配合测一次路径：探测包走隧道自己的 UDP 通道，不经过业务流，单次最多 1 MB。忙碌时不测。</p>
+            <p>空闲时两端自动配合测一次路径：探测包走隧道自己的 UDP 通道，不经过业务流，单次最多 1 MB。忙碌时不自动测，可手动立即测。每次结果也写入日志目录的 probe.jsonl。</p>
           </div>
-          <div class="probe-when" id="probeWhen">等待首次测量</div>
+          <div class="probe-head-actions">
+            <div class="probe-when" id="probeWhen">等待首次测量</div>
+            <button class="primary" id="probeNowBtn" type="button">立即体检</button>
+          </div>
         </header>
 
         <div class="grid two">
@@ -257,48 +256,6 @@
             <span class="card-note" id="probeHistoryNote">还没有记录</span>
           </div>
           <div class="probe-history" id="probeHistory"></div>
-        </div>
-      </section>
-
-      <!-- speed -->
-      <section class="page" data-page="speed">
-        <header class="page-head">
-          <div>
-            <h1>链路测速</h1>
-            <p>经当前本地 SOCKS 代理真实下载。Node 版内置的 <code>speedtest</code> 是进程内自环，测不到真实链路，所以这里走代理。</p>
-          </div>
-        </header>
-
-        <div class="card">
-          <label class="field">
-            <span class="field-label">测速 URL</span>
-            <input id="speedUrl" type="text" spellcheck="false"
-                   value="https://downloads.claude.ai/claude-code-releases/2.1.319/win32-x64/claude.exe" />
-          </label>
-          <div class="grid two">
-            <label class="field">
-              <span class="field-label">采样时长（秒）</span>
-              <input id="speedSeconds" type="number" min="3" max="60" value="10" />
-            </label>
-            <label class="field">
-              <span class="field-label">走哪个本地端口</span>
-              <input id="speedPort" type="number" min="1" max="65535" value="1080" />
-            </label>
-          </div>
-          <div class="actions">
-            <button class="primary" id="speedBtn" type="button">开始测速</button>
-            <span class="action-note" id="speedNote">代理未运行时会失败</span>
-          </div>
-        </div>
-
-        <div class="card speed-result">
-          <div class="speed-big is-empty"><span id="speedMbps">—</span><small>Mbit/s</small></div>
-          <div class="speed-detail">
-            <div><span>已下载</span><strong id="speedBytes">—</strong></div>
-            <div><span>耗时</span><strong id="speedElapsed">—</strong></div>
-            <div><span>折算</span><strong id="speedMiB">—</strong></div>
-          </div>
-          <div class="meter"><div class="meter-fill" id="speedMeter"></div></div>
         </div>
       </section>
 
