@@ -12,7 +12,7 @@ import { computeMtuLimits, FrameTx, FrameRx, packTxFrame, type TxSymbol } from '
 import { chooseGroupD } from '../src/control/controller.ts';
 import { Stream } from '../src/stream/stream.ts';
 import { encodeAckV2 } from '../src/stream/segment.ts';
-import { D_FLOOR, MAX_SETS_PER_SECOND } from '../src/constants.ts';
+import { D_FLOOR, MAX_ACTIVE_SETS, MAX_SETS_PER_SECOND } from '../src/constants.ts';
 
 const LIMITS = computeMtuLimits(1400, 20);
 
@@ -93,6 +93,38 @@ test('interleave: a lane that stops filling still gets its parity', () => {
   for (const s of parity) assert.ok(((s.typeK >>> 5) & 0x07) <= 2);
 });
 
+test('a group that closes short still repairs, because the decoder derives kEff too', () => {
+  // d=10 with two segments flushed early: the sender scales the code length to
+  // kEff = ceil(6*2/10) = 2 (so a short group does not pay for six parity
+  // symbols), and stamps the session's k=6 in every header. The Cauchy
+  // coefficient is 1/(r XOR (k+c)), i.e. it depends on k, so decoding that
+  // group with 6 solves a different linear system: the shard comes out garbage
+  // and only the length/padding sanity check keeps it out of the stream.
+  // Before this test existed the parity of *every* short group was dead weight
+  // (recovered=0, badRecon=1), which interleaving and adaptive d make common.
+  const payloads = [Buffer.alloc(40, 0x11), Buffer.alloc(40, 0x22)];
+  const emitted: TxSymbol[] = [];
+  const tx = new FrameTx(10, LIMITS, (s) => emitted.push(s));
+  tx.setK(6);
+  for (const p of payloads) tx.onSegment(p, 0);
+  tx.onTick(5000);
+  assert.equal(emitted.length, 4, '2 data + kEff=2 parity');
+
+  const delivered: Array<{ payload: Buffer; recovered: boolean }> = [];
+  const rx = new FrameRx({
+    d: 10, p: 6, maxSymbolLen: LIMITS.symbolMax,
+    deliver: (b, info) => delivered.push({ payload: Buffer.from(b), recovered: info.recovered }),
+    oob: () => {},
+  });
+  // Everything except the first data symbol.
+  emitted.forEach((s, i) => { if (i !== 0) rx.onDatagram(packTxFrame(s), 1); });
+  const counters = (rx as unknown as { counters: { badRecon: number; recovered: number } }).counters;
+  assert.equal(counters.badRecon, 0, 'the reconstruction must not be rejected as garbage');
+  const repaired = delivered.filter((d) => d.recovered);
+  assert.equal(repaired.length, 1, 'the lost shard was repaired from the short group');
+  assert.deepEqual(repaired[0].payload, payloads[0], 'and it is the original bytes');
+});
+
 test('control segments never join a data group', () => {
   const emitted: TxSymbol[] = [];
   const tx = new FrameTx(10, LIMITS, (s) => emitted.push(s));
@@ -133,6 +165,12 @@ test('adaptive d: the set-rate bound outranks the loss bound', () => {
   const d = chooseGroupD({ dMax: 40, p: 6, loss: 0.30, symPerSec: 2000 });
   assert.equal(d, Math.ceil(2000 / MAX_SETS_PER_SECOND));
   assert.ok(d * MAX_SETS_PER_SECOND >= 2000, 'the sender stays inside the set budget');
+  // And the budget itself has to fit the receiver's map: a set occupies a slot
+  // for 2 s (settle at 1 s, delete at 2 s), so the sustained rate must stay at
+  // or below half of MAX_ACTIVE_SETS. The constant used to say 150, which is
+  // 300 resident sets against a cap of 256.
+  assert.ok(MAX_SETS_PER_SECOND * 2 <= MAX_ACTIVE_SETS,
+    `set budget ${MAX_SETS_PER_SECOND}/s must fit ${MAX_ACTIVE_SETS} slots over 2 s`);
 });
 
 test('ACK copies: a flagged duplicate is not loss evidence', () => {

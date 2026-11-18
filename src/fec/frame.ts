@@ -5,7 +5,8 @@
 //   data symbol   = len(2 LE) | payload        (len includes the 2-byte prefix)
 //   parity symbol = symbol_max bytes of RS output
 //   oob symbol    = raw oob message (set_id = index = 0)
-// The 6-byte FEC header is prepended by Session before the AEAD envelope.
+// The 7-byte FEC header (v2: d was added to the 6-byte v1 layout) is prepended
+// by Session before the AEAD envelope.
 
 import {
   FEC_HDR_LEN, SymbolType, MAX_S, MAX_ACTIVE_SETS, MAX_GAP_PLACEHOLDERS,
@@ -503,8 +504,21 @@ export class FrameRx {
     for (let i = 0; i < set.n; ++i) {
       if (!set.orig.has(i) && !set.recov.has(i)) missing.push(i);
     }
-    if (missing.length === 0 || missing.length > set.k || set.symbolMax < 2) return;
-    const n = set.n, k = set.k;
+    // The code length is not the header's k when the group closed early: the
+    // sender scales it to kEff = max(1, min(k, ceil(k*n/d))) so a short group
+    // does not pay for full parity. The Cauchy coefficient is 1/(r XOR (k+c)),
+    // i.e. it *depends on k*, so decoding a kEff-encoded group with the
+    // header's k solves a different linear system: the reconstruction is
+    // garbage, and only the length/zero-tail sanity check below keeps it out
+    // of the stream. Deriving the same kEff here is exact rather than a guess —
+    // n is final the moment a parity symbol exists (parity is only emitted at
+    // close), and d and k both travel in the header.
+    const dSet = set.dKnown ? set.d : this.dMax;
+    const kUsed = dSet > 0
+      ? Math.max(1, Math.min(set.k, Math.ceil((set.k * set.n) / dSet)))
+      : set.k;
+    if (missing.length === 0 || missing.length > kUsed || set.symbolMax < 2) return;
+    const n = set.n, k = kUsed;
     if (n + k > 256) return;
     const size = set.symbolMax;
     const shards: (Buffer | null)[] = new Array(n + k).fill(null);

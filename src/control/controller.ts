@@ -279,7 +279,8 @@ export function chooseGroupD(o: {
   return Math.max(1, Math.min(dMax, d));
 }
 
-/** BBR v1/v2 lite: only exposes pacing/srtt hints to the reactor. */export class BbrLite {
+/** BBR v1/v2 lite: only exposes pacing/srtt hints to the reactor. */
+export class BbrLite {
   version: 1 | 2 = 2;
   srttMs: number;
   minRttMs = 0;

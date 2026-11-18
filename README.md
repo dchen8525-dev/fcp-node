@@ -116,7 +116,7 @@ src/
   crypto/     aes.ts keys.ts        原生 AES-128-GCM、会话/方向密钥派生
               envelope.ts           28 字节双信封、1024 槽反重放
               handshake.ts          HELLO/HELLO_ACK、caps、TLV、协商状态机
-  fec/        gf256.ts cauchy.ts rs.ts hdr.ts   字段运算与 6 字节 FEC 头
+  fec/        gf256.ts cauchy.ts rs.ts hdr.ts   字段运算与 7 字节 FEC 头（v2 带 d）
               frame.ts             FrameTx/FrameRx、集合结算、MTU 预算、oob
               fecstat.ts           128 字节 FECSTAT 编解码与校验
   control/    controller.ts        AdaptiveFec / BbrLite / FecstatReporter

@@ -132,9 +132,16 @@ export const MAX_INTERLEAVE = 8;
  *  granularity gets coarse (k/d jumps by 1/d per step) and the set rate climbs. */
 export const D_FLOOR = 4;
 /** Ceiling on full groups per second, used to reject a d so small that the
- *  receiver would evict unaccounted sets faster than it settles them
- *  (MAX_ACTIVE_SETS = 256 over a 2 s settle window). */
-export const MAX_SETS_PER_SECOND = 150;
+ *  receiver would evict unaccounted sets faster than it settles them.
+ *
+ *  A set occupies a slot for 2 s (frame.ts settles at 1 s and deletes at 2 s),
+ *  so a sustained rate of P groups/s keeps 2P sets resident, and MAX_ACTIVE_SETS
+ *  = 256 (declared below, in the FEC section) allows at most 128/s. This used
+ *  to be 150, which its own comment disproved: 150 x 2 = 300 resident sets,
+ *  i.e. exactly the eviction path the bound exists to avoid. The 256 is written
+ *  out because MAX_ACTIVE_SETS is declared later in this file; the invariant
+ *  `2 x this <= MAX_ACTIVE_SETS` is pinned by tests/geom.test.ts. */
+export const MAX_SETS_PER_SECOND = 256 / 2;
 /** A d change is only applied when it moves by at least this much, so the
  *  controller cannot chatter between two adjacent values every tick. */
 export const D_STEP_MIN = 2;
