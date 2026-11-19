@@ -12,7 +12,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { createSocket } from 'node:dgram';
 import { fileURLToPath } from 'node:url';
 
 const CLI = fileURLToPath(new URL('../src/app/cli.ts', import.meta.url));
@@ -20,6 +21,18 @@ const KEY = '11c10975740b454b247adc95637e1c9a'; // 32 hex chars, dummy PSK
 
 function run(args: string[]) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8', timeout: 15000 });
+}
+
+/** A UDP port the kernel just handed out, so the started-server case can bind. */
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const s = createSocket('udp4');
+    s.once('error', reject);
+    s.bind(0, '127.0.0.1', () => {
+      const p = s.address().port;
+      s.close(() => resolve(p));
+    });
+  });
 }
 
 /** Assert the CLI rejected the invocation with the expected diagnostic. */
@@ -179,4 +192,62 @@ test('CLI: speedtest --seconds is range-checked like every other numeric option'
   }
   // The deprecated spelling is held to the same contract.
   expectReject(['speedtest', `--key=${KEY}`, '--speedtest-seconds=99'], /--seconds expects an integer in 3\.\.30/);
+});
+
+// --- probe interval: one knob, and it owns the off-state ------------------
+
+test('CLI: --no-probe is rejected in favour of --probe-interval=0', () => {
+  // The interval already has an off-state, so a second switch could contradict
+  // it (interval 300 + "disabled"). Ignoring the flag would be worse than the
+  // old behaviour: the periodic probe would keep running after an upgrade said
+  // it should stop.
+  expectReject(['server', `--key=${KEY}`, '--no-probe'],
+    /--no-probe is no longer accepted; use --probe-interval=0/);
+});
+
+test('CLI: --probe-interval rejects the ambiguous 1..29 window and junk', () => {
+  // An empty value is a typo, not "off": it used to normalise to 0 and silently
+  // disable the probe, which is exactly the silent-default class this contract
+  // forbids. Writing 0 is how you ask for off.
+  for (const bad of ['1', '29', '86401', 'abc', '3.5', '']) {
+    expectReject(['server', `--key=${KEY}`, `--probe-interval=${bad}`],
+      /--probe-interval expects an integer: 0 or below disables the probe, otherwise 30\.\.86400/);
+  }
+});
+
+test('CLI: --probe-interval=0 and below are the off-state, not an error', async () => {
+  // 0 and any negative number must reach a running server: the merged knob's
+  // whole point is that "off" is a value, so rejecting it would leave the user
+  // with no way to disable the probe at all.
+  for (const value of ['0', '-1']) {
+    const port = await freePort();
+    const proc = spawn(process.execPath,
+      [CLI, 'server', `--key=${KEY}`, `--probe-interval=${value}`, '-b', `127.0.0.1:${port}`],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    proc.stdout.setEncoding('utf8');
+    proc.stderr.setEncoding('utf8');
+    const started = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(
+        `no "server started" within 8 s (--probe-interval=${value})\nstdout: ${out}\nstderr: ${err}`)), 8000);
+      // Logs go to stderr (src/util/log.ts), startup line included.
+      proc.stderr.on('data', (d: string) => {
+        err += d;
+        if (err.includes('server started')) { clearTimeout(timer); resolve(); }
+      });
+      proc.stdout.on('data', (d: string) => { out += d; });
+      proc.on('exit', (code) => {
+        clearTimeout(timer);
+        reject(new Error(`exited ${code} before startup (--probe-interval=${value})\nstderr: ${err}`));
+      });
+    });
+    try {
+      await started;
+    } finally {
+      await new Promise<void>((r) => { proc.once('exit', () => r()); proc.kill(); });
+    }
+    assert.doesNotMatch(err, /unknown option|unknown switch/,
+      `--probe-interval=${value} must be a known option`);
+    assert.equal(out, '', `--probe-interval=${value} must not write to stdout`);
+  }
 });

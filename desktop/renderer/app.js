@@ -244,12 +244,11 @@ function collectSettings() {
     fecParityMax: el.fecParityMax.value === '' ? 4 : Number(el.fecParityMax.value),
     logLevel: el.logLevel.value,
     // PMTUD 已恒定默认开启，界面不再有开关；存档里不再写 pmtud 字段。
-    // 分钟 -> 秒,与 --probe-interval 同一单位。≤0 一律记 0,由 probe=false
-    // 让主进程发 --no-probe;不要把 0 吞成默认值。
-    // 正数钳到 CLI 接受的 30..86400 秒,这样"填 >0 就体检"不会被边界值拒绝。
+    // 分钟 -> 秒,与 --probe-interval 同一单位。≤0 一律记 0:CLI 侧 0 就是关闭,
+    // 不再有 --no-probe 这个第二开关。正数钳到 CLI 接受的 30..86400 秒,
+    // 这样"填 >0 就体检"不会被边界值拒绝。
     probeInterval: probeMin > 0
       ? Math.min(86400, Math.max(30, Math.round(probeMin * 60))) : 0,
-    probe: probeMin > 0,
     remember: el.remember.checked,
   };
 }
@@ -260,7 +259,7 @@ function scheduleSave() {
     window.fcp.saveSettings({
       remember: false, key: '', host: '', port: 4460, listenHost: '127.0.0.1',
       listenPort: 1080, mtu: 1040, fecData: 10, fecParityMax: 4, logLevel: '',
-      probeInterval: 300, probe: true,
+      probeInterval: 300,
     });
     return;
   }
@@ -292,7 +291,7 @@ function applySettings(s) {
   if (typeof s.fecParityMax === 'number') el.fecParityMax.value = String(s.fecParityMax);
   if (s.logLevel) el.logLevel.value = s.logLevel;
   // 旧存档里的 pmtud 字段刻意忽略：PMTUD 现在恒定开启，不再由界面控制。
-  // 分钟 -> 秒。旧存档用 probe:false 表示关闭,这里一并折算成 0。
+  // 分钟 -> 秒。旧存档的 probe:false 是已废弃的第二开关,只读不写,折算成 0。
   if (typeof s.probeInterval === 'number') {
     el.probeInterval.value = String(Math.round(s.probeInterval / 60));
   }

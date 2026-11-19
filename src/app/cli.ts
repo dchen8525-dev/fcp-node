@@ -94,15 +94,15 @@ Common:
                         Copies carry a "redundant copy" bit so the peer does
                         not mistake them for duplicate-ACK loss evidence, and
                         they ride the data lanes so the interleave spreads them.
-  --no-probe            stop the automatic idle path probe. TLV 6 negotiation
-                        stays on, so the desktop shell's "measure now" button
-                        still works: this flag kills only the periodic timer.
-                        To drop the protocol entirely (legacy interop), the
-                        session's probeNegotiate must be set false in code.
   --probe-interval=SEC  how often an idle tunnel measures its path (default 300,
                         30..86400). Idle means no application byte for 20 s in
                         either direction: a busy tunnel is never probed, and the
                         probe's own bytes do not count as activity.
+                        SEC <= 0 turns the periodic probe off: the interval owns
+                        its own off-state, so there is no --no-probe switch to
+                        disagree with it. TLV 6 is still offered, so the desktop
+                        shell's "measure now" button keeps working; to drop the
+                        protocol itself, probeNegotiate must be false in code.
   --probe-budget=KiB    DAT payload one measurement may use across both
                         directions (default 1024, 64..8192). The train ramps
                         until loss rises above the path's own baseline and then
@@ -145,7 +145,7 @@ See docs/移植对照与差异.md for the full delta list.
 // parser used "the next token does not start with -" to decide, so `--no-pmtud 3`
 // silently swallowed the 3 and every later positional shifted.
 const BOOL_FLAGS = new Set([
-  'help', 'no-pmtud', 'no-probe', 'deny-private',
+  'help', 'no-pmtud', 'deny-private',
 ]);
 
 const ALIASES: Record<string, string> = {
@@ -202,6 +202,7 @@ const REMOVED_OPTS: Record<string, { use: string; why: string; short?: boolean }
   'fec-budget': { use: '--fec-parity-max=N: P is the ceiling k may climb to', why: 'the ratio never bounded anything (the default 0.8 mapped to k=7, above the agreed P, so the extra parity was dropped by the peer as IndexPastS); the agreed P is the only honest ceiling' },
   k: { use: '--fec-parity-max=N to raise the P ceiling; k itself is automatic', why: 'the old C++ spelling of --parity; pinning k disables loss-driven adaptation' },
   pmtud: { use: '--no-pmtud, and only if you want probing OFF', why: 'probing is already the default, so the switch only restated it and invited the opposite reading' },
+  'no-probe': { use: '--probe-interval=0', why: 'the interval already has an off-state; a separate switch could contradict it, so one config could say "measure every 5 min" and "never" at the same time' },
   'key-file': { use: '--key=HEX32', why: 'a file only wrapped the same 32 hex chars in a path that could fail with ENOENT' },
   'psk-file': { use: '--key=HEX32', why: 'a file only wrapped the same 32 hex chars in a path that could fail with ENOENT' },
   'key-env': { use: '--key=HEX32', why: 'the key is now one inline value, so there is no env lookup to resolve or get wrong' },
@@ -319,6 +320,28 @@ function intOpt(opts: Map<string, string>, name: string, def: number, min: numbe
     throw new Error(`--${name} expects an integer in ${min}..${max}, got "${raw}"`);
   }
   return n;
+}
+
+/**
+ * `--probe-interval` is the only probe switch, so it needs an off-state: any
+ * value <= 0 means "never run the periodic probe" and is normalised to 0.
+ * Positive values keep the old 30..86400 range, and 1..29 stays a loud error
+ * rather than being rounded up — an interval that short is a typo, and a silent
+ * fix would make the config differ from what was written.
+ */
+function probeIntervalOpt(opts: Map<string, string>): number {
+  const raw = opts.get('probe-interval');
+  if (raw === undefined) return 300;
+  if (raw.trim() === '') {
+    throw new Error('--probe-interval expects an integer: 0 or below disables the probe, ' +
+      'otherwise 30..86400 seconds, got an empty value');
+  }
+  const n = Number(raw);
+  if (!Number.isInteger(n) || (n > 0 && (n < 30 || n > 86400))) {
+    throw new Error('--probe-interval expects an integer: 0 or below disables the probe, ' +
+      `otherwise 30..86400 seconds, got "${raw}"`);
+  }
+  return n > 0 ? n : 0;
 }
 
 /**
@@ -493,9 +516,11 @@ async function main(): Promise<void> {
   // exactly as it was before these knobs existed.
   const interleave = intOpt(opts, 'interleave', 1, 1, MAX_INTERLEAVE);
   const ackCopies = intOpt(opts, 'ack-copies', 1, 1, MAX_ACK_COPIES);
-  // Idle path probe. --no-probe stops only the periodic scheduler; TLV 6 is
-  // still offered so the desktop shell's manual "measure now" can run.
-  const probeIntervalSec = intOpt(opts, 'probe-interval', 300, 30, 86400);
+  // Idle path probe. The interval owns its off-state (<= 0 = never), so there
+  // is no separate --no-probe to disagree with it. Only the periodic scheduler
+  // is affected; TLV 6 is still offered so the desktop shell's manual "measure
+  // now" can run.
+  const probeIntervalSec = probeIntervalOpt(opts);
   const probeBudgetKiB = intOpt(opts, 'probe-budget', 1024, 64, 8192);
   const debugLog = logLevel === 'debug' ? (l: string) => log(`DBG ${l}`) : undefined;
   const mtuMin = intOpt(opts, 'mtu-min', DEFAULT_MTU_MIN, 128, 9000);
@@ -511,7 +536,7 @@ async function main(): Promise<void> {
     ...fecGeo,
     interleave,
     ackCopies,
-    probe: !flags.has('no-probe'),
+    probe: probeIntervalSec > 0,
     probeIntervalMs: probeIntervalSec * 1000,
     probeBudgetBytes: probeBudgetKiB * 1024,
     pinnedK: pinnedKFromEnv(log),

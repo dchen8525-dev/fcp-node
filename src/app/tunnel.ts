@@ -106,7 +106,7 @@ export interface TunnelOptions {
    *  via probeNegotiate so the button is never dead. */
   probe?: boolean;
   /** Offer TLV 6 at handshake. Defaults to true; only set false if the peer
-   *  cannot speak PROBE (legacy interop). --no-probe does NOT set this. */
+   *  cannot speak PROBE (legacy interop). --probe-interval=0 does NOT set this. */
   probeNegotiate?: boolean;
   probeIntervalMs?: number;
   probeBudgetBytes?: number;
@@ -452,8 +452,8 @@ export class TunnelClient {
    *
    * The protocol negotiation itself is always offered (see ensurePoolEntry),
    * so an explicit "measure now" works even when automatic probing is off via
-   * --no-probe. That is the point: the user disabled *periodic* measurement,
-   * not the ability to ask for one.
+   * --probe-interval=0. That is the point: the user disabled *periodic*
+   * measurement, not the ability to ask for one.
    */
   probeNow(): boolean {
     if (!this.running || this.probeRunning || this.probePending) return false;
@@ -485,7 +485,7 @@ export class TunnelClient {
       role: HandshakeRole.Client,
       d: this.opts.d ?? DEFAULT_D, p: this.opts.p ?? DEFAULT_P,
       interleave: this.opts.interleave, ackCopies: this.opts.ackCopies,
-      // Negotiation stays on for --no-probe so an explicit probeNow() can run;
+      // Negotiation stays on for --probe-interval=0 so an explicit probeNow() can run;
       // only the automatic scheduler reads opts.probe.
       probe: this.opts.probeNegotiate !== false,
       mtu: this.opts.mtu ?? DEFAULT_MTU_MIN,
@@ -1512,7 +1512,7 @@ export class TunnelServer {
       role: HandshakeRole.Server,
       d: this.opts.d ?? DEFAULT_D, p: this.opts.p ?? DEFAULT_P,
       interleave: this.opts.interleave, ackCopies: this.opts.ackCopies,
-      // Negotiation stays on for --no-probe so an explicit probeNow() can run;
+      // Negotiation stays on for --probe-interval=0 so an explicit probeNow() can run;
       // only the automatic scheduler reads opts.probe.
       probe: this.opts.probeNegotiate !== false,
       mtu: this.opts.mtu ?? DEFAULT_MTU_MIN,

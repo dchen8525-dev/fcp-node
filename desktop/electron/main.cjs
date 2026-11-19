@@ -195,8 +195,11 @@ function statsArgs(cfg) {
   // 兜底值取渲染层的默认(10/4),不是 CLI 的 10/6:GUI 一直发的是 4,这里不偷偷改。
   args.push(`--fec-data=${Number.isInteger(cfg.fecData) ? cfg.fecData : 10}`);
   args.push(`--fec-parity-max=${Number.isInteger(cfg.fecParityMax) ? cfg.fecParityMax : 4}`);
-  if (cfg.probeInterval) args.push(`--probe-interval=${cfg.probeInterval}`);
-  if (cfg.probe === false) args.push('--no-probe');
+  // 体检只有一个旋钮:间隔 <= 0 就是关闭,CLI 侧也没有 --no-probe。
+  // 缺字段(很老的存档)当默认值 300,不让一次升级顺手把体检关掉。
+  const probeSec = Number.isFinite(Number(cfg.probeInterval)) && cfg.probeInterval !== ''
+    ? Math.round(Number(cfg.probeInterval)) : 300;
+  args.push(`--probe-interval=${probeSec > 0 ? probeSec : 0}`);
   args.push(`--log-level=${cfg.logLevel || 'info'}`);
   // 日志默认开启、固定落在用户数据目录,界面不再提供路径框。
   // openLogDir() 会 mkdirSync,所以这里直接用它的返回值。

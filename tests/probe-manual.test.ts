@@ -2,8 +2,8 @@
 //
 // probe-session.test.ts proves the Session-level protocol; this one proves the
 // GUI-facing contract: probeNow() must work even with automatic probing OFF
-// (--no-probe), must ignore the idle gate, and must deliver exactly one result
-// on the normal onProbe channel. The TLV 6 negotiation is deliberately left on
+// (--probe-interval=0), must ignore the idle gate, and must deliver exactly one
+// result on the normal onProbe channel. The TLV 6 negotiation is deliberately left on
 // (probeNegotiate defaults true) — that is what makes the button usable when
 // the user only disabled *periodic* measurement.
 
@@ -49,7 +49,7 @@ test('probeNow: manual measurement runs with automatic probing disabled', async 
     psk, host: '127.0.0.1', port: serverPort,
     listenHost: '127.0.0.1', listenPort: proxyPort,
     mtu: 1400, pmtud: false,
-    probe: false,                  // automatic scheduler OFF (--no-probe)
+    probe: false,                  // automatic scheduler OFF (--probe-interval=0)
     probeBudgetBytes: 256 * 1024,  // keep the test short
     log: () => {},
     onProbe: (r) => { result = r; },
