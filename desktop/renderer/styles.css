@@ -1008,6 +1008,12 @@ select option { background: var(--card); color: var(--ink); }
 .page[data-page="probe"] { height: 100%; }
 .page[data-page="probe"].is-active { display: flex; flex-direction: column; }
 .page[data-page="probe"] > * { flex: 0 0 auto; }
+/* 垂直空间是这一页的稀缺资源：stage 的上下留白、标题下间距、卡片内边距都收一档，
+   省下来的像素直接变成「最近几次」的行数（默认 980×700 下 +4 行左右）。 */
+.stage:has(.page[data-page="probe"].is-active) { padding-top: 16px; padding-bottom: 16px; }
+.page[data-page="probe"] .page-head { margin-bottom: 12px; }
+.page[data-page="probe"] .page-head p { line-height: 1.55; }
+.page[data-page="probe"] > .card { padding: 14px 18px; margin-bottom: 10px; }
 /* 最后一张卡片（最近几次）可以被压缩，但不能被内容顶出去：
    这样窗口再矮也只是列表变短，而不会把整页撑出滚动条。 */
 .page[data-page="probe"] > .card:last-child {
@@ -1018,16 +1024,40 @@ select option { background: var(--card); color: var(--ink); }
   flex-direction: column;
 }
 
+/* 「两个大数」和「本次测量」并成一张卡：原来两张卡各有一圈边框、内边距和一整行
+   标题，光这层壳就吃掉近 100px 高度，而它们本来就是同一次测量的两组读数。 */
+.probe-rates { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 22px; }
+/* 标签、数值、丢包说明并排一行：这三者本来就是同一句读数的三段，
+   竖着堆要 75px，横着排只要 32px。窄窗口下说明文字省略，不换行。 */
+.probe-rate { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.probe-rate .metric-label { flex: none; }
+.probe-rate .metric-value { margin: 0; font-size: 26px; letter-spacing: -0.5px; }
+.probe-rate .metric-value small { font-size: 11.5px; margin-left: 4px; }
+.probe-rate .metric-sub {
+  margin: 0; flex: 1 1 auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.probe-kv { margin-top: 11px; padding-top: 9px; border-top: 1px solid var(--line); }
+.kv-head {
+  display: flex; align-items: baseline; gap: 9px;
+  margin-bottom: 6px;
+  font-size: 12px; font-weight: 650; color: var(--muted);
+}
+.probe-kv .kv-grid { gap: 4px; }
+.probe-kv .kv-grid > div { gap: 3px; }
+.probe-kv .kv-grid span { font-size: 10.5px; }
+.probe-kv .kv-grid strong { font-size: 13.5px; }
+
 .probe-history {
   display: flex;
   flex-direction: column;
   /* 最多同时显示 N 行数据 + 1 行表头，再多就纵向滚动。
      行高是固定值；N 由 app.js 在根元素上写 --probe-visible-rows，
      这里只给 fallback，不要在本元素上声明同名变量（自身声明会遮蔽继承值）。 */
-  --probe-row-h: 34px;
+  --probe-row-h: 30px;
   flex: 1 1 auto;
-  /* 窗口很矮时留出表头 + 2 行，再矮就让页面滚动兜底。 */
-  min-height: calc(var(--probe-row-h) * 3);
+  /* 窗口很矮时留出表头 + 3 行，再矮就让页面滚动兜底。 */
+  min-height: calc(var(--probe-row-h) * 4);
   max-height: calc(var(--probe-row-h) * (var(--probe-visible-rows, 10) + 1) + 1px);
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -1043,7 +1073,7 @@ select option { background: var(--card); color: var(--ink); }
   padding: 0 2px;
   box-sizing: border-box;
   border-top: 1px solid var(--line);
-  font-size: 12px;
+  font-size: 11.5px;
 }
 .probe-row:first-child { border-top: 0; }
 .probe-row.head {

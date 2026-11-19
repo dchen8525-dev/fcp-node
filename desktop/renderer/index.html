@@ -202,7 +202,7 @@
         <header class="page-head">
           <div>
             <h1>链路体检</h1>
-            <p>空闲时两端自动配合测一次路径：探测包走隧道自己的 UDP 通道，不经过业务流，单次最多 1 MB。忙碌时不自动测，可手动立即测。</p>
+            <p>空闲时自动测一次，探测包走隧道自己的 UDP 通道，不占业务流，单次最多 1 MB。</p>
           </div>
           <div class="probe-head-actions">
             <div class="probe-when" id="probeWhen">等待首次测量</div>
@@ -210,33 +210,34 @@
           </div>
         </header>
 
-        <div class="grid two">
-          <div class="metric">
-            <div class="metric-label"><i class="swatch down"></i>下行可用</div>
-            <div class="metric-value" id="probeDown">— <small>MB/s</small></div>
-            <div class="metric-sub" id="probeDownSub">还没测过</div>
+        <div class="card probe-summary">
+          <div class="probe-rates">
+            <div class="probe-rate">
+              <div class="metric-label"><i class="swatch down"></i>下行可用</div>
+              <div class="metric-value" id="probeDown">— <small>MB/s</small></div>
+              <div class="metric-sub" id="probeDownSub">还没测过</div>
+            </div>
+            <div class="probe-rate">
+              <div class="metric-label"><i class="swatch up"></i>上行可用</div>
+              <div class="metric-value" id="probeUp">— <small>MB/s</small></div>
+              <div class="metric-sub" id="probeUpSub">还没测过</div>
+            </div>
           </div>
-          <div class="metric up-metric">
-            <div class="metric-label"><i class="swatch up"></i>上行可用</div>
-            <div class="metric-value" id="probeUp">— <small>MB/s</small></div>
-            <div class="metric-sub" id="probeUpSub">还没测过</div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-title">
-            本次测量
-            <span class="card-note" id="probeAt">—</span>
-          </div>
-          <div class="kv-grid">
-            <div><span>RTT 最小 / 平均</span><strong id="probeRtt">—</strong></div>
-            <div><span>抖动</span><strong id="probeJitter">—</strong></div>
-            <div><span>排队增量</span><strong id="probeQueue">—</strong></div>
-            <div><span>最长连续丢</span><strong id="probeRun">—</strong></div>
-            <div><span>探测数据</span><strong id="probeBytes">—</strong></div>
-            <div><span>用时</span><strong id="probeElapsed">—</strong></div>
-            <div><span>MTU</span><strong id="probeMtu">—</strong></div>
-            <div><span>FEC k / d</span><strong id="probeFec">—</strong></div>
+          <div class="probe-kv">
+            <div class="kv-head">
+              <span>本次测量</span>
+              <span class="card-note" id="probeAt">—</span>
+            </div>
+            <div class="kv-grid">
+              <div><span>RTT 最小 / 平均</span><strong id="probeRtt">—</strong></div>
+              <div><span>抖动</span><strong id="probeJitter">—</strong></div>
+              <div><span>排队增量</span><strong id="probeQueue">—</strong></div>
+              <div><span>最长连续丢</span><strong id="probeRun">—</strong></div>
+              <div><span>探测数据</span><strong id="probeBytes">—</strong></div>
+              <div><span>用时</span><strong id="probeElapsed">—</strong></div>
+              <div><span>MTU</span><strong id="probeMtu">—</strong></div>
+              <div><span>FEC k / d</span><strong id="probeFec">—</strong></div>
+            </div>
           </div>
         </div>
 
