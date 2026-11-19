@@ -1027,16 +1027,46 @@ select option { background: var(--card); color: var(--ink); }
 /* 「两个大数」和「本次测量」并成一张卡：原来两张卡各有一圈边框、内边距和一整行
    标题，光这层壳就吃掉近 100px 高度，而它们本来就是同一次测量的两组读数。 */
 .probe-rates { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 22px; }
-/* 标签、数值、丢包说明并排一行：这三者本来就是同一句读数的三段，
-   竖着堆要 75px，横着排只要 32px。窄窗口下说明文字省略，不换行。 */
-.probe-rate { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
-.probe-rate .metric-label { flex: none; }
-.probe-rate .metric-value { margin: 0; font-size: 26px; letter-spacing: -0.5px; }
+/* 每个方向两行：第一行「标签 + 大数值」，第二行「丢包 / 有效」说明。
+   三样挤一行时说明只剩小半栏宽：默认窗口下每栏约 135px，而
+   「丢包 0.0% · 有效 1.00 MB/s」要 190px，必然被 ellipsis 截成
+   「丢包 0.0% · 有效 1.0…」。说明单独占满一栏后，最长文案
+   （丢包 100.0% · 有效 8.42 MB/s · 超时）也放得下。 */
+.probe-rate {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  column-gap: 8px;
+  row-gap: 1px;
+  min-width: 0;
+}
+.probe-rate .metric-label { grid-column: 1; grid-row: 1; }
+/* 数值整体不可断：`1.00` 和 `MB/s` 之间的那个空格是可断点，容器一窄就折成
+   两行（「1.00」在上、「MB/s」在下），比截断更难看。窄到放不下时由容器查询
+   把两栏改成一栏，而不是让数字自己断开。 */
+.probe-rate .metric-value {
+  grid-column: 2; grid-row: 1; margin: 0;
+  font-size: 26px; letter-spacing: -0.5px;
+  white-space: nowrap;
+}
 .probe-rate .metric-value small { font-size: 11.5px; margin-left: 4px; }
 .probe-rate .metric-sub {
-  margin: 0; flex: 1 1 auto; min-width: 0;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  grid-column: 1 / -1; grid-row: 2;
+  margin: 0; min-width: 0;
+  /* 不设 nowrap：默认窗口（半栏 295px）一行放得下，窗口再窄就折行，
+     宁可多占一行也不给「…」。曾经用 nowrap + ellipsis，980 宽下正好卡在
+     边界上，缩放比一变就把「1.00 MB/s」截成「1.0…」。 */
+  overflow-wrap: anywhere;
 }
+/* 卡片宽度不够并排两栏时叠成一栏。判据是卡片自身的宽度（容器查询），
+   不是窗口宽度——侧栏宽度、预览面板宽度都算进去了，不用去调阈值。
+   两栏所需的最小宽度：标签 62 + 间距 8 + 最宽数值「≥ 99.9 MB/s」约 120 = 190/栏，
+   两栏 + 22 栏距 + 28 卡片内边距约 430，取 440 留余量。 */
+.card.probe-summary { container-type: inline-size; }
+@container (max-width: 440px) {
+  .probe-rates { grid-template-columns: 1fr; gap: 8px; }
+}
+
 .probe-kv { margin-top: 11px; padding-top: 9px; border-top: 1px solid var(--line); }
 .kv-head {
   display: flex; align-items: baseline; gap: 9px;
@@ -1086,9 +1116,13 @@ select option { background: var(--card); color: var(--ink); }
   color: var(--muted-2);
 }
 .probe-row .t { font-family: var(--mono); color: var(--muted); }
-.probe-row .bar { display: flex; align-items: center; gap: 8px; }
+.probe-row .bar { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* 条形可以让路，数值不让：窗口窄时先压扁进度条，读数永远一行。
+   否则 1.1 MB/s 会被挤成「1.1」+「MB/s」两行，行高从 14px 变 28px。 */
 .probe-row .bar .track {
-  flex: 1;
+  flex: 1 1 auto;
+  /* 留一小段，别让两条进度条压成 0 后相邻的读数黏在一起分不清列 */
+  min-width: 16px;
   height: 4px;
   border-radius: 999px;
   background: var(--track);
@@ -1097,7 +1131,7 @@ select option { background: var(--card); color: var(--ink); }
 .probe-row .bar .fill { height: 100%; border-radius: 999px; }
 .probe-row .bar .fill.down { background: var(--accent); }
 .probe-row .bar .fill.up { background: var(--sand); }
-.probe-row .n { font-family: var(--mono); text-align: right; color: var(--ink-2); }
+.probe-row .n { font-family: var(--mono); text-align: right; color: var(--ink-2); white-space: nowrap; }
 .probe-row .r, .probe-row .l { font-family: var(--mono); color: var(--muted); }
 .probe-empty { padding: 10px 2px; font-size: 12px; color: var(--muted-2); }
 
