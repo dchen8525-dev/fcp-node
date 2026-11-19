@@ -30,6 +30,12 @@ Key (required, both ends equal):
 
 Server:
   -b, --bind=IP[:P]     UDP listen address (default 0.0.0.0:4460)
+  --deny-private        refuse OPEN targets in loopback / RFC1918 / link-local
+                        (cloud metadata) / CGNAT / IPv6 ULA space, including
+                        domains that resolve there. Off by default: a personal
+                        tunnel is meant to reach your own LAN. Turn it on when
+                        the PSK is shared with people who should get the
+                        internet but not the server's network.
 
 Client:
   --peer=IP[:P]         FCP server to connect to (required; port defaults to 4460)
@@ -139,7 +145,7 @@ See docs/移植对照与差异.md for the full delta list.
 // parser used "the next token does not start with -" to decide, so `--no-pmtud 3`
 // silently swallowed the 3 and every later positional shifted.
 const BOOL_FLAGS = new Set([
-  'help', 'no-pmtud', 'no-probe',
+  'help', 'no-pmtud', 'no-probe', 'deny-private',
 ]);
 
 const ALIASES: Record<string, string> = {
@@ -469,6 +475,11 @@ async function main(): Promise<void> {
       log(`WRN unknown switch --${name} ignored (see --help; speedtest is a subcommand, not a flag)`);
     }
   }
+  // --deny-private describes what a *server* may dial. Accepting it on the
+  // client and doing nothing would look like protection that is not there.
+  if (mode !== 'server' && flags.has('deny-private')) {
+    log(`WRN --deny-private only applies to server mode; ignored for ${mode}`);
+  }
 
   // The wide ACK is no longer a choice: offering it costs 1 TLV byte in the
   // handshake and a peer that cannot speak it negotiates down by itself, so the
@@ -526,6 +537,7 @@ async function main(): Promise<void> {
     const bind = splitHostPort(opts.get('bind'), '0.0.0.0', 4460);
     tunnel = new TunnelServer({
       ...common, listenHost: bind.host, port: bind.port,
+      denyPrivate: flags.has('deny-private'),
       onStats: (line) => process.stdout.write(line + '\n'),
     });
   } else if (mode === 'client') {

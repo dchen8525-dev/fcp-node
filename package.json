@@ -19,7 +19,6 @@
     "server": "node src/app/server.ts",
     "client": "node src/app/client.ts",
     "bench": "node src/app/bench.ts",
-    "replay": "node src/app/replay.ts",
     "pack:deb": "node packaging/linux/build-deb.mjs",
     "pack:client-exe": "node packaging/win/build-client-exe.mjs",
     "pack:desktop": "npm --prefix desktop run pack"

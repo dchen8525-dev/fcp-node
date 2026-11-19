@@ -457,6 +457,16 @@ export const RETX_LAT_SAMPLES = 256;
  *  each run, so 256 KiB of reorder data becomes 128 k Buffer objects. */
 export const MIN_OOB_CHUNKS = 1024;
 export const MAX_OOB_CHUNKS = 8192;
+/** Session-wide ceiling on reorder + delivered-but-unconsumed bytes, summed
+ *  over the default stream and every live sid stream. Each stream's own
+ *  ceiling is its rcvBufBytes (up to 4 MiB once the BDP walk grows it), and a
+ *  mux session can carry 255 of them — a peer holding one hole per stream
+ *  pins rcvBuf × 255 of heap until the idle timeout, which on a small VPS is
+ *  an OOM lever. The per-stream windows are untouched; over-budget streams
+ *  are trimmed largest-first and their window is re-shrunk each tick until
+ *  the aggregate drains. 16 MiB is far above any legitimate page load and far
+ *  below the per-stream worst case multiplied out. */
+export const SESSION_STREAM_BUDGET_BYTES = 16 * 1024 * 1024;
 
 // PMTUD (pmtu.h)
 export const PMTU_MAGIC = Buffer.from('FCP_PMTU', 'latin1');

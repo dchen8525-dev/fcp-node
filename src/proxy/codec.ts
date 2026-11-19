@@ -148,7 +148,7 @@ function httpVersionOk(v: string): boolean { return /^HTTP\/1\.[01]$/.test(v); }
  * invalid form. `net.isIP` can classify but not convert, so the OPEN codec
  * needs an explicit expansion to build an ATYP_IPV6 target.
  */
-function parseIpv6Literal(text: string): Buffer | null {
+export function parseIpv6Literal(text: string): Buffer | null {
   if (!text || text.length > 45) return null;
   let body = text;
   // Normalise a trailing dotted-IPv4 into two hextets, then parse uniformly.

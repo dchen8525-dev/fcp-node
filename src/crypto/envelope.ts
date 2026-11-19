@@ -10,9 +10,11 @@ import { deriveSessionKey, deriveDirectionKeys, deriveEpochDirectionKey } from '
 import {
   SALT_LEN, NONCE_LEN, TAG_LEN, ENVELOPE_OVERHEAD, RESET_MAGIC_LEN, RESET_MAGIC,
   NONCE_LIMIT, REPLAY_WINDOW, EPOCH_SPAN, EPOCH_SPACE_END, FIRST_ROLL_AT,
-  GCM_IV_LEN, Direction, type DirectionValue,
+  GCM_IV_LEN, FEC_HDR_LEN, SymbolType, Direction, type DirectionValue,
 } from '../constants.ts';
 import { bytesEqual, getLe64, putLe64 } from '../wire.ts';
+import { parseHdr, hdrType, packHdr, packTypeK } from '../fec/hdr.ts';
+import { isHello } from './handshake.ts';
 
 const U64_MAX = 0xffffffffffffffffn;
 
@@ -299,6 +301,52 @@ export class Envelope {
 export function sealReset(psk: Uint8Array, salt: Uint8Array, sendDir: DirectionValue, recvDir: DirectionValue, counter: bigint): Buffer | null {
   const env = new Envelope(psk, salt, sendDir, recvDir);
   const wire = env.sealAt(counter, RESET_MAGIC);
+  env.destroy();
+  return wire;
+}
+
+/**
+ * Pre-auth gate for a datagram whose salt matches no live session (server
+ * side). Decrypts under the v6 bootstrap key and confirms the shape is a
+ * HELLO — the first datagram a client ever puts on the wire for a new salt
+ * (Session.start() sends only the handshake until it establishes), so this is
+ * the cheapest possible "is a session worth allocating" test. Garbage and
+ * traffic sealed under a stale v7 session key (a client that outlived a
+ * server restart) fail here at the cost of one GCM open, instead of costing a
+ * whole Session object tree first and failing inside onWire. Returns the
+ * decrypted HELLO payload, or null.
+ */
+export function openBootstrapHello(psk: Uint8Array, salt: Uint8Array, wire: Uint8Array): Buffer | null {
+  if (wire.length < ENVELOPE_OVERHEAD + FEC_HDR_LEN) return null;
+  if (!bytesEqual(salt, wire, SALT_LEN)) return null;
+  const counter = getLe64(wire, SALT_LEN);
+  const iv = makeIv(counter, Direction.C2S); // the server receives C2S; this gate is server-only
+  const cipherLen = wire.length - ENVELOPE_OVERHEAD;
+  const cipher = wire.subarray(SALT_LEN + NONCE_LEN, SALT_LEN + NONCE_LEN + cipherLen);
+  const tag = wire.subarray(SALT_LEN + NONCE_LEN + cipherLen);
+  const { c2s } = deriveDirectionKeys(deriveSessionKey(psk, salt));
+  const plain = gcmOpen(c2s, iv, cipher, tag);
+  if (plain === null) return null;
+  const hdr = parseHdr(plain);
+  if (!hdr || hdrType(hdr.typeK) !== SymbolType.Oob) return null;
+  const symbol = plain.subarray(FEC_HDR_LEN);
+  return isHello(symbol) ? Buffer.from(symbol) : null;
+}
+
+/**
+ * Seal one oob payload under the bootstrap key — the shape a client's first
+ * HELLO takes. Only the C2S half is needed here: the gate it exists for is
+ * server-side, and the bootstrap envelope is per-(PSK, salt) static, which is
+ * why a captured HELLO authenticates until the replay window expires. Returns
+ * the sealed wire datagram or null on exhaustion.
+ */
+export function sealOobBootstrap(
+  psk: Uint8Array, salt: Uint8Array, payload: Uint8Array, sendDir: DirectionValue,
+): Buffer | null {
+  const env = new Envelope(psk, salt, sendDir, sendDir === Direction.C2S ? Direction.S2C : Direction.C2S);
+  env.initBootstrapNonce(0);
+  const plain = Buffer.concat([packHdr({ setId: 0, index: 0, d: 0, typeK: packTypeK(0, 0, SymbolType.Oob) }), Buffer.from(payload)]);
+  const wire = env.seal(plain);
   env.destroy();
   return wire;
 }

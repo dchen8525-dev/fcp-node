@@ -4,6 +4,7 @@
 
 import { createSocket, type Socket as UdpSocket, type RemoteInfo } from 'node:dgram';
 import { createServer, connect, isIP, type Socket as TcpSocket, type Server as TcpServer } from 'node:net';
+import { lookup as dnsLookup } from 'node:dns';
 import { randomBytes } from 'node:crypto';
 import {
   SALT_LEN, Direction, HandshakeRole, DEFAULT_MTU_MIN, DEFAULT_D, DEFAULT_P,
@@ -14,7 +15,7 @@ import {
 import { Session, type SessionConfig, type SessionProbeResult } from '../session/session.ts';
 import { probeReport, type ProbeReport } from '../probe/pathprobe.ts';
 import { Stream, type StreamCallbacks } from '../stream/stream.ts';
-import { sealReset } from '../crypto/envelope.ts';
+import { openBootstrapHello, sealReset } from '../crypto/envelope.ts';
 import {
   detectEntry, socks5ParseGreeting, socks5GreetingReply, socks5ParseRequest,
   socks5Reply, socks5RepForOpenError, Socks5Rep,
@@ -22,7 +23,7 @@ import {
   HTTP_OK, HTTP_BAD_REQUEST, HTTP_BAD_GATEWAY, HTTP_METHOD_NOT_ALLOWED,
   HTTP_HEAD_TOO_LARGE, HTTP_FORWARD_METHOD_NOT_ALLOWED,
   openWriteRequest, openWriteOk, openWriteErr, openParseRequest, openParseReply,
-  targetText, type ProxyTarget, type ParseResult,
+  targetText, parseIpv6Literal, type ProxyTarget, type ParseResult,
 } from '../proxy/codec.ts';
 import { OpenError } from '../constants.ts';
 import { createTraceSink, type TraceSink } from '../util/trace.ts';
@@ -78,6 +79,12 @@ export interface TunnelOptions {
   ackCopies?: number;
   pinnedK?: number;
   ack_v2?: boolean; pmtud?: boolean; keyUpdate?: boolean;
+  /** Server only: refuse OPEN targets in private / loopback / link-local /
+   *  ULA space (and domains that resolve there). Off by default: the tunnel is
+   *  a personal proxy, so dialing your own LAN is the point. Turn it on when
+   *  the PSK is shared with people who should reach the internet but not the
+   *  server's own network. */
+  denyPrivate?: boolean;
   log?: (line: string) => void;
   /**
    * Machine-readable one-line counters, emitted every 500 ms on the wire side
@@ -138,6 +145,27 @@ interface ConnStreamState {
  *  while still cutting a garbage-flood's allocation churn to noise. */
 const MAX_NEW_SESSIONS_PER_IP = 64;
 const RATE_WINDOW_MS = 1000;
+/** Pre-auth CPU budget, per source and global.
+ *
+ *  Every datagram with an unseen salt is decrypted once under the bootstrap key
+ *  before anything else happens (see the gate in onUdp). That is ~36 us of
+ *  HKDF + AES-GCM per packet, so an unauthenticated 37-byte flood used to buy
+ *  unbounded CPU: ~28k pps saturated a core without the attacker knowing the
+ *  PSK. The budget is charged before that decryption, not after, so the cost an
+ *  attacker can impose is capped by a number instead of by its packet rate.
+ *
+ *  The two caps answer different floods. Per-IP stops one host from eating the
+ *  whole global budget, which would otherwise lock legitimate clients out while
+ *  a single source keeps the counter full. Global bounds the aggregate: at
+ *  8192/s the gate can claim ~30% of a core, which leaves the process able to
+ *  service established sessions — the traffic that actually matters during an
+ *  attack — instead of dying whole.
+ *
+ *  Per-IP 256 is four times MAX_NEW_SESSIONS_PER_IP, so a browser burst of
+ *  session creations plus one HELLO retry each is never throttled; the cost a
+ *  single source can still force is 256 x ~36 us, under 1% of a core. */
+const MAX_PREAUTH_PER_IP = 256;
+const MAX_PREAUTH_GLOBAL = 8192;
 /** Bound the bookkeeping maps: a spoofed-source flood must not grow them. */
 const RATE_MAP_MAX = 4096;
 /** How long one sealed bootstrap datagram is remembered. A replay of a captured
@@ -185,6 +213,12 @@ const UDP_BUFFER_BYTES = 4 * 1024 * 1024;
  *  a peer that disappears is reaped by peer_dead, but a PSK holder can still
  *  open more than the process should carry. */
 const MAX_TUNNEL_SESSIONS = 1024;
+/** Global rate on Session *creations* per second. The per-IP budget below
+ *  bounds one source; a leaked PSK spread across a botnet turns 64/s/IP into
+ *  an unbounded sum. With the bootstrap-HELLO pre-gate, only genuinely sealed
+ *  HELLOs ever reach creation, so this cap is the last line against
+ *  allocation churn rather than the first. */
+const MAX_NEW_SESSIONS_GLOBAL = 1000;
 
 function enlargeUdpBuffers(sock: UdpSocket, dbg: (line: string) => void, log: (line: string) => void): void {
   for (const which of ['recv', 'send'] as const) {
@@ -238,6 +272,60 @@ function dialHost(t: ProxyTarget): string {
   if (t.atyp === ATYP_IPV4) return [...t.addr].join('.');
   const hex = Buffer.from(t.addr).toString('hex');
   return (hex.match(/.{1,4}/g) ?? []).join(':');
+}
+
+/**
+ * SSRF deny-list, byte-based (--deny-private).
+ *
+ * The tunnel is a personal proxy, so dialing the server's own LAN is normally
+ * the point. When the PSK is shared with people who should reach the internet
+ * but not the server's network, this refuses targets that point back into it:
+ * loopback, RFC1918 private ranges, link-local (169.254/16 and fe80::/10 —
+ * which also covers the cloud metadata endpoints 169.254.169.254 / 100.100.100.200
+ * / 169.254.169.254), CGNAT 100.64/10, IPv6 ULA fc00::/7 and IPv4-mapped IPv6.
+ * Multicast and the 0/8 + 224+ blocks are refused too. Domain targets are
+ * resolved and every answer is checked, so "metadata.google.internal" cannot
+ * slip past a literal check.
+ *
+ * This is defence-in-depth, not a security boundary: the resolver is consulted
+ * for the check and then again by connect(), so a fast DNS-rebind attacker who
+ * controls the record can race the two lookups. Against that, pin the resolved
+ * IP in connect() or run the tunnel on a host with no internal routes worth
+ * reaching.
+ */
+export function ipv4Denied(parts: number[]): boolean {
+  const [a, b] = parts;
+  if (a === 0 || a === 127 || a === 10) return true;
+  if (a === 169 && b === 254) return true;                  // link-local (cloud metadata)
+  if (a === 172 && b >= 16 && b <= 31) return true;        // RFC1918
+  if (a === 192 && b === 168) return true;                 // RFC1918
+  if (a === 100 && b >= 64 && b <= 127) return true;       // CGNAT
+  if (a >= 224) return true;                               // multicast / reserved
+  return false;
+}
+export function ipv6Denied(b: Buffer): boolean {
+  if (b[0] === 0xff) return true;                          // multicast ff00::/8
+  if (b[0] === 0xfe && (b[1] & 0xc0) === 0x80) return true; // link-local fe80::/10
+  if (b[0] === 0xfc || b[0] === 0xfd) return true;         // ULA fc00::/7
+  // IPv4-mapped ::ffff:a.b.c.d — check the embedded address
+  let v4Mapped = true;
+  for (let i = 0; i < 10; ++i) if (b[i] !== 0) { v4Mapped = false; break; }
+  if (v4Mapped && b[10] === 0xff && b[11] === 0xff) {
+    return ipv4Denied([b[12]!, b[13]!, b[14]!, b[15]!]);
+  }
+  // loopback ::1 and unspecified ::
+  let allZero = true;
+  for (let i = 0; i < 15; ++i) if (b[i] !== 0) { allZero = false; break; }
+  if (allZero && (b[15] === 0 || b[15] === 1)) return true;
+  return false;
+}
+export function ipDenied(family: number, addr: string): boolean {
+  if (family === 4) return ipv4Denied(addr.split('.').map(Number));
+  if (family === 6) {
+    const b = parseIpv6Literal(addr);
+    return b === null ? false : ipv6Denied(b);
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +492,7 @@ export class TunnelClient {
       pmtuMaxMtu: this.opts.pmtuMaxMtu,
       pinnedK: this.opts.pinnedK,
       ack_v2: this.opts.ack_v2, pmtud: this.opts.pmtud, keyUpdate: this.opts.keyUpdate,
+      probeBudgetBytes: this.opts.probeBudgetBytes,
       trace: trace?.write,
     };
     const entry: SharedClientSession = {
@@ -1052,6 +1141,11 @@ interface ServerTunnel {
   parser: PrefixParser<ProxyTarget>;
   targetSock: TcpSocket | null;
   openDone: boolean;
+  /** The OPEN passed parsing but the target is still being vetted (the
+   *  --deny-private DNS lookup). Bytes that arrive in that window belong to the
+   *  OPEN's payload and must be queued, not dropped: consuming them would tell
+   *  the peer they were delivered, so nothing would ever resend them. */
+  openPending: boolean;
   /** OPEN_OK already crossed the tunnel: an OPEN_ERR frame would then be read
    *  by the client as response bytes, not as a reply. */
   openOkSent: boolean;
@@ -1079,6 +1173,9 @@ export class TunnelServer {
   private log: (line: string) => void;
   private dbg: (line: string) => void;
   private newSessionsByIp = new Map<string, { count: number; windowStart: number }>();
+  private newSessionsGlobal = { count: 0, windowStart: 0 };
+  private preAuthByIp = new Map<string, { count: number; windowStart: number }>();
+  private preAuthGlobal = { count: 0, windowStart: 0 };
   private resetReplyByIp = new Map<string, number>();
   /** salt|nonce of bootstrap datagrams already accepted, with their arrival
    *  time. Bounded; see rememberBootstrap(). */
@@ -1136,6 +1233,41 @@ export class TunnelServer {
     return true;
   }
 
+  /** S5 companion: global session-creation budget per second. Per-IP limits do
+   *  not bound a distributed flood from spoofed or distinct source addresses;
+   *  this one does. HELLOs rejected here are simply dropped — a real client
+   *  that is being rate-limited just reconnects a second later, while a flood
+   *  gets nothing but a silent hole. */
+  private allowNewSessionGlobal(now: number): boolean {
+    if (now - this.newSessionsGlobal.windowStart >= RATE_WINDOW_MS) {
+      this.newSessionsGlobal = { count: 0, windowStart: now };
+    }
+    if (this.newSessionsGlobal.count >= MAX_NEW_SESSIONS_GLOBAL) return false;
+    this.newSessionsGlobal.count += 1;
+    return true;
+  }
+
+  /** Charge one datagram against the pre-auth CPU budget. Consumed before the
+   *  bootstrap-key decryption, so a rejected packet costs a map lookup and
+   *  nothing else. Both windows are 1 s, same as the session budgets. */
+  private allowPreAuth(ip: string, now: number): boolean {
+    if (now - this.preAuthGlobal.windowStart >= RATE_WINDOW_MS) {
+      this.preAuthGlobal = { count: 0, windowStart: now };
+    }
+    if (this.preAuthGlobal.count >= MAX_PREAUTH_GLOBAL) return false;
+    if (this.preAuthByIp.size > RATE_MAP_MAX) this.pruneRateMaps(now);
+    const entry = this.preAuthByIp.get(ip);
+    if (!entry || now - entry.windowStart >= RATE_WINDOW_MS) {
+      this.preAuthByIp.set(ip, { count: 1, windowStart: now });
+      this.preAuthGlobal.count += 1;
+      return true;
+    }
+    if (entry.count >= MAX_PREAUTH_PER_IP) return false;
+    entry.count += 1;
+    this.preAuthGlobal.count += 1;
+    return true;
+  }
+
   /** S5: stateless reset replies at 1 Hz per peer IP — the same reflector
    *  guard the client side already had. */
   private allowResetReply(ip: string, now: number): boolean {
@@ -1150,6 +1282,9 @@ export class TunnelServer {
     for (const [ip, e] of this.newSessionsByIp) {
       if (now - e.windowStart >= RATE_WINDOW_MS * 10) this.newSessionsByIp.delete(ip);
     }
+    for (const [ip, e] of this.preAuthByIp) {
+      if (now - e.windowStart >= RATE_WINDOW_MS * 10) this.preAuthByIp.delete(ip);
+    }
     for (const [ip, t] of this.resetReplyByIp) {
       if (now - t >= RATE_WINDOW_MS * 10) this.resetReplyByIp.delete(ip);
     }
@@ -1161,6 +1296,11 @@ export class TunnelServer {
       const oldest = this.newSessionsByIp.keys().next().value;
       if (oldest === undefined) break;
       this.newSessionsByIp.delete(oldest);
+    }
+    while (this.preAuthByIp.size > RATE_MAP_MAX / 2) {
+      const oldest = this.preAuthByIp.keys().next().value;
+      if (oldest === undefined) break;
+      this.preAuthByIp.delete(oldest);
     }
     while (this.resetReplyByIp.size > RATE_MAP_MAX / 2) {
       const oldest = this.resetReplyByIp.keys().next().value;
@@ -1227,8 +1367,39 @@ export class TunnelServer {
       this.dbg(`[${key.slice(0, 8)}] bootstrap replay dropped (${rinfo.address}:${rinfo.port})`);
       return;
     }
+    const salt = msg.subarray(0, SALT_LEN);
+    // CPU budget for the unknown-salt path, charged before the decryption below
+    // rather than after it. Placed here so both outcomes — the gate rejecting
+    // junk and the gate accepting a HELLO — cost one budget unit, which is the
+    // only way the crypto work an unauthenticated sender can force is bounded.
+    if (!this.allowPreAuth(rinfo.address, nowMs())) return;
+    // Pre-auth gate. Building a Session costs two Envelopes, the KDF, a Stream,
+    // a PathProbe and three controllers — and every 37-byte datagram with an
+    // unseen salt used to buy all of it before the ciphertext was even looked
+    // at a second time. A real client's first datagram for a new salt is always
+    // its HELLO (Session.start() puts nothing else on the wire until it
+    // establishes), so decrypting once under the bootstrap key and checking for
+    // that shape is the cheapest sufficient test. Anything else is either junk
+    // or a v7 session-key packet from a client that outlived our state, and
+    // both get the same answer a Session would have produced — a stateless
+    // reset — at the cost of one GCM open and zero allocation.
+    if (openBootstrapHello(this.opts.psk, salt, msg) === null) {
+      if (this.allowResetReply(rinfo.address, nowMs())) {
+        const reset = sealReset(this.opts.psk, salt, Direction.S2C, Direction.C2S,
+          NONCE_LIMIT - 1n - BigInt(randomBytes(2).readUInt16LE(0)));
+        if (reset) {
+          this.dbg(`[${key.slice(0, 8)}] no session for salt -> stateless reset tx ${reset.length}B`);
+          this.udp.send(reset, rinfo.port, rinfo.address);
+        }
+      }
+      return;
+    }
+    // Per-IP first: a single source that is already at its own cap must not
+    // also drain the global budget, or one flooding host would deny new
+    // sessions to every other client while never exceeding its per-IP share.
     if (!this.allowNewSession(rinfo.address, nowMs())) return;
-    const created = this.createSession(msg.subarray(0, SALT_LEN), rinfo);
+    if (!this.allowNewSessionGlobal(nowMs())) return;
+    const created = this.createSession(salt, rinfo);
     if (!created) return;
     const ok = created.session.onWire(msg, nowMs());
     if (created.session.isClosed) {
@@ -1239,16 +1410,8 @@ export class TunnelServer {
       return;
     }
     if (!ok) {
-      // #86: authenticated-looking traffic for a salt we do not own. Answer
-      // once with a stateless reset under the bootstrap key, at most 1 Hz per
-      // peer IP so a flood cannot turn this path into a reflector.
-      if (this.allowResetReply(rinfo.address, nowMs())) {
-        const reset = created.session.makeReset();
-        if (reset) {
-          this.dbg(`[${key.slice(0, 8)}] auth failed -> stateless reset tx ${reset.length}B`);
-          this.udp.send(reset, rinfo.port, rinfo.address);
-        }
-      }
+      // The gate above already proved this datagram is a HELLO shape, so a
+      // failure here is a bootstrap-key problem the reset path cannot fix.
       created.cleanup();
       created.trace?.close();
       return;
@@ -1356,6 +1519,7 @@ export class TunnelServer {
       pmtuMaxMtu: this.opts.pmtuMaxMtu,
       pinnedK: this.opts.pinnedK,
       ack_v2: this.opts.ack_v2, pmtud: this.opts.pmtud, keyUpdate: this.opts.keyUpdate,
+      probeBudgetBytes: this.opts.probeBudgetBytes,
       trace: trace?.write,
     };
     let closed = false;
@@ -1430,7 +1594,8 @@ export class TunnelServer {
       key, addr, sid,
       stream: null as unknown as Stream, // streamReady assigns it before any byte
       parser: new PrefixParser(openParseRequest),
-      targetSock: null, openDone: false, openOkSent: false, pendingToTarget: [], pendingToTunnel: [],
+      targetSock: null, openDone: false, openOkSent: false, openPending: false,
+      pendingToTarget: [], pendingToTunnel: [],
       endFromTarget: false, paused: false, pumping: false,
       cleanup: () => {
         t.pendingToTarget.length = 0;
@@ -1442,7 +1607,12 @@ export class TunnelServer {
       closeWriteBuf: () => t.stream.closeWrite(nowMs()),
       callbacks: () => ({
         send: () => {},
-        read: (bytes) => { this.onStreamBytes(t, bytes); },
+        // Fire-and-forget: the path is async only for the optional DNS check,
+        // and a rejection here must not become an unhandled rejection.
+        read: (bytes) => { void this.onStreamBytes(t, bytes).catch((e: Error) => {
+          this.log(`target handling failed: ${e.message}`);
+          t.closeWriteBuf();
+        }); },
         closed: () => {},
         eof: () => { if (t.targetSock && !t.targetSock.destroyed) t.targetSock.end(); },
       }),
@@ -1478,10 +1648,44 @@ export class TunnelServer {
     }
   }
 
-  private onStreamBytes(t: ServerTunnel, bytes: Buffer): void {
+  /**
+   * --deny-private check for one OPEN target.
+   *
+   * A literal target is judged directly (no DNS in the path). A domain target
+   * is resolved first and EVERY answer must pass — one private record in a
+   * round-robin set is a way in. A resolution failure is not a refusal: it
+   * will surface as ENOTFOUND on connect(), which is the honest answer, and
+   * refusing here would hide it behind a misleading "refused".
+   */
+  private async targetAllowed(target: ProxyTarget, host: string): Promise<boolean> {
+    if (target.atyp === ATYP_IPV4) return !ipv4Denied([...target.addr]);
+    if (target.atyp === ATYP_IPV6) return !ipv6Denied(target.addr);
+    // family: 4 to match the dial below (a domain target connects with
+    // family: 4, so the process never reaches the AAAA records). Resolving
+    // with `all: true` alone pulled AAAA in as well and refused any public
+    // host that happens to publish a private IPv6 answer, even though that
+    // address could not have been dialled — a false refusal, logged as
+    // "target refused (private address space)" with no way to tell why.
+    const answers = await new Promise<Array<{ address: string; family: number }>>((resolve) => {
+      dnsLookup(host, { all: true, family: 4 }, (err, addrs) => {
+        if (err || !addrs) { resolve([]); return; }
+        resolve(addrs as Array<{ address: string; family: number }>);
+      });
+    });
+    if (answers.length === 0) return true; // let connect() report the real error
+    // One private answer in a round-robin set is a way in.
+    return answers.every((a) => !ipDenied(a.family, a.address));
+  }
+
+  private async onStreamBytes(t: ServerTunnel, bytes: Buffer): Promise<void> {
     if (t.openDone) {
       const sock = t.targetSock;
       if (!sock || sock.destroyed) {
+        // Still being vetted (--deny-private does a DNS lookup before connect):
+        // the bytes are part of the OPEN payload, so queue them in the FIFO and
+        // keep them charged to the window. Dropping them here was silent data
+        // loss — consumeBuf() marks them "taken" and the peer never resends.
+        if (t.openPending) { t.pendingToTarget.push(bytes); return; }
         // Target is gone (OPEN was refused, connect failed, or the socket was
         // destroyed). Drop rather than queue forever.
         t.consumeBuf(bytes.length);
@@ -1533,6 +1737,24 @@ export class TunnelServer {
     const target = r.value;
     this.dbg(`[${t.key.slice(0, 8)}] OPEN rx target=${targetText(target)}:${target.port} firstPayload=${rest.length}B`);
     const host = dialHost(target);
+    // --deny-private: refuse before connect() when the target points into the
+    // server's own network. openDone is already set, so bytes that arrive while
+    // the lookup runs land in pendingToTarget (see the openPending branch in
+    // onStreamBytes) and wait for OPEN_OK, the same path they take before
+    // 'connect' fires.
+    if (this.opts.denyPrivate) {
+      t.openPending = true;
+      let allowed = false;
+      try { allowed = await this.targetAllowed(target, host); }
+      finally { t.openPending = false; }
+      if (!allowed) {
+        this.log(`target refused (private address space): ${targetText(target)}`);
+        t.pendingToTarget.length = 0;
+        t.writeBuf(openWriteErr(OpenError.Refused));
+        t.closeWriteBuf();
+        return;
+      }
+    }
     const sock = connect({ host, port: target.port, family: target.atyp === 0x04 ? 6 : 4 });
     t.targetSock = sock;
     sock.setNoDelay(true);
@@ -1582,4 +1804,4 @@ export class TunnelServer {
   }
 }
 
-export { OPEN_MAX_BYTES };
+export { OPEN_MAX_BYTES, MAX_PREAUTH_PER_IP };

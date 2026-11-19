@@ -552,6 +552,25 @@ export class Stream {
     }
   }
 
+  /**
+   * Drop reorder-buffer bytes from the tail until oobBytes ≤ limit.
+   *
+   * The session-level aggregate budget calls this on its heaviest streams:
+   * each stream's own ceiling is its rcvBufBytes, and a mux session carries up
+   * to 255 of them, so the per-stream bound alone does not bound the session.
+   * Tail-first, same policy as insertChunk's own trim — the newest bytes go
+   * and the sender's ARQ retransmits them.
+   */
+  trimReorderTo(limit: number): void {
+    while (this.oobBytes > limit && this.oob.length) {
+      const last = this.oob[this.oob.length - 1]!;
+      const excess = Math.min(this.oobBytes - limit, last.bytes.length);
+      last.bytes = last.bytes.subarray(0, last.bytes.length - excess);
+      this.oobBytes -= excess;
+      if (last.bytes.length === 0) this.oob.pop();
+    }
+  }
+
   private deliverPrefix(nowMs: number): void {
     let guard = 0;
     while (guard++ < 65536) {

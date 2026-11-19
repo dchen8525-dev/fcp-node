@@ -32,7 +32,7 @@
 //    RTT from the echoed sentMs without clock sync either.
 
 import {
-  PROBE_MAGIC, PROBE_HDR_LEN,
+  PROBE_MAGIC, PROBE_HDR_LEN, PROBE_BUDGET_BYTES,
   PROBE_TYPE_DAT, PROBE_TYPE_ECHO, PROBE_TYPE_SUM, PROBE_TYPE_DOWN,
   PROBE_FLAG_LAST, PROBE_FLAG_DOWN,
   PROBE_RATE_START_BPS, PROBE_RATE_CAP_BPS, PROBE_RAMP_ROUND,
@@ -303,7 +303,17 @@ export class PathProbe {
    *  fixed assumption there under-paces every chunk by a third. */
   private lastTickAt = 0;
 
-  constructor(host: ProbeHost) { this.host = host; }
+  private localBudgetBytes: number;
+
+  /** `localBudgetBytes` is what THIS end is willing to spend on one run, i.e.
+   *  the `--probe-budget` value. It is also the ceiling for a train we are
+   *  asked to serve: the request names the peer's budget, and honouring it
+   *  verbatim would let one authenticated DOWN datagram order gigabytes of
+   *  egress from a responder that never configured a budget of its own. */
+  constructor(host: ProbeHost, localBudgetBytes: number = PROBE_BUDGET_BYTES) {
+    this.host = host;
+    this.localBudgetBytes = localBudgetBytes;
+  }
 
   get running(): boolean { return this.token !== 0; }
 
@@ -578,7 +588,20 @@ export class PathProbe {
     // still report either rate honestly.
     if (f.total < 4 || f.size < PROBE_HDR_LEN + 64) return;
     if (this.up || this.token !== 0) return;
-    this.up = freshTx(f.token, f.total, f.size, PROBE_RATE_START_BPS, false, now);
+    // The responder's volume used to be whatever the request named: total and
+    // size are both u16 wire fields, so ONE authenticated DOWN datagram could
+    // order up total × size ≈ 4.3 GB of paced egress (fragmented UDP above the
+    // path MTU once size passed it) and hold this slot for hours. The
+    // initiator's budget lives in start(); the responder had none. Bind the
+    // served train to what THIS end is willing to spend (its own --probe-budget,
+    // default 1 MiB): datagrams no larger than the local budget can carry, and a
+    // train no longer than that budget allows. A requester with a smaller budget
+    // still gets exactly what it asked for; one with a larger budget or a bigger
+    // MTU gets a truncated train (its loss number reads pessimistically for the
+    // missing tail — measurement degrades, nothing breaks).
+    const size = Math.min(f.size, Math.max(PROBE_HDR_LEN + 64, this.host.dgramSize()));
+    const total = Math.min(f.total, Math.max(4, Math.floor(this.localBudgetBytes / size)));
+    this.up = freshTx(f.token, total, size, PROBE_RATE_START_BPS, false, now);
   }
 
   // ----------------------------------------------------------- receiving

@@ -23,6 +23,8 @@ import {
   DEFAULT_WINDOW_MIN_BYTES, DEFAULT_WINDOW_CEILING_BYTES,
   DEFAULT_RCV_BUF_FLOOR_BYTES, RCV_BUF_BDP_FACTOR,
   WINDOW_BDP_FACTOR, WINDOW_UPDATE_INTERVAL_MS, WINDOW_CHANGE_RATIO,
+  SESSION_STREAM_BUDGET_BYTES,
+  PROBE_BUDGET_BYTES,
 } from '../constants.ts';
 import { bytesEqual, getLe16, getLe32, putLe16, putLe32 } from '../wire.ts';
 import { Envelope, sealReset } from '../crypto/envelope.ts';
@@ -70,6 +72,9 @@ export interface SessionConfig {
   /** Offer the idle path probe TLV (default true). False on either end removes
    *  the feature: no train is started and no train is answered. */
   probe?: boolean;
+  /** Per-run probe budget in bytes (--probe-budget). Caps both the train this
+   *  end starts and the train it serves for the peer. */
+  probeBudgetBytes?: number;
   mtu?: number; ipHdrLen?: number;
   pinnedK?: number;
   initialSrttMs?: number;
@@ -251,7 +256,7 @@ export class Session {
       // Fills the current MTU exactly: envelope(28) + fec header(7) + payload.
       dgramSize: () => (this.limits.valid ? this.limits.symbolMax : 0),
       onResult: (r) => this.cb.pathProbe?.({ ...r, mtu: this.limits.mtu, d: this.groupD, k: this.k }),
-    });
+    }, cfg.probeBudgetBytes ?? PROBE_BUDGET_BYTES);
 
     this.stream = new Stream(
       { maxSegment: this.limits.payloadMax, initialSrttMs: cfg.initialSrttMs ?? DEFAULT_SRTT_MS },
@@ -549,7 +554,12 @@ export class Session {
     const token = getLe32(payload, 10);
     const mtu = getLe16(payload, 14);
     if (type === PMTU_TYPE_ACK) {
-      if (token === this.pmtuToken && mtu > this.pmtuAckedMtu) {
+      // The clamp the PROBE branch below has: an ACK naming a size above our
+      // own ceiling used to be applied verbatim (computeMtuLimits has no upper
+      // bound), so a misbehaving peer could blow the send budget up to 65 KB
+      // datagrams — EMSGSIZE on every send, an udp-error log line per datagram,
+      // and the walk pinned because every later probe target is ≤ pmtuAckedMtu.
+      if (token === this.pmtuToken && mtu > this.pmtuAckedMtu && mtu <= this.pmtuMaxMtu) {
         this.pmtuAckedMtu = mtu; this.pmtuMtu = mtu;
         this.pmtuProbesLost = 0; this.pmtuBackoffMs = 0;
         // The peer just proved the path carries this size, so a ceiling that
@@ -675,14 +685,24 @@ export class Session {
     const rcvWant = this.bdpWindow(this.bbr.bwBytesPerMs, this.stream.rcvBufBytes,
       RCV_BUF_BDP_FACTOR, DEFAULT_RCV_BUF_FLOOR_BYTES, srtt);
     const rcvNext = Math.max(this.stream.rcvBufBytes, rcvWant);
-    if (sendWant === this.stream.sendWindowBytes && rcvNext === this.stream.rcvBufBytes) return;
-    this.stream.setWindows(sendWant, rcvNext);
+    const changed = sendWant !== this.stream.sendWindowBytes || rcvNext !== this.stream.rcvBufBytes;
+    if (changed) {
+      this.stream.setWindows(sendWant, rcvNext);
+      this.dbg(`[${this.tag()}] window send ${this.stream.sendWindowBytes}B rcv ${this.stream.rcvBufBytes}B ` +
+        `(sendBw=${this.sndBbr.bwBytesPerMs.toFixed(2)}B/ms rcvBw=${this.bbr.bwBytesPerMs.toFixed(2)}B/ms srtt=${this.bbr.srttMs}ms)`);
+    }
     // Mux streams share the same window targets; the per-stream advertise
     // still collapses under each stream's own reorder occupancy, which is
     // what actually throttles a busy multiplexed session.
+    //
+    // This must run even when the default stream's own targets did not change.
+    // enforceStreamBytesBudget() squeezes an over-share stream down to a 1-byte
+    // receive window on every tick, and this loop is the only thing that lifts
+    // it back. Behind the early return above it never lifted: the squeezed
+    // stream is never `this.stream`, so the default stream's targets stayed
+    // stable, the return fired every cadence, and the squeezed sid stayed
+    // pinned at 1 byte for the life of the session.
     if (this.mux) for (const st of this.streams.values()) st.setWindows(sendWant, rcvNext);
-    this.dbg(`[${this.tag()}] window send ${this.stream.sendWindowBytes}B rcv ${this.stream.rcvBufBytes}B ` +
-      `(sendBw=${this.sndBbr.bwBytesPerMs.toFixed(2)}B/ms rcvBw=${this.bbr.bwBytesPerMs.toFixed(2)}B/ms srtt=${this.bbr.srttMs}ms)`);
   }
 
   /** factor x BDP for one direction, with ratio hysteresis so the advertised
@@ -900,6 +920,53 @@ export class Session {
   /** Path shard-loss rate as measured by the peer's FECSTAT. */
   get fecLoss(): number { return this.strategy.currentLoss(); }
 
+  /**
+   * Session-wide heap ceiling on reorder + delivered-but-unconsumed bytes.
+   *
+   * Each stream's own ceiling is its rcvBufBytes — up to 4 MiB once the BDP
+   * walk grows it — and a mux session can carry 255 sid streams, so the
+   * per-stream bound alone lets one authenticated peer pin ~1 GiB of heap by
+   * holding a single hole per stream until the idle timeout. This pass sums
+   * every stream's reorderBytes + deliveryPendingBytes and, over budget,
+   * trims the heaviest streams' reorder tails first. What cannot be trimmed
+   * (deliveryPending is already in the host's hands) is starved instead: any
+   * stream still holding more than its fair share has its receive window
+   * re-shrunk here every tick, so new bytes are refused until the aggregate
+   * drains back under the cap. updateStreamWindows re-grows those windows on
+   * its 250 ms cadence, which is why this runs on every tick: the shrink is
+   * re-applied far more often than the growth.
+   */
+  private enforceStreamBytesBudget(): void {
+    const rows: Array<{ s: Stream; bytes: number }> = [];
+    let total = 0;
+    const collect = (s: Stream): void => {
+      const b = s.reorderBytes + s.deliveryPendingBytes;
+      if (b > 0) { rows.push({ s, bytes: b }); total += b; }
+    };
+    collect(this.stream);
+    for (const st of this.streams.values()) collect(st);
+    if (total <= SESSION_STREAM_BUDGET_BYTES) return;
+    rows.sort((a, b) => b.bytes - a.bytes);
+    let over = total - SESSION_STREAM_BUDGET_BYTES;
+    for (const r of rows) {
+      if (over <= 0) break;
+      const reorder = r.s.reorderBytes;
+      if (reorder <= 0) continue;
+      const cut = Math.min(over, reorder);
+      r.s.trimReorderTo(reorder - cut);
+      // Keep the row honest: the fair-share test below must judge what is left
+      // after the trim, not what was there before it.
+      r.bytes -= cut;
+      over -= cut;
+    }
+    if (over > 0) {
+      const share = Math.max(1, Math.floor(SESSION_STREAM_BUDGET_BYTES / Math.max(1, rows.length)));
+      for (const r of rows) {
+        if (r.bytes > share) r.s.setWindows(r.s.sendWindowBytes, 1);
+      }
+    }
+  }
+
   /** Feed the controller the receiver-side loss fallback and push the resulting
    *  k into the encoder. The setK call matters on its own: only handleFecstat
    *  used to do it, so a k changed by the local fallback never reached FrameTx
@@ -1006,6 +1073,7 @@ export class Session {
       this.updateStreamWindows(nowMs);
       this.stream.onTick(nowMs);
       if (this.mux) for (const st of this.streams.values()) st.onTick(nowMs);
+      this.enforceStreamBytesBudget();
       const report = this.reporter.onTick(nowMs, this.rx?.counters ?? emptyCounters(), this.rx?.accountedThroughSetId() ?? 0);
       if (report) {
         // FECSTAT is oob and never retransmitted; reporter.cc sends the 128-byte
