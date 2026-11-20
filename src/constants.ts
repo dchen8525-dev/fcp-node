@@ -190,8 +190,18 @@ export const PROBE_FLAG_DOWN = 0x02;
  *  together. Echoes are ~67 bytes each on top (see PROBE_HDR_LEN + overhead). */
 export const PROBE_BUDGET_BYTES = 1024 * 1024;
 export const PROBE_INTERVAL_MS = 5 * 60_000;
-/** No application byte in either direction for this long counts as idle. */
+/** The idle gate looks at application bytes over this window. */
 export const PROBE_IDLE_MS = 20_000;
+/** Application bytes inside PROBE_IDLE_MS above which the path counts as busy.
+ *
+ *  The gate used to be "not one application byte in the window", which a
+ *  browser resets forever: an analytics beacon or an open page's poll every few
+ *  seconds is enough to push the deadline out for hours, and the GUI countdown
+ *  then cycles 0:30 -> 0:00 without a single measurement. A trickle does not
+ *  move a 1 MiB train, a transfer does, so the gate counts bytes instead of
+ *  watching for silence. A quarter of the default budget over the window is
+ *  ~13 KB/s. */
+export const PROBE_QUIET_BYTES = 256 * 1024;
 /** Ramp start. Below this a 512 KiB half-budget finishes before the rate has
  *  moved at all, so a fresh probe would report the pacing rate, not the path. */
 export const PROBE_RATE_START_BPS = 256 * 1024;

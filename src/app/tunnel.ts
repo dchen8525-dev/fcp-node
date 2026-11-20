@@ -10,8 +10,9 @@ import {
   SALT_LEN, Direction, HandshakeRole, DEFAULT_MTU_MIN, DEFAULT_D, DEFAULT_P,
   OPEN_MAX_BYTES, ATYP_DOMAIN, ATYP_IPV4, DATA_WIRE_OVERHEAD, NONCE_LIMIT,
   MUX_MAX_STREAMS, MUX_SESSION_POOL,
-  PROBE_INTERVAL_MS, PROBE_IDLE_MS, PROBE_BUDGET_BYTES, PROBE_RETRY_MS,
+  PROBE_INTERVAL_MS, PROBE_IDLE_MS, PROBE_QUIET_BYTES, PROBE_BUDGET_BYTES, PROBE_RETRY_MS,
 } from '../constants.ts';
+import { ByteWindow } from '../util/bytewindow.ts';
 import { Session, type SessionConfig, type SessionProbeResult } from '../session/session.ts';
 import { probeReport, type ProbeReport } from '../probe/pathprobe.ts';
 import { Stream, type StreamCallbacks } from '../stream/stream.ts';
@@ -378,6 +379,18 @@ export class TunnelClient {
   private probeRunning = false;
   private probeCount = 0;
   private lastAppByteMs = 0;
+  /** Application bytes per second, i.e. "was there traffic in the window".
+   *  `lastAppByteMs` alone cannot answer that: one beacon every few seconds
+   *  keeps it fresh forever, and an absolute silence gate then starves the
+   *  probe (the GUI countdown just recycles its retry interval). */
+  private appMoved = new ByteWindow();
+  /** The schedule is due but the path is carrying traffic. Surfaced in the
+   *  stats line so the GUI can say "waiting for idle" instead of counting down
+   *  to a deadline that will be pushed out again. */
+  private probeWaitBusy = false;
+  /** Last time the "no ready session" stall was logged; one line a minute is
+   *  enough to diagnose a probe that never starts without spamming the log. */
+  private probeStallLogMs = 0;
   /** Manual "measure now" request. Set by probeNow(), consumed on the next
    *  tick; bypasses both the idle gate and the schedule, but still needs a
    *  ready session (one is created if the pool is empty). */
@@ -609,7 +622,8 @@ export class TunnelClient {
         `tx=${this.bytesTx}B rx=${this.bytesRx}B tx_rate=${txRate}B/s rx_rate=${rxRate}B/s ` +
         `app_rx=${this.bytesAppRx}B app_tx=${this.bytesAppTx}B ` +
         `app_rx_rate=${appRxRate}B/s app_tx_rate=${appTxRate}B/s ` +
-        `probe_run=${this.probeRunning ? 1 : 0} probe_next=${this.probeDueSec(now)}s probe_n=${this.probeCount}`,
+        `probe_run=${this.probeRunning ? 1 : 0} probe_next=${this.probeDueSec(now)}s probe_n=${this.probeCount}` +
+        ` probe_wait=${this.probeWaitBusy ? 1 : 0}`,
     );
     this.statsPrevTx = this.bytesTx;
     this.statsPrevRx = this.bytesRx;
@@ -624,6 +638,14 @@ export class TunnelClient {
     if (this.probeRunning) return 0;
     if (this.probeNextMs === 0) return Math.round((this.opts.probeIntervalMs ?? PROBE_INTERVAL_MS) / 1000);
     return Math.max(0, Math.round((this.probeNextMs - now) / 1000));
+  }
+
+  /** Every application byte goes through here: the last-byte clock feeds the
+   *  log line and the per-second window feeds the idle gate. */
+  private noteAppBytes(bytes: number, now: number): void {
+    if (!(bytes > 0)) return;
+    this.lastAppByteMs = now;
+    this.appMoved.add(bytes, now);
   }
 
   /**
@@ -662,11 +684,16 @@ export class TunnelClient {
         return;
       }
       if (now < this.probeNextMs) return;
-      if (now - this.lastAppByteMs < PROBE_IDLE_MS) {
+      // A busy path must not be measured: the train would report the user's
+      // traffic and add a megabyte to it. "Busy" is a byte budget over the
+      // window, not the absence of a single byte — see PROBE_QUIET_BYTES.
+      if (this.appMoved.total(now, PROBE_IDLE_MS) >= PROBE_QUIET_BYTES) {
         // Busy: do not consume the schedule, come back when it might be idle.
+        this.probeWaitBusy = true;
         this.probeNextMs = now + Math.min(interval, PROBE_RETRY_MS * 6);
         return;
       }
+      this.probeWaitBusy = false;
     }
     let target: Session | null = null;
     for (const entry of this.pool) {
@@ -681,6 +708,12 @@ export class TunnelClient {
       // tick, once the handshake has had a chance to complete.
       if (this.pool.length === 0) this.ensurePoolEntry();
       if (manual) this.probePending = true;
+      // Without this the only trace of a probe that never starts is a countdown
+      // in the GUI, which is exactly the state that took two hours to notice.
+      if (now - this.probeStallLogMs >= 60_000) {
+        this.probeStallLogMs = now;
+        this.log(`path probe: no ready session (pool=${this.pool.length}, manual=${manual ? 1 : 0})`);
+      }
       this.probeNextMs = now + PROBE_RETRY_MS;
       return;
     }
@@ -691,6 +724,7 @@ export class TunnelClient {
       return;
     }
     this.probeRunning = true;
+    this.probeWaitBusy = false;
     this.probeNextMs = now + interval;
     this.log(`path probe: ${Math.round(budget / 1024)} KiB train, ${manual ? 'manual' : `idle ${Math.round((now - this.lastAppByteMs) / 1000)}s`}, mtu=${target.mtuLimits.mtu}`);
   }
@@ -924,7 +958,7 @@ export class TunnelClient {
         writeConn = (b) => {
           const n = connStream!.write(b, nowMs());
           this.bytesAppTx += n;
-          this.lastAppByteMs = nowMs();
+          this.noteAppBytes(n, nowMs());
           return n;
         };
         consumedConn = (n) => connStream!.consumed(n);
@@ -962,7 +996,7 @@ export class TunnelClient {
     streamRead = (bytes: Buffer) => {
       // 应用层下行:交付给本地应用(浏览器)的字节,不含任何隧道开销。
       this.bytesAppRx += bytes.length;
-      this.lastAppByteMs = nowMs();
+      this.noteAppBytes(bytes.length, nowMs());
       // Consumption is what releases the peer's send window. Doing it only
       // after the local socket has flushed applies real backpressure; the old
       // immediate consumed() let a slow reader grow Node's writable buffer

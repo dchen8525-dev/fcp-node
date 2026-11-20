@@ -45,6 +45,7 @@ const state = {
   probeRunning: false,
   probeNextSec: -1,
   probeCount: 0,
+  probeWait: false,
 };
 
 function fmtBytes(n) {
@@ -420,6 +421,8 @@ window.fcp.onStats((s) => {
   if (s.probeRun !== undefined) state.probeRunning = s.probeRun;
   if (s.probeNextSec !== undefined) state.probeNextSec = s.probeNextSec;
   if (s.probeCount !== undefined) state.probeCount = s.probeCount;
+  // 老隧道不带 probe_wait:保持 false,倒计时按原样显示。
+  if (s.probeWait !== undefined) state.probeWait = s.probeWait;
   renderProbeWhen();
   drawChart();
 });
@@ -625,6 +628,9 @@ function renderProbeWhen() {
   if (!state.running) { node.textContent = '代理未启动'; node.classList.add('is-off'); return; }
   if (state.probeNextSec < 0) { node.textContent = '自动体检已关闭（仍可手动测）'; node.classList.add('is-off'); return; }
   if (state.probeRunning) { node.textContent = '测量中…'; node.classList.add('is-live'); return; }
+  // 到点了但链路有流量:隧道每 30 s 重试一次,倒计时会在 0:30 -> 0:00 之间
+  // 反复打转,看着像坏了。直接说清楚在等什么。
+  if (state.probeWait) { node.textContent = '有流量，等空闲后测量'; node.classList.add('is-off'); return; }
   node.textContent = state.probeCount > 0
     ? `下次 ${mmss(state.probeNextSec)} ｜ 已测 ${state.probeCount} 次`
     : `首次测量 ${mmss(state.probeNextSec)} 后（需空闲）`;

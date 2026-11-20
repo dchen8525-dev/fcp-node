@@ -218,7 +218,7 @@ function classify(line) {
 
 // 末尾的 app_* 字段为应用层(浏览器真实)字节:0.0.5 及更早的隧道不带,捕获可选。
 // probe_* 同理:0.0.18 及更早的隧道不发,渲染层按"未启用"处理。
-const STATS_RE = /^stats\s+([\d.]+)s\s+live=(\d+)\s+up=(\d+)\s+tunnels=(\d+)\s+tx=(\d+)B\s+rx=(\d+)B\s+tx_rate=(-?\d+)B\/s\s+rx_rate=(-?\d+)B\/s(?:\s+app_rx=(\d+)B\s+app_tx=(\d+)B\s+app_rx_rate=(-?\d+)B\/s\s+app_tx_rate=(-?\d+)B\/s)?(?:\s+probe_run=(\d)\s+probe_next=(-?\d+)s\s+probe_n=(\d+))?/;
+const STATS_RE = /^stats\s+([\d.]+)s\s+live=(\d+)\s+up=(\d+)\s+tunnels=(\d+)\s+tx=(\d+)B\s+rx=(\d+)B\s+tx_rate=(-?\d+)B\/s\s+rx_rate=(-?\d+)B\/s(?:\s+app_rx=(\d+)B\s+app_tx=(\d+)B\s+app_rx_rate=(-?\d+)B\/s\s+app_tx_rate=(-?\d+)B\/s)?(?:\s+probe_run=(\d)\s+probe_next=(-?\d+)s\s+probe_n=(\d+)(?:\s+probe_wait=(\d))?)?/;
 
 function startTunnel(cfg) {
   if (child) stopTunnel();
@@ -271,6 +271,8 @@ function startTunnel(cfg) {
           probeRun: m[13] !== undefined ? m[13] === '1' : undefined,
           probeNextSec: m[14] !== undefined ? Number(m[14]) : undefined,
           probeCount: m[15] !== undefined ? Number(m[15]) : undefined,
+          // 到点但链路有流量,隧道在等空闲:界面不该再显示一个会被推迟的倒计时。
+          probeWait: m[16] !== undefined ? m[16] === '1' : undefined,
         });
         return;
       }
