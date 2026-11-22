@@ -122,16 +122,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - uses: android-actions/setup-android@v3
-      - name: install SDK packages pinned by android/app/build.gradle
+      # ubuntu-latest 镜像自带 Android SDK（ANDROID_HOME 已设置）；不要用
+      # android-actions/setup-android，它会在新版 runner 上强制 sdkmanager
+      # --update 并失败。只补装 build.gradle 里钉住的两个包。
+      - name: accept licenses and install pinned SDK packages
         run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMANAGER" ] || SDKMANAGER="$(command -v sdkmanager)"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0"
       - uses: gradle/actions/setup-gradle@v4
       # gradlew 在 Windows 上创建，提交时可能没有可执行位。
       - name: make gradlew executable
         run: chmod +x android/gradlew
       - name: point gradle at the CI SDK (local.properties is gitignored)
-        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
       - name: unit + interop tests (core/ on a desktop JVM)
         working-directory: android
         run: ./gradlew test --no-daemon --stacktrace
