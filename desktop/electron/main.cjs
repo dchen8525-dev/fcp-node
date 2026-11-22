@@ -126,7 +126,7 @@ function createTray() {
     // window icon on every paint.
     const image = source.resize({ width: 16, height: 16, quality: 'best' });
     tray = new Tray(image);
-    tray.setToolTip('FCP Node · 未启动');
+    tray.setToolTip('FCP Client · 未启动');
     tray.on('click', showWindow);
     tray.on('double-click', showWindow);
     rebuildTrayMenu();
@@ -162,10 +162,10 @@ function rebuildTrayMenu() {
   template.push(
     { label: '打开日志目录', click: () => { void revealLogDir(); } },
     { type: 'separator' },
-    { label: '退出 FCP Node', click: quitApp },
+    { label: '退出 FCP Client', click: quitApp },
   );
   tray.setContextMenu(Menu.buildFromTemplate(template));
-  tray.setToolTip(running ? `FCP Node · 运行中 · ${childState.peer || ''}`.trim() : 'FCP Node · 未启动');
+  tray.setToolTip(running ? `FCP Client · 运行中 · ${childState.peer || ''}`.trim() : 'FCP Client · 未启动');
 }
 
 /** One-time hint when the window is first hidden; Windows-only and silent
@@ -176,7 +176,7 @@ function notifyMinimizedToTray() {
   if (process.platform === 'win32' && typeof tray.displayBalloon === 'function') {
     try {
       tray.displayBalloon({
-        title: 'FCP Node 仍在运行',
+        title: 'FCP Client 仍在运行',
         content: '窗口已隐藏到托盘；右键托盘图标可停止隧道或退出。',
       });
     } catch { /* balloon is decorative */ }
@@ -352,7 +352,7 @@ function createWindow() {
   win = new BrowserWindow({
     width: 980, height: 700, minWidth: 820, minHeight: 600,
     backgroundColor: themeMeta(themeId).bg,
-    title: 'FCP Node',
+    title: 'FCP Client',
     icon: ICON_PATH,
     show: false,
     autoHideMenuBar: true,
