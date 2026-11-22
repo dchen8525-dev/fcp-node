@@ -384,9 +384,11 @@ export class TunnelClient {
    *  keeps it fresh forever, and an absolute silence gate then starves the
    *  probe (the GUI countdown just recycles its retry interval). */
   private appMoved = new ByteWindow();
-  /** The schedule is due but the path is carrying traffic. Surfaced in the
-   *  stats line so the GUI can say "waiting for idle" instead of counting down
-   *  to a deadline that will be pushed out again. */
+  /** The schedule is due but the probe cannot start: either the path is
+   *  carrying application traffic, or no ready session was available. Surfaced
+   *  in the stats line so the GUI says "waiting for idle" instead of counting
+   *  down to a deadline that keeps being pushed out (or, worse, a 5 s retry
+   *  loop that looks like a normal countdown). */
   private probeWaitBusy = false;
   /** Last time the "no ready session" stall was logged; one line a minute is
    *  enough to diagnose a probe that never starts without spamming the log. */
@@ -695,14 +697,28 @@ export class TunnelClient {
       }
       this.probeWaitBusy = false;
     }
+    // Pick a ready session. Two rules, in order:
+    //  1. "Busy" is decided at the tunnel level by the application-byte gate
+    //     above (门②), not per-session by wire state. inflightBytes/queuedBytes
+    //     count *wire* bytes still unacked or queued; on a long-lived mux pool
+    //     those are almost never all zero even when the application is idle —
+    //     one lingering unacked segment in each of the 4 sessions was enough to
+    //     fail every candidate and stall the probe for hours ("no ready
+    //     session", pool=4). Reusing the wire gate here contradicted 门② and
+    //     starved the measurement.
+    //  2. Still *prefer* a session with no wire bytes outstanding so the train
+    //     is not mixed with retransmits; only fall back to a merely-ready one
+    //     if none is clean. Manual asks skip the preference entirely (they
+    //     already bypass the idle gate and are meant to measure now).
     let target: Session | null = null;
+    let fallback: Session | null = null;
     for (const entry of this.pool) {
       const s = entry.session;
       if (!s.pathProbeReady || s.pathProbeRunning) continue;
-      if (!manual && (s.inflightBytes > 0 || s.queuedBytes > 0)) continue;
-      target = s;
-      break;
+      if (!fallback) fallback = s;
+      if (manual || (s.inflightBytes === 0 && s.queuedBytes === 0)) { target = s; break; }
     }
+    if (!target && !manual) target = fallback;
     if (!target) {
       // A manual ask with no live session creates one and retries on the next
       // tick, once the handshake has had a chance to complete.
@@ -714,13 +730,19 @@ export class TunnelClient {
         this.probeStallLogMs = now;
         this.log(`path probe: no ready session (pool=${this.pool.length}, manual=${manual ? 1 : 0})`);
       }
-      this.probeNextMs = now + PROBE_RETRY_MS;
+      // No ready session is a WAIT, not a due-and-running countdown. Mark it so
+      // the GUI shows "waiting for idle" instead of a 0:05 -> 0:00 loop that
+      // flashes every 5 s. Retry on a bounded cadence, not a fixed 5 s spin.
+      this.probeWaitBusy = true;
+      this.probeNextMs = now + Math.min(interval, PROBE_RETRY_MS * 6);
       return;
     }
     const budget = this.opts.probeBudgetBytes ?? PROBE_BUDGET_BYTES;
     if (!target.startPathProbe(budget)) {
       if (manual) this.probePending = true;
-      this.probeNextMs = now + PROBE_RETRY_MS;
+      // Same as above: a failed start is a wait, not a countdown.
+      this.probeWaitBusy = true;
+      this.probeNextMs = now + Math.min(interval, PROBE_RETRY_MS * 6);
       return;
     }
     this.probeRunning = true;
