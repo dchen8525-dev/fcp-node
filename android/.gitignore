@@ -1,0 +1,31 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+app/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Machine-specific SDK location (created by Android Studio / `sdkmanager`).
+local.properties
+
+# IDE
+.idea/
+*.iml
+captures/
+.cxx/
+
+# Debugging artifacts produced while testing on device/emulator
+# (uiautomator dumps, screenshots, adb pull files)
+*.xml.bak
+ui*.xml
+s[0-9]*.xml
+*.png
+*.mp4
+
+# Downloads fetched during manual interop checks
+*.tar.gz
+*.AppImage
+dl-result.txt

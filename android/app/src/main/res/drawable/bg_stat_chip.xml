@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 速率 chip 背景：12dp 圆角卡片面 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/fcp_card"/>
+    <corners android:radius="12dp"/>
+</shape>

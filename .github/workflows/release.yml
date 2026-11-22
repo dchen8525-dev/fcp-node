@@ -1,12 +1,16 @@
-# 发布流水线:推 tag(0.0.3 或 v0.0.3)自动构建并上传全部 4 个资产到同名
+# 发布流水线:推 tag(0.0.3 或 v0.0.3)自动构建并上传全部资产到同名
 # GitHub Release;workflow_dispatch 只构建产物供检查,不发布。
 #
-# 资产与平台(deb 必须在 linux 打包,SEA/electron-builder 必须在 windows):
+# 资产与平台(deb 必须在 linux 打包,SEA/electron-builder 必须在 windows,
+# APK 在 linux runner 上用 Android SDK 打包):
 #   ubuntu  -> fcp-server_<ver>_amd64.deb
+#              fcp-android-<ver>.apk (release 变体,已签名可直接安装)
 #   windows -> fcp-client-<ver>.exe (Node SEA)、fcp-client-gui-<ver>-portable.exe、
 #              fcp-client-gui-setup-<ver>.exe (electron-builder)
 # 脚本自带 esbuild/postject 的 npx 回退,仓库零依赖,无需 npm install 根目录。
 # 版本号以根 package.json 为唯一来源,tag 必须一致(见 verify)。
+# 安卓的 versionName/versionCode 由 android/app/build.gradle 从同一个
+# package.json 派生,不单独维护,因此不会再出现"忘改第四处"的漂移。
 
 name: release
 
@@ -51,6 +55,7 @@ jobs:
             exit 1
           fi
           echo "tag $REF == $PKG (package.json, desktop, PRODUCT_VERSION)"
+          echo "(android/app/build.gradle derives versionName from package.json — nothing to bump there)"
       - name: gate (imports + full suite + self-interop)
         run: npm run check
 
@@ -103,8 +108,60 @@ jobs:
             desktop/dist/fcp-client-gui-setup-*.exe
           if-no-files-found: error
 
+  android:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # JDK 21：AGP 8.13 要求 17+，21 是当前 runner 上的默认主线版本。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      # 互操作测试会在测试进程里拉起 node src/app/server.ts 对拍。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: android-actions/setup-android@v3
+      - name: install SDK packages pinned by android/app/build.gradle
+        run: |
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null
+      - uses: gradle/actions/setup-gradle@v4
+      # gradlew 在 Windows 上创建，提交时可能没有可执行位。
+      - name: make gradlew executable
+        run: chmod +x android/gradlew
+      - name: point gradle at the CI SDK (local.properties is gitignored)
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+      - name: unit + interop tests (core/ on a desktop JVM)
+        working-directory: android
+        run: ./gradlew test --no-daemon --stacktrace
+      - name: assemble release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+      - name: name the artifact after the project version
+        run: |
+          VER="$(node -p "require('./package.json').version")"
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/fcp-android-${VER}.apk"
+          # 版本号必须与 tag 一致；派生逻辑出错时在这里就炸，而不是发布后才发现
+          node -e "
+            const m = require('./android/app/build/outputs/apk/release/output-metadata.json');
+            const el = m.elements[0];
+            if (el.versionName !== process.argv[1]) {
+              console.error('APK versionName ' + el.versionName + ' != package.json ' + process.argv[1]);
+              process.exit(1);
+            }
+            console.log('APK versionName/versionCode =', el.versionName, '/', el.versionCode);
+          " "$VER"
+          ls -l dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fcp-android
+          path: dist/fcp-android-*.apk
+          if-no-files-found: error
+
   publish:
-    needs: [deb, windows]
+    needs: [deb, windows, android]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -115,7 +172,7 @@ jobs:
       - name: sha256sums.txt (same format as the manual releases)
         run: |
           cd dist
-          sha256sum -b fcp-server_*.deb fcp-client-[0-9]*.exe fcp-client-gui-setup-*.exe fcp-client-gui-*-portable.exe > sha256sums.txt
+          sha256sum -b fcp-server_*.deb fcp-client-[0-9]*.exe fcp-client-gui-setup-*.exe fcp-client-gui-*-portable.exe fcp-android-*.apk > sha256sums.txt
           cat sha256sums.txt
       - name: create release if missing and upload assets
         env:
@@ -133,5 +190,6 @@ jobs:
             dist/fcp-client-[0-9]*.exe \
             dist/fcp-client-gui-setup-*.exe \
             dist/fcp-client-gui-*-portable.exe \
+            dist/fcp-android-*.apk \
             dist/sha256sums.txt
           echo "uploaded to release $TAG"

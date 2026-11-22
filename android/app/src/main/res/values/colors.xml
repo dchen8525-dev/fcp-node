@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ===== FCP 品牌色（seed #00BFA5 青绿，M3 harmonized，克制不艳） ===== -->
+    <color name="md_theme_primary">#006B5E</color>
+    <color name="md_theme_onPrimary">#FFFFFF</color>
+    <color name="md_theme_primaryContainer">#9CF2E1</color>
+    <color name="md_theme_onPrimaryContainer">#00201B</color>
+
+    <color name="md_theme_secondary">#4A635C</color>
+    <color name="md_theme_onSecondary">#FFFFFF</color>
+    <color name="md_theme_secondaryContainer">#CDE8DE</color>
+    <color name="md_theme_onSecondaryContainer">#062019</color>
+
+    <color name="md_theme_error">#BA1A1A</color>
+    <color name="md_theme_onError">#FFFFFF</color>
+    <color name="md_theme_errorContainer">#FFDAD6</color>
+    <color name="md_theme_onErrorContainer">#410002</color>
+
+    <!-- Surface 层次：页面底 = surfaceContainer，卡片高一层的 fcp_card -->
+    <color name="md_theme_surface">#F6FBF6</color>
+    <color name="md_theme_onSurface">#181D1A</color>
+    <color name="md_theme_surfaceVariant">#DBE5DF</color>
+    <color name="md_theme_onSurfaceVariant">#3F4944</color>
+    <color name="md_theme_outline">#6F7974</color>
+    <color name="md_theme_outlineVariant">#BEC9C3</color>
+    <color name="md_theme_surfaceContainer">#EAEFEB</color>
+    <color name="md_theme_surfaceContainerHigh">#E4EFE9</color>
+    <color name="md_theme_surfaceContainerHighest">#DFE9E4</color>
+
+    <!-- 页面底色与卡片（浅色：白卡浮在灰绿底上） -->
+    <color name="fcp_page_bg">#EAEFEB</color>
+    <color name="fcp_card">#FFFFFF</color>
+
+    <!-- 状态语义色 -->
+    <color name="fcp_status_connected">#00BFA5</color>
+    <color name="fcp_status_connecting">#FFB300</color>
+    <color name="fcp_status_disconnected">#8A938E</color>
+
+    <!-- 日志级别（控制台深底上的亮色） -->
+    <color name="log_debug">#7A8A85</color>
+    <color name="log_info">#6EC3FF</color>
+    <color name="log_warning">#FFC46B</color>
+    <color name="log_error">#FF7B72</color>
+    <color name="fcp_console_bg">#101418</color>
+    <color name="fcp_console_text">#C9D4D0</color>
+</resources>

@@ -32,3 +32,10 @@ dist/
 
 # 另一会话的临时实验脚本与日志
 .tmp-test/
+
+# Android client (gradle/monorepo subproject). Its own .gitignore covers the
+# build tree; these guard against artifacts landing at the repo root.
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties

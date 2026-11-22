@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FCP VPN</string>
+
+    <!-- ===== 主页 ===== -->
+    <string name="fcp_connect">连接</string>
+    <string name="fcp_disconnect">断开</string>
+    <string name="fcp_state_connected">已连接</string>
+    <string name="fcp_state_connecting">连接中…</string>
+    <string name="fcp_state_reconnecting">重连中…</string>
+    <string name="fcp_state_disconnecting">断开中…</string>
+    <string name="fcp_state_disconnected">已断开</string>
+    <string name="fcp_state_unconfigured">未配置服务器</string>
+    <string name="fcp_server_unconfigured">未配置服务器，点击右上角设置开始</string>
+    <string name="fcp_mixed_proxy_hint">混合代理 127.0.0.1:%1$d</string>
+    <string name="fcp_chip_down">↓ 下行</string>
+    <string name="fcp_chip_up">↑ 上行</string>
+    <string name="fcp_chip_sessions">会话</string>
+    <string name="fcp_chip_duration">时长</string>
+    <string name="fcp_btn_log">日志</string>
+    <string name="fcp_btn_settings">设置</string>
+    <string name="fcp_vpn_denied">已取消 VPN 授权，可稍后在系统弹窗中允许</string>
+    <string name="fcp_notif_denied">未授予通知权限，连接状态将不在通知栏显示</string>
+    <string name="fcp_msg_not_configured">请先在设置中填写服务器与密钥</string>
+    <string name="fcp_msg_psk_missing">密钥未记住，请到设置中重新填写</string>
+
+    <!-- ===== 设置页 ===== -->
+    <string name="fcp_settings_title">设置</string>
+    <string name="fcp_save">保存</string>
+    <string name="fcp_label_server">服务器</string>
+    <string name="fcp_hint_server_host">服务器地址（IP 或域名）</string>
+    <string name="fcp_hint_server_port">UDP 端口</string>
+    <string name="fcp_label_psk">密钥</string>
+    <string name="fcp_hint_psk">PSK（32 位十六进制）</string>
+    <string name="fcp_remember_psk">记住密钥</string>
+    <string name="fcp_label_run_mode">运行模式</string>
+    <string name="fcp_mode_vpn">VPN 全局</string>
+    <string name="fcp_mode_proxy">仅本机代理</string>
+    <string name="fcp_advanced">高级</string>
+    <string name="fcp_advanced_summary">FEC、MTU 与探测参数</string>
+    <string name="fcp_hint_fec_data">fec-data</string>
+    <string name="fcp_hint_fec_parity_max">fec-parity-max</string>
+    <string name="fcp_hint_mtu_min">mtu-min</string>
+    <string name="fcp_hint_probe_interval">probe-interval（0 关闭）</string>
+    <string name="fcp_hint_proxy_port">本地代理端口</string>
+    <string name="fcp_saved">设置已保存</string>
+    <string name="fcp_error_host_empty">服务器地址不能为空</string>
+    <string name="fcp_error_host_invalid">无效的服务器地址</string>
+    <string name="fcp_error_port">端口超出范围（1–65535）</string>
+    <string name="fcp_error_psk_empty">密钥不能为空</string>
+    <string name="fcp_error_psk_invalid">需要 32 位十六进制字符</string>
+    <string name="fcp_error_number">请输入数字</string>
+    <string name="fcp_error_range">超出范围（%1$d–%2$d）</string>
+
+    <!-- ===== 日志页 ===== -->
+    <string name="fcp_log_title">日志</string>
+    <string name="fcp_log_filter_all">全部</string>
+    <string name="fcp_log_filter_info">信息</string>
+    <string name="fcp_log_filter_warning">警告</string>
+    <string name="fcp_log_filter_error">错误</string>
+    <string name="fcp_log_copy">复制</string>
+    <string name="fcp_log_clear">清空</string>
+    <string name="fcp_log_copied">已复制 %1$d 条日志</string>
+    <string name="fcp_log_nothing_to_copy">没有日志可复制</string>
+</resources>

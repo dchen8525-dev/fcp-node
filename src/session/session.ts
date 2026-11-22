@@ -11,6 +11,7 @@ import {
   TLV_TYPE_MULTIPLEX, MUX_MAX_STREAMS, LOCAL_FLAGS_M1, TLV_TYPE_PATH_PROBE,
   HANDSHAKE_SEND_BUDGET, BOOTSTRAP_PROBES_PER_SECOND,
   NAT_KEEPALIVE_MS, PEER_ALIVE_GRACE_MS, KEEPALIVE_MAGIC, KEEPALIVE_LEN,
+  DNS_MAGIC, DNS_TYPE_QUERY, DNS_TYPE_RESPONSE, DNS_HDR_LEN, DNS_MAX_PAYLOAD,
   RESET_MAGIC, RESET_MAGIC_LEN, ENVELOPE_OVERHEAD, NONCE_LIMIT,
   PMTU_MAGIC, PMTU_HEADER_LEN, PMTU_TYPE_PROBE, PMTU_TYPE_ACK,
   PMTU_ABSOLUTE_MAX_MTU, DEFAULT_PMTU_MAX_MTU, PMTU_PROBE_STEP, PMTU_BACKOFF_MAX_MS,
@@ -96,6 +97,11 @@ export interface SessionCallbacks {
   debug?: (line: string) => void;
   /** Multiplexing host (server side): creates per-sid stream state. */
   streamHost?: StreamHost;
+  /** Server side: a DNS query arrived over oob. Answer it with
+   *  sendDnsResponse() using the same token. */
+  dnsQuery?: (token: number, query: Buffer) => void;
+  /** Client side: the response for a DNS query this end sent. */
+  dnsResponse?: (token: number, payload: Buffer) => void;
   /** An idle-time path measurement finished on this end (initiator only).
    *  Stamped with the session's current geometry so a reader can tell what the
    *  measured loss would have cost. */
@@ -449,9 +455,67 @@ export class Session {
       return;
     }
     if (this.dispatchHandshake(payload, nowMs)) return;
+    if (this.dnsHandle(payload)) return;
     if (this.isPmtuFrame(payload) && this.pmtuHandle(payload, nowMs)) return;
     if (this.probeEnabled && isProbeFrame(payload)) { this.probe.onFrame(payload, nowMs); return; }
     this.handleFecstat(payload, nowMs);
+  }
+
+  /**
+   * DNS over oob. Both directions carry the same 13-byte header; the token is
+   * the client's correlation id and is echoed verbatim in the response.
+   * Oversized payloads are dropped rather than fragmented: a DNS answer past
+   * the symbol budget is a truncated answer the caller has to retry anyway,
+   * and silently emitting a partial datagram would corrupt the resolver's view.
+   */
+  private dnsHandle(payload: Buffer): boolean {
+    if (payload.length < DNS_HDR_LEN) return false;
+    if (!bytesEqual(DNS_MAGIC, payload, DNS_MAGIC.length)) return false;
+    const type = payload[8];
+    const token = getLe32(payload, 9);
+    const body = payload.subarray(DNS_HDR_LEN);
+    if (type === DNS_TYPE_QUERY) {
+      if (body.length === 0 || body.length > DNS_MAX_PAYLOAD) {
+        this.dbg("[".concat(this.tag(), "] dns query dropped len=", String(body.length)));
+        return true;
+      }
+      this.dbg("[".concat(this.tag(), "] dns query rx token=", String(token), " len=", String(body.length)));
+      this.cb.dnsQuery?.(token, Buffer.from(body));
+      return true;
+    }
+    if (type === DNS_TYPE_RESPONSE) {
+      this.dbg("[".concat(this.tag(), "] dns response rx token=", String(token), " len=", String(body.length)));
+      this.cb.dnsResponse?.(token, Buffer.from(body));
+      return true;
+    }
+    ++this.structFail;
+    return true;
+  }
+
+  /** Client: ask the server to resolve a DNS packet. Returns false when it
+   *  cannot be sent (closed session or oversized payload). */
+  sendDnsQuery(token: number, query: Buffer): boolean {
+    if (this.closeNotified || query.length === 0 || query.length > DNS_MAX_PAYLOAD) return false;
+    const msg = Buffer.allocUnsafe(DNS_HDR_LEN + query.length);
+    DNS_MAGIC.copy(msg, 0);
+    msg[8] = DNS_TYPE_QUERY;
+    putLe32(token >>> 0, msg, 9);
+    query.copy(msg, DNS_HDR_LEN);
+    this.sendOob(msg);
+    return true;
+  }
+
+  /** Server: answer a query. Silently drops an oversized answer (the caller
+   *  still sees a timeout, which is the same outcome as a lost datagram). */
+  sendDnsResponse(token: number, answer: Buffer): boolean {
+    if (this.closeNotified || answer.length === 0 || answer.length > DNS_MAX_PAYLOAD) return false;
+    const msg = Buffer.allocUnsafe(DNS_HDR_LEN + answer.length);
+    DNS_MAGIC.copy(msg, 0);
+    msg[8] = DNS_TYPE_RESPONSE;
+    putLe32(token >>> 0, msg, 9);
+    answer.copy(msg, DNS_HDR_LEN);
+    this.sendOob(msg);
+    return true;
   }
 
   private dispatchHandshake(payload: Buffer, nowMs: number): boolean {

@@ -36,6 +36,10 @@ Server:
                         tunnel is meant to reach your own LAN. Turn it on when
                         the PSK is shared with people who should get the
                         internet but not the server's network.
+  --dns-upstream=IP[,IP]  resolvers for protocol-internal DNS (oob FCP_DNS1).
+                        Defaults to this host's resolver list, so a name the
+                        server can reach resolves identically here. No extra
+                        port is opened: queries ride the tunnel itself.
 
 Client:
   --peer=IP[:P]         FCP server to connect to (required; port defaults to 4460)
@@ -157,7 +161,7 @@ const ALIASES: Record<string, string> = {
 // ever reached because the client branch matched first).
 const KNOWN_OPTS = new Set([
   'key', 'bind', 'peer', 'mtu-min', 'fec-data', 'fec-parity-max', 'metrics',
-  'interleave', 'ack-copies',
+  'interleave', 'ack-copies', 'dns-upstream',
   'probe-interval', 'probe-budget',
   'log-level', 'log-file', 'seconds', 'speedtest-seconds', 'positional',
 ]);
@@ -170,7 +174,7 @@ const KNOWN_OPTS = new Set([
 // forbids, and the peer budget it produces does not match what was asked for.
 const VALUE_OPTS = new Set([
   'key', 'bind', 'peer', 'mtu-min', 'fec-data', 'fec-parity-max', 'metrics',
-  'interleave', 'ack-copies', 'probe-interval', 'probe-budget',
+  'interleave', 'ack-copies', 'dns-upstream', 'probe-interval', 'probe-budget',
   'log-level', 'log-file', 'seconds', 'speedtest-seconds',
 ]);
 
@@ -563,6 +567,8 @@ async function main(): Promise<void> {
     tunnel = new TunnelServer({
       ...common, listenHost: bind.host, port: bind.port,
       denyPrivate: flags.has('deny-private'),
+      dnsUpstream: opts.get('dns-upstream')
+        ?.split(',').map((s) => s.trim()).filter((s) => s.length > 0),
       onStats: (line) => process.stdout.write(line + '\n'),
     });
   } else if (mode === 'client') {

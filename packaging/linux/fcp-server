@@ -18,6 +18,10 @@ if [ -n "${FCP_FEC:-}" ]; then
   exit 1
 fi
 
+# Protocol-internal DNS (oob FCP_DNS1) resolvers. Empty = this host's own
+# resolver list, which is exactly what OPEN(domain) uses.
+[ -n "${FCP_DNS_UPSTREAM:-}" ] && set -- "$@" --dns-upstream="${FCP_DNS_UPSTREAM}"
+
 exec /opt/fcp-server/node/bin/node /opt/fcp-server/fcp-server.mjs \
   --key="${FCP_KEY}" \
   -b "${FCP_BIND:-0.0.0.0:4461}" \

@@ -4,13 +4,14 @@
 
 import { createSocket, type Socket as UdpSocket, type RemoteInfo } from 'node:dgram';
 import { createServer, connect, isIP, type Socket as TcpSocket, type Server as TcpServer } from 'node:net';
-import { lookup as dnsLookup } from 'node:dns';
+import { lookup as dnsLookup, getServers } from 'node:dns';
 import { randomBytes } from 'node:crypto';
 import {
   SALT_LEN, Direction, HandshakeRole, DEFAULT_MTU_MIN, DEFAULT_D, DEFAULT_P,
   OPEN_MAX_BYTES, ATYP_DOMAIN, ATYP_IPV4, DATA_WIRE_OVERHEAD, NONCE_LIMIT,
   MUX_MAX_STREAMS, MUX_SESSION_POOL,
   PROBE_INTERVAL_MS, PROBE_IDLE_MS, PROBE_QUIET_BYTES, PROBE_BUDGET_BYTES, PROBE_RETRY_MS,
+  DNS_UPSTREAM_TIMEOUT_MS,
 } from '../constants.ts';
 import { ByteWindow } from '../util/bytewindow.ts';
 import { Session, type SessionConfig, type SessionProbeResult } from '../session/session.ts';
@@ -30,6 +31,8 @@ import { OpenError } from '../constants.ts';
 import { createTraceSink, type TraceSink } from '../util/trace.ts';
 
 const TICK_MS = 10;
+/** Ceiling on concurrent protocol-internal DNS lookups per server process. */
+const DNS_MAX_INFLIGHT = 256;
 /** Stats line cadence: fast enough for a live graph, slow enough not to spam. */
 const STATS_PERIOD_MS = 500;
 
@@ -86,6 +89,10 @@ export interface TunnelOptions {
    *  the PSK is shared with people who should reach the internet but not the
    *  server's own network. */
   denyPrivate?: boolean;
+  /** Server only: resolvers for protocol-internal DNS (oob FCP_DNS1). Defaults
+   *  to the host's own resolver list (dns.getServers()), so a server that can
+   *  resolve OPEN(domain) also answers DNS identically. */
+  dnsUpstream?: string[];
   log?: (line: string) => void;
   /**
    * Machine-readable one-line counters, emitted every 500 ms on the wire side
@@ -1233,6 +1240,10 @@ export class TunnelServer {
   private preAuthByIp = new Map<string, { count: number; windowStart: number }>();
   private preAuthGlobal = { count: 0, windowStart: 0 };
   private resetReplyByIp = new Map<string, number>();
+  /** Protocol-internal DNS queries currently waiting on an upstream answer.
+   *  Capped so an authenticated peer cannot turn the server into a traffic
+   *  amplifier by flooding oob queries. */
+  private dnsInflight = 0;
   /** salt|nonce of bootstrap datagrams already accepted, with their arrival
    *  time. Bounded; see rememberBootstrap(). */
   private seenBootstrap = new Map<string, number>();
@@ -1607,6 +1618,7 @@ export class TunnelServer {
         cleanup();
         this.sessions.delete(key);
         },
+      dnsQuery: (token, query) => { this.answerDnsQuery(session, token, query); },
       streamHost: {
         inboundStream: (sid) => {
           if (closed) return null;
@@ -1644,6 +1656,71 @@ export class TunnelServer {
   }
 
   /** M1: a tunnel for an inbound sid stream on a multiplexed session. */
+  /**
+   * Resolve one protocol-internal DNS query (oob FCP_DNS1) on the server's own
+   * resolver — the same resolver OPEN(domain) uses, so a name that a tunnel
+   * stream can reach always resolves here too.
+   *
+   * Answers are single datagrams: DNS over UDP is the wire format the client
+   * sent, and a response past the symbol budget is dropped by the session layer
+   * (the client sees a timeout and retries, which is what a lost datagram looks
+   * like anyway).
+   */
+  private answerDnsQuery(session: Session, token: number, query: Buffer): void {
+    if (this.dnsInflight >= DNS_MAX_INFLIGHT) {
+      this.dbg(`dns token=${token} dropped: ${this.dnsInflight} queries in flight`);
+      return;
+    }
+    const upstreams = this.opts.dnsUpstream && this.opts.dnsUpstream.length > 0
+      ? this.opts.dnsUpstream
+      : getServers().map((s) => s.replace(/^\[|\]$/g, '').replace(/%[^%]*$/, '')).filter((s) => isIP(s) === 4);
+    if (upstreams.length === 0) {
+      this.log('dns: no IPv4 resolver available (set --dns-upstream)');
+      return;
+    }
+    ++this.dnsInflight;
+    let settled = false;
+    const finish = (answer: Buffer | null) => {
+      if (settled) return;
+      settled = true;
+      --this.dnsInflight;
+      if (answer) {
+        if (!session.sendDnsResponse(token, answer)) {
+          this.dbg(`dns token=${token} answer ${answer.length}B not sendable (oversized or session closed)`);
+        }
+      } else {
+        this.dbg(`dns token=${token} no answer from ${upstreams.join(',')}`);
+      }
+    };
+    const attempt = (idx: number) => {
+      if (settled) return;
+      if (idx >= upstreams.length) { finish(null); return; }
+      const sock = createSocket('udp4');
+      // Per-hop latch: a timeout, an error and a send callback can all fire
+      // around one close, and each one falling through to attempt(idx + 1)
+      // would skip the next upstream entirely.
+      let hopDone = false;
+      const nextHop = () => {
+        if (hopDone || settled) return;
+        hopDone = true;
+        clearTimeout(timer);
+        try { sock.close(); } catch { /* already closed */ }
+        attempt(idx + 1);
+      };
+      const timer = setTimeout(nextHop, DNS_UPSTREAM_TIMEOUT_MS);
+      sock.on('message', (msg) => {
+        if (hopDone) return;
+        hopDone = true;
+        clearTimeout(timer);
+        try { sock.close(); } catch { /* already closed */ }
+        finish(msg);
+      });
+      sock.on('error', nextHop);
+      sock.send(query, 53, upstreams[idx]!, (err) => { if (err) nextHop(); });
+    };
+    attempt(0);
+  }
+
   private newSidTunnel(key: string, sid: number, addr: { host: string; port: number }, trace: TraceSink | undefined): ServerTunnel {
     let t: ServerTunnel;
     t = {

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色主题覆盖（seed #00BFA5 的 M3 dark 调色板） -->
+    <color name="md_theme_primary">#82D5C4</color>
+    <color name="md_theme_onPrimary">#003730</color>
+    <color name="md_theme_primaryContainer">#005046</color>
+    <color name="md_theme_onPrimaryContainer">#9CF2E1</color>
+
+    <color name="md_theme_secondary">#B1CCC2</color>
+    <color name="md_theme_onSecondary">#1C352E</color>
+    <color name="md_theme_secondaryContainer">#334C44</color>
+    <color name="md_theme_onSecondaryContainer">#CDE8DE</color>
+
+    <color name="md_theme_error">#FFB4AB</color>
+    <color name="md_theme_onError">#690005</color>
+    <color name="md_theme_errorContainer">#93000A</color>
+    <color name="md_theme_onErrorContainer">#FFDAD6</color>
+
+    <color name="md_theme_surface">#101413</color>
+    <color name="md_theme_onSurface">#DFE4E0</color>
+    <color name="md_theme_surfaceVariant">#3F4944</color>
+    <color name="md_theme_onSurfaceVariant">#BEC9C3</color>
+    <color name="md_theme_outline">#88938D</color>
+    <color name="md_theme_outlineVariant">#3F4944</color>
+    <color name="md_theme_surfaceContainer">#1C201F</color>
+    <color name="md_theme_surfaceContainerHigh">#262B29</color>
+    <color name="md_theme_surfaceContainerHighest">#313534</color>
+
+    <!-- 页面底色与卡片（深色：卡片比底高一层 tonal） -->
+    <color name="fcp_page_bg">#141817</color>
+    <color name="fcp_card">#262B29</color>
+
+    <!-- 状态语义色（深色下略微提亮） -->
+    <color name="fcp_status_connected">#2AE0C5</color>
+    <color name="fcp_status_connecting">#FFC933</color>
+    <color name="fcp_status_disconnected">#9AA4A0</color>
+</resources>

@@ -143,7 +143,27 @@ tests/        bytes / protocol / golden / e2e / self-interop
 scripts/      check.mjs self-interop.mjs
 docs/         协议格式.md 移植对照与差异.md
 scripts/      start-client.cmd（本机客户端一键启动）
+android/      安卓客户端（monorepo 子项目，见 android/README.md）
+              VpnService 全局代理 + 本机混合代理端口；core/ 为纯 Java 协议栈，
+              互操作测试直接拉起本仓库的 src/app/server.ts 对拍
+desktop/      桌面 Electron 壳（驱动 resources/cli.mjs）
+packaging/    linux deb / win SEA 打包
 ```
+
+## 安卓客户端
+
+`android/` 是同一协议的第二实现（纯 Java 8）：
+
+```bash
+cd android
+./gradlew test            # 桌面 JVM 单测 + 对拍真实服务端的互操作测试
+./gradlew assembleDebug   # app-debug.apk
+```
+
+协议改动必须两端同步——对照表与移植纪律见 `android/README.md`。它额外实现了
+**协议内 DNS**（oob `FCP_DNS1`，见 `docs/协议格式.md` §8.x）：VPN 的 TUN 层只有 IP
+包、域名已在应用侧丢失，客户端必须自己解析，而移动网络常阻断公共解析器，所以让
+服务端用自己的 resolver 代答，不额外暴露端口。
 
 ## 调试日志
 
@@ -167,7 +187,8 @@ node scripts/self-interop.mjs --log-dir=logs/smoke
 
 ## 发布产物（Release）
 
-每次发布带四个安装包，外加 `sha256sums.txt`，全部由本仓库的 `packaging/` 脚本生成（资产名统一小写）：
+每次发布带五个安装包，外加 `sha256sums.txt`，全部由本仓库的 `packaging/` 脚本
+与 `android/` 的 Gradle 工程生成（资产名统一小写）：
 
 | 资产 | 平台 | 说明 |
 |---|---|---|
@@ -175,7 +196,13 @@ node scripts/self-interop.mjs --log-dir=logs/smoke
 | `fcp-client-gui-setup-<ver>.exe` | Windows x64 | 桌面 GUI 客户端 NSIS 安装包（per-user，无需管理员） |
 | `fcp-client-gui-<ver>-portable.exe` | Windows x64 | 桌面 GUI 客户端免安装单文件版 |
 | `fcp-client-<ver>.exe` | Windows x64 | 纯命令行客户端（Node SEA 单文件，不需要装 Node） |
-| `sha256sums.txt` | — | 上述四个产物的 SHA-256 校验和 |
+| `fcp-android-<ver>.apk` | Android 11+ (API 30) | 安卓客户端：VpnService 全局代理 + 本机混合代理端口。release 变体、已签名，可直接安装 |
+| `sha256sums.txt` | — | 上述五个产物的 SHA-256 校验和 |
+
+**版本号只有一个来源**：根 `package.json` 的 `version`。deb、SEA exe、desktop 的
+`package.json` 各有一处副本（CI 的 `verify` 会校验三者与 tag 一致），**安卓不维护副本**
+——`android/app/build.gradle` 构建时从 `../../package.json` 派生
+`versionName` 与 `versionCode`，所以 bump 版本时不需要动 `android/`。
 
 构建：
 
@@ -184,7 +211,14 @@ npm run pack:deb            # 首次会下载并校验 Node 22 到 packaging/.ca
 npm run pack:client-exe     # 复用 desktop/node_modules 里的 esbuild
 npm --prefix desktop install
 npm --prefix desktop run pack   # -> desktop/dist/fcp-node-<ver>-portable.exe 与 fcp-node-setup-<ver>.exe
+
+cd android && ./gradlew assembleRelease
+# -> app/build/outputs/apk/release/app-release.apk（版本号同 package.json）
 ```
+
+安卓 release APK 的签名：默认用 debug keystore（内部分发可直接安装）；设置了
+`FCP_ANDROID_KEYSTORE` / `FCP_ANDROID_KEYSTORE_PASSWORD` / `FCP_ANDROID_KEY_ALIAS` /
+`FCP_ANDROID_KEY_PASSWORD` 环境变量后改用正式签名。
 
 服务端安装：
 

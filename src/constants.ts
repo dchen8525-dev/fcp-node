@@ -357,6 +357,19 @@ export const SN_WINDOW = 4096;
  *  symbols; the sender's ARQ retransmits whatever this drops. */
 export const MAX_RX_SYMBOL_BYTES = 8 * 1024 * 1024;
 
+// DNS over oob: protocol-internal resolution. The TUN-side client has no usable
+// local resolver (captive/mobile networks block public DNS), while the server
+// resolves every OPEN(domain) already - so let it resolve plain DNS too instead
+// of exposing a second TCP port or a dedicated stream per lookup.
+//   magic8 | type1 (0=query, 1=response) | token4 LE | dns wire payload
+export const DNS_MAGIC = Buffer.from('FCP_DNS1', 'latin1');
+export const DNS_TYPE_QUERY = 0;
+export const DNS_TYPE_RESPONSE = 1;
+export const DNS_HDR_LEN = 13;
+/** Stays inside the smallest MTU's symbol budget (MTU 1040 -> symbolMax 977). */
+export const DNS_MAX_PAYLOAD = 900;
+export const DNS_UPSTREAM_TIMEOUT_MS = 5000;
+
 // Session (session.cc)
 export const KEEPALIVE_MAGIC = Buffer.from('FCPKAL1\0', 'latin1');
 export const KEEPALIVE_LEN = 8;
