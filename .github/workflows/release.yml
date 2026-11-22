@@ -3,8 +3,8 @@
 #
 # 资产与平台(deb 必须在 linux 打包,SEA/electron-builder 必须在 windows):
 #   ubuntu  -> fcp-server_<ver>_amd64.deb
-#   windows -> fcp-client-<ver>.exe (Node SEA)、fcp-node-<ver>-portable.exe、
-#              fcp-node-setup-<ver>.exe (electron-builder)
+#   windows -> fcp-client-<ver>.exe (Node SEA)、fcp-client-gui-<ver>-portable.exe、
+#              fcp-client-gui-setup-<ver>.exe (electron-builder)
 # 脚本自带 esbuild/postject 的 npx 回退,仓库零依赖,无需 npm install 根目录。
 # 版本号以根 package.json 为唯一来源,tag 必须一致(见 verify)。
 
@@ -93,14 +93,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: fcp-client-exe
-          path: dist/fcp-client-*.exe
+          path: dist/fcp-client-[0-9]*.exe
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: fcp-desktop
           path: |
-            desktop/dist/fcp-node-*-portable.exe
-            desktop/dist/fcp-node-setup-*.exe
+            desktop/dist/fcp-client-gui-*-portable.exe
+            desktop/dist/fcp-client-gui-setup-*.exe
           if-no-files-found: error
 
   publish:
@@ -115,7 +115,7 @@ jobs:
       - name: sha256sums.txt (same format as the manual releases)
         run: |
           cd dist
-          sha256sum -b fcp-server_*.deb fcp-client-*.exe fcp-node-setup-*.exe fcp-node-*-portable.exe > sha256sums.txt
+          sha256sum -b fcp-server_*.deb fcp-client-[0-9]*.exe fcp-client-gui-setup-*.exe fcp-client-gui-*-portable.exe > sha256sums.txt
           cat sha256sums.txt
       - name: create release if missing and upload assets
         env:
@@ -130,8 +130,8 @@ jobs:
             || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             dist/fcp-server_*.deb \
-            dist/fcp-client-*.exe \
-            dist/fcp-node-setup-*.exe \
-            dist/fcp-node-*-portable.exe \
+            dist/fcp-client-[0-9]*.exe \
+            dist/fcp-client-gui-setup-*.exe \
+            dist/fcp-client-gui-*-portable.exe \
             dist/sha256sums.txt
           echo "uploaded to release $TAG"

@@ -55,10 +55,10 @@
       ]
     },
     "portable": {
-      "artifactName": "fcp-node-${version}-portable.exe"
+      "artifactName": "fcp-client-gui-${version}-portable.exe"
     },
     "nsis": {
-      "artifactName": "fcp-node-setup-${version}.exe",
+      "artifactName": "fcp-client-gui-setup-${version}.exe",
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,

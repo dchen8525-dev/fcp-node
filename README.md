@@ -172,8 +172,8 @@ node scripts/self-interop.mjs --log-dir=logs/smoke
 | 资产 | 平台 | 说明 |
 |---|---|---|
 | `fcp-server_<ver>_amd64.deb` | Debian/Ubuntu amd64 | 服务端。内嵌 Node 22 运行时，带 systemd unit（`fcp-server.service`）和 `/etc/fcp-server/server.conf`；首次安装自动生成 PSK 并只打印一次 |
-| `fcp-node-setup-<ver>.exe` | Windows x64 | 桌面 GUI 客户端 NSIS 安装包（per-user，无需管理员） |
-| `fcp-node-<ver>-portable.exe` | Windows x64 | 桌面 GUI 客户端免安装单文件版 |
+| `fcp-client-gui-setup-<ver>.exe` | Windows x64 | 桌面 GUI 客户端 NSIS 安装包（per-user，无需管理员） |
+| `fcp-client-gui-<ver>-portable.exe` | Windows x64 | 桌面 GUI 客户端免安装单文件版 |
 | `fcp-client-<ver>.exe` | Windows x64 | 纯命令行客户端（Node SEA 单文件，不需要装 Node） |
 | `sha256sums.txt` | — | 上述四个产物的 SHA-256 校验和 |
 
