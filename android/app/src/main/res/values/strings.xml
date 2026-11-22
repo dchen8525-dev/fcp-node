@@ -13,6 +13,8 @@
     <string name="fcp_state_unconfigured">未配置服务器</string>
     <string name="fcp_server_unconfigured">未配置服务器，点击右上角设置开始</string>
     <string name="fcp_mixed_proxy_hint">混合代理 127.0.0.1:%1$d</string>
+    <string name="fcp_hint_vpn_mode">已接管全部应用流量 · 代理端口 127.0.0.1:%1$d</string>
+    <string name="fcp_hint_proxy_mode">代理服务 127.0.0.1:%1$d · 其他应用需自行设置代理</string>
     <string name="fcp_chip_down">↓ 下行</string>
     <string name="fcp_chip_up">↑ 上行</string>
     <string name="fcp_chip_sessions">会话</string>
@@ -35,7 +37,21 @@
     <string name="fcp_remember_psk">记住密钥</string>
     <string name="fcp_label_run_mode">运行模式</string>
     <string name="fcp_mode_vpn">VPN 全局</string>
-    <string name="fcp_mode_proxy">仅本机代理</string>
+    <string name="fcp_mode_proxy">代理服务</string>
+    <!-- 两种模式的真实差别：VPN 接管全部应用流量；代理端口只开一个监听，
+         应用必须自己把代理指向它。旧文案"仅本机代理"会被读成"本机全部流量
+         都走代理"，与实际行为相反。 -->
+    <string name="fcp_mode_vpn_desc">接管手机上所有应用的流量（需要授权 VPN）</string>
+    <string name="fcp_mode_proxy_desc">只在本机开一个代理服务，不接管任何流量；其他应用或系统 WiFi 需自行把代理指向它</string>
+    <string name="fcp_label_vpn_apps">按应用代理</string>
+    <string name="fcp_apps_all">全部应用</string>
+    <string name="fcp_apps_selected">已选 %1$d 个应用</string>
+    <string name="fcp_apps_title">按应用代理</string>
+    <string name="fcp_apps_hint">勾选的应用走 VPN，其余应用直连。全不选表示所有应用都走 VPN。改动在重新连接后生效。</string>
+    <string name="fcp_apps_search_hint">搜索应用</string>
+    <string name="fcp_apps_clear">全不选</string>
+    <string name="fcp_apps_save">保存</string>
+    <string name="fcp_apps_saved">已保存，重新连接后生效</string>
     <string name="fcp_advanced">高级</string>
     <string name="fcp_advanced_summary">FEC、MTU 与探测参数</string>
     <string name="fcp_hint_fec_data">fec-data</string>

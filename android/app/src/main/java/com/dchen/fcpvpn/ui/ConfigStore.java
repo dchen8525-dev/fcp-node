@@ -32,6 +32,8 @@ public final class ConfigStore {
     private static final String KEY_MTU_MIN = "mtu_min";
     private static final String KEY_PROBE_INTERVAL = "probe_interval";
     private static final String KEY_PROXY_PORT = "proxy_port";
+    /** 分应用代理白名单（VPN 模式）：空集合 = 全部应用。 */
+    private static final String KEY_VPN_APPS = "vpn_apps";
 
     private static final Pattern IPV4_PATTERN =
             Pattern.compile("^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$");
@@ -96,6 +98,25 @@ public final class ConfigStore {
 
     public static int getProxyPort(Context context) {
         return prefs(context).getInt(KEY_PROXY_PORT, VpnConfig.DEFAULT_PROXY_PORT);
+    }
+
+    /**
+     * 分应用代理白名单（仅 VPN 模式使用）。
+     * 空集合 = 不启用白名单，全部应用走 VPN；非空 = 只有这些包名走 VPN。
+     */
+    public static java.util.Set<String> getVpnApps(Context context) {
+        java.util.Set<String> stored = prefs(context).getStringSet(KEY_VPN_APPS, null);
+        return stored == null
+                ? new java.util.HashSet<String>()
+                : new java.util.HashSet<String>(stored);
+    }
+
+    public static void setVpnApps(Context context, java.util.Set<String> apps) {
+        prefs(context).edit()
+                .putStringSet(KEY_VPN_APPS,
+                        apps == null ? new java.util.HashSet<String>()
+                                : new java.util.HashSet<String>(apps))
+                .apply();
     }
 
     /** 服务器地址是否已配置完整（host + port + PSK）。 */

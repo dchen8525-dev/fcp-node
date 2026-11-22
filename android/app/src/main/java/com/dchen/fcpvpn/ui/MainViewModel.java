@@ -96,7 +96,7 @@ public class MainViewModel extends AndroidViewModel {
         connectionState.setValue(VpnConnectionState.CONNECTING);
 
         if (ConfigStore.RUN_MODE_PROXY.equals(mode)) {
-            // 仅本机代理：不走 VpnService，直接管理引擎生命周期。
+            // 代理端口模式：不走 VpnService、不接管流量，只管理引擎与 1080 监听。
             // protector 传 null（不在 VPN 内无需保护）。
             TunnelManager.get(app).start(config, null);
         } else {

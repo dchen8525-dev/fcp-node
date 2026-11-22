@@ -24,6 +24,7 @@ import com.dchen.fcpvpn.core.session.EngineConfig;
 import com.dchen.fcpvpn.core.session.SocketProtector;
 import com.dchen.fcpvpn.log.LogConfig;
 import com.dchen.fcpvpn.log.Logger;
+import com.dchen.fcpvpn.ui.ConfigStore;
 import com.dchen.fcpvpn.ui.MainActivity;
 import com.dchen.fcpvpn.util.SecretPrefs;
 
@@ -379,10 +380,40 @@ public class FcpVpnService extends VpnService {
                 .addAddress(VpnConfig.VPN_ADDRESS, VpnConfig.VPN_ADDRESS_PREFIX)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
-                .addDisallowedApplication(getPackageName());
-        Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=0.0.0.0/0 (IPv4 only)"
-                + " dns=1.1.1.1,8.8.8.8 excludedApp=" + getPackageName());
+                .addDnsServer("8.8.8.8");
+
+        // 分应用代理：白名单非空时只有选中的应用走 VPN，其余直连。
+        // addAllowedApplication 与 addDisallowedApplication 互斥，因此两种情形
+        // 只能二选一；白名单里若出现自己会被 VPN 回环，这里跳过。
+        java.util.Set<String> onlyApps = ConfigStore.getVpnApps(this);
+        int applied = 0;
+        int missing = 0;
+        if (onlyApps.isEmpty()) {
+            builder.addDisallowedApplication(getPackageName());
+            Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=0.0.0.0/0 (IPv4 only)"
+                    + " dns=1.1.1.1,8.8.8.8 mode=all-apps excludedApp=" + getPackageName());
+        } else {
+            for (String pkg : onlyApps) {
+                if (pkg == null || pkg.equals(getPackageName())) continue;
+                try {
+                    builder.addAllowedApplication(pkg);
+                    ++applied;
+                } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+                    // 应用已卸载：跳过，不让整条隧道建不起来
+                    ++missing;
+                }
+            }
+            if (applied == 0) {
+                // 白名单里的应用全都没了：退回全部应用，总比建一个空隧道强
+                builder.addDisallowedApplication(getPackageName());
+                Logger.warning(LogConfig.MODULE_VPN,
+                        "VPN 白名单里的应用都已卸载，退回全部应用模式");
+            } else {
+                Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=0.0.0.0/0 (IPv4 only)"
+                        + " dns=1.1.1.1,8.8.8.8 mode=whitelist apps=" + applied
+                        + " missing=" + missing);
+            }
+        }
         return builder.establish();
     }
 

@@ -10,6 +10,18 @@
     <!-- Android 13+ 通知运行时权限 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+      Android 11+ 包可见性：分应用代理需要列出已安装的启动器应用。
+      只声明 MAIN/LAUNCHER 查询（而非 QUERY_ALL_PACKAGES），对"选择要代理的
+      应用"完全够用，也不需要商店敏感权限。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:name=".FcpVpnApplication"
         android:allowBackup="false"
@@ -33,6 +45,12 @@
         <!-- 设置页 -->
         <activity
             android:name=".ui.SettingsActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- 分应用代理：勾选哪些应用走 VPN -->
+        <activity
+            android:name=".ui.AppPickerActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
 

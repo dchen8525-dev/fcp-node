@@ -47,6 +47,9 @@ public class SettingsActivity extends AppCompatActivity {
         setupValidation();
         setupAdvancedToggle();
 
+        binding.vpnAppsCard.setOnClickListener(v ->
+                startActivity(new android.content.Intent(this, AppPickerActivity.class)));
+
         binding.btnSave.setOnClickListener(v -> save());
 
         // 首次启动引导：聚焦服务器地址输入框并弹出键盘
@@ -84,11 +87,36 @@ public class SettingsActivity extends AppCompatActivity {
         } else {
             binding.btnModeVpn.setChecked(true);
         }
+        binding.modeToggle.addOnButtonCheckedListener((group, checkedId, isChecked) -> {
+            if (isChecked) updateModeDesc(checkedId == R.id.btn_mode_proxy);
+        });
+        updateModeDesc(ConfigStore.RUN_MODE_PROXY.equals(ConfigStore.getRunMode(this)));
         binding.inputFecData.setText(String.valueOf(ConfigStore.getFecData(this)));
         binding.inputFecParityMax.setText(String.valueOf(ConfigStore.getFecParityMax(this)));
         binding.inputMtuMin.setText(String.valueOf(ConfigStore.getMtuMin(this)));
         binding.inputProbeInterval.setText(String.valueOf(ConfigStore.getProbeIntervalSec(this)));
         binding.inputProxyPort.setText(String.valueOf(ConfigStore.getProxyPort(this)));
+    }
+
+    /**
+     * 两种模式的实际效果差异直接写在选项下面：VPN 模式接管全部应用流量；
+     * 代理端口模式只开一个监听，应用需自己把代理指向它。（旧文案"仅本机代理"
+     * 没有表达"不接管"，容易被读成本机全部流量自动走代理。）
+     */
+    private void updateModeDesc(boolean proxyMode) {
+        binding.modeDesc.setText(proxyMode
+                ? R.string.fcp_mode_proxy_desc
+                : R.string.fcp_mode_vpn_desc);
+    }
+
+    /** 从应用选择页返回后刷新摘要。 */
+    
+    protected void onResume() {
+        super.onResume();
+        int n = ConfigStore.getVpnApps(this).size();
+        binding.vpnAppsSummary.setText(n == 0
+                ? getString(R.string.fcp_apps_all)
+                : getString(R.string.fcp_apps_selected, n));
     }
 
     // ------------------------------------------------------------ 即时校验

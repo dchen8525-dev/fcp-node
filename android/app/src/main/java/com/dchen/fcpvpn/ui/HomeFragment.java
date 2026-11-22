@@ -134,7 +134,7 @@ public class HomeFragment extends Fragment {
             return;
         }
         if (ConfigStore.RUN_MODE_PROXY.equals(ConfigStore.getRunMode(requireContext()))) {
-            // 仅本机代理：直接拉起引擎（当前为 Stub，M4 接入真实引擎）
+            // 代理端口模式：不建 TUN，只管理引擎生命周期（1080 监听由 TunnelManager 拉起）
             viewModel.connect();
             return;
         }
