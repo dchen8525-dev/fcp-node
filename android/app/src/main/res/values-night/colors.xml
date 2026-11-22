@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 深色主题覆盖（seed #00BFA5 的 M3 dark 调色板） -->
-    <color name="md_theme_primary">#82D5C4</color>
+    <!-- 深色主题覆盖：底色压到接近黑，卡片高一层 tonal，不用纯黑避免边框发死 -->
+    <color name="md_theme_primary">#6EF0D2</color>
     <color name="md_theme_onPrimary">#003730</color>
     <color name="md_theme_primaryContainer">#005046</color>
     <color name="md_theme_onPrimaryContainer">#9CF2E1</color>
@@ -16,22 +16,42 @@
     <color name="md_theme_errorContainer">#93000A</color>
     <color name="md_theme_onErrorContainer">#FFDAD6</color>
 
-    <color name="md_theme_surface">#101413</color>
-    <color name="md_theme_onSurface">#DFE4E0</color>
-    <color name="md_theme_surfaceVariant">#3F4944</color>
-    <color name="md_theme_onSurfaceVariant">#BEC9C3</color>
-    <color name="md_theme_outline">#88938D</color>
-    <color name="md_theme_outlineVariant">#3F4944</color>
-    <color name="md_theme_surfaceContainer">#1C201F</color>
-    <color name="md_theme_surfaceContainerHigh">#262B29</color>
-    <color name="md_theme_surfaceContainerHighest">#313534</color>
+    <color name="md_theme_surface">#0B1311</color>
+    <color name="md_theme_onSurface">#E6F1ED</color>
+    <color name="md_theme_surfaceVariant">#2A3934</color>
+    <color name="md_theme_onSurfaceVariant">#B8CCC4</color>
+    <color name="md_theme_outline">#7A8F88</color>
+    <color name="md_theme_outlineVariant">#2A3934</color>
+    <color name="md_theme_surfaceContainer">#121D19</color>
+    <color name="md_theme_surfaceContainerHigh">#17241F</color>
+    <color name="md_theme_surfaceContainerHighest">#1D2B26</color>
 
-    <!-- 页面底色与卡片（深色：卡片比底高一层 tonal） -->
-    <color name="fcp_page_bg">#141817</color>
-    <color name="fcp_card">#262B29</color>
+    <color name="fcp_page_bg">#0B1311</color>
+    <color name="fcp_card">#121D19</color>
 
-    <!-- 状态语义色（深色下略微提亮） -->
-    <color name="fcp_status_connected">#2AE0C5</color>
-    <color name="fcp_status_connecting">#FFC933</color>
-    <color name="fcp_status_disconnected">#9AA4A0</color>
+    <color name="fcp_text_primary">#E6F1ED</color>
+    <color name="fcp_text_muted">#8FA79E</color>
+    <color name="fcp_text_faint">#6F8A81</color>
+    <color name="fcp_divider">#1E2C27</color>
+
+    <color name="fcp_status_connected">#2EE6C5</color>
+    <color name="fcp_status_connecting">#F5B942</color>
+    <color name="fcp_status_disconnected">#5A6B65</color>
+
+    <color name="fcp_badge_bg">#0F3A32</color>
+    <color name="fcp_badge_text">#6EF0D2</color>
+
+    <color name="fcp_danger_bg">#3A1B18</color>
+    <color name="fcp_danger_text">#FFB4A9</color>
+    <color name="fcp_danger_border">#5A2A26</color>
+
+    <color name="fcp_btn_dark_1">#6EF0D2</color>
+    <!-- 深色下主按钮底要压暗，白字才够对比（亮青底 + 白字不可读） -->
+    <color name="fcp_btn_dark_2">#0F766E</color>
+
+    <!-- 日志级别：深色卡底上的亮色 -->
+    <color name="log_debug">#7A8A85</color>
+    <color name="log_info">#6EF0D2</color>
+    <color name="log_warning">#FFC46B</color>
+    <color name="log_error">#FF7B72</color>
 </resources>

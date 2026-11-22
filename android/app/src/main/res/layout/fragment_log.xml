@@ -14,9 +14,11 @@
         android:layout_height="wrap_content"
         android:paddingStart="20dp"
         android:paddingEnd="20dp"
-        android:paddingTop="24dp"
-        android:paddingBottom="8dp"
-        android:textAppearance="?attr/textAppearanceHeadlineSmall"
+        android:paddingTop="20dp"
+        android:paddingBottom="10dp"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:textColor="@color/fcp_text_primary"
         android:text="@string/fcp_log_title"/>
 
     <!-- 过滤 chips：全部 / 信息 / 警告 / 错误 -->
@@ -65,7 +67,7 @@
         </com.google.android.material.chip.ChipGroup>
     </HorizontalScrollView>
 
-    <!-- 深色控制台风格日志卡片 -->
+    <!-- 日志卡片：浅色底 + 等宽字体，级别用色区分（A 方案的卡片语言） -->
     <com.google.android.material.card.MaterialCardView
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -74,10 +76,11 @@
         android:layout_marginEnd="16dp"
         android:layout_marginTop="8dp"
         android:layout_marginBottom="8dp"
-        app:cardCornerRadius="16dp"
+        app:cardCornerRadius="22dp"
         app:cardElevation="0dp"
-        app:cardBackgroundColor="@color/fcp_console_bg"
-        app:strokeWidth="0dp">
+        app:cardBackgroundColor="@color/fcp_card"
+        app:strokeWidth="1dp"
+        app:strokeColor="@color/fcp_divider">
 
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/recycler_log"

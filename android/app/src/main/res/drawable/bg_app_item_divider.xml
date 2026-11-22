@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 应用列表条目底部的内缩分隔线：从文字起始处开始（18dp 内边距 + 40dp 图标 + 16dp 间距），
+     末端留 12dp，和卡片右内边距对齐。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:gravity="bottom"
+        android:left="74dp"
+        android:right="12dp">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/fcp_divider" />
+            <size android:height="1dp" />
+        </shape>
+    </item>
+</layer-list>

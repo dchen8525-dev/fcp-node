@@ -15,6 +15,10 @@
     <string name="fcp_mixed_proxy_hint">混合代理 127.0.0.1:%1$d</string>
     <string name="fcp_hint_vpn_mode">已接管全部应用流量 · 代理端口 127.0.0.1:%1$d</string>
     <string name="fcp_hint_proxy_mode">代理服务 127.0.0.1:%1$d · 其他应用需自行设置代理</string>
+    <string name="fcp_brand">FCP</string>
+    <string name="fcp_rate_down_label">↓ 下行速率</string>
+    <string name="fcp_metric_up">↑ 上行</string>
+    <string name="fcp_unit_mb_s">MB/s</string>
     <string name="fcp_chip_down">↓ 下行</string>
     <string name="fcp_chip_up">↑ 上行</string>
     <string name="fcp_chip_sessions">会话</string>
@@ -45,6 +49,7 @@
     <string name="fcp_mode_proxy_desc">只在本机开一个代理服务，不接管任何流量；其他应用或系统 WiFi 需自行把代理指向它</string>
     <string name="fcp_label_vpn_apps">按应用代理</string>
     <string name="fcp_apps_all">全部应用</string>
+    <string name="fcp_apps_proxy_mode_hint">代理服务模式下不适用（不接管流量）</string>
     <string name="fcp_apps_selected">已选 %1$d 个应用</string>
     <string name="fcp_apps_title">按应用代理</string>
     <string name="fcp_apps_hint">勾选的应用走 VPN，其余应用直连。全不选表示所有应用都走 VPN。改动在重新连接后生效。</string>
@@ -54,10 +59,10 @@
     <string name="fcp_apps_saved">已保存，重新连接后生效</string>
     <string name="fcp_advanced">高级</string>
     <string name="fcp_advanced_summary">FEC、MTU 与探测参数</string>
-    <string name="fcp_hint_fec_data">fec-data</string>
-    <string name="fcp_hint_fec_parity_max">fec-parity-max</string>
-    <string name="fcp_hint_mtu_min">mtu-min</string>
-    <string name="fcp_hint_probe_interval">probe-interval（0 关闭）</string>
+    <string name="fcp_hint_fec_data">FEC 数据包</string>
+    <string name="fcp_hint_fec_parity_max">FEC 冗余上限</string>
+    <string name="fcp_hint_mtu_min">最小 MTU</string>
+    <string name="fcp_hint_probe_interval">探测间隔（0=关）</string>
     <string name="fcp_hint_proxy_port">本地代理端口</string>
     <string name="fcp_saved">设置已保存</string>
     <string name="fcp_error_host_empty">服务器地址不能为空</string>

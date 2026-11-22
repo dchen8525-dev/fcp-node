@@ -5,9 +5,10 @@
     android:orientation="horizontal"
     android:gravity="center_vertical"
     android:minHeight="64dp"
-    android:paddingStart="16dp"
-    android:paddingEnd="16dp"
+    android:paddingStart="18dp"
+    android:paddingEnd="12dp"
     android:background="?attr/selectableItemBackground"
+    android:foreground="@drawable/bg_app_item_divider"
     android:clickable="true"
     android:focusable="true">
 
@@ -29,18 +30,21 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:textSize="15sp"
+            android:textStyle="bold"
             android:maxLines="1"
             android:ellipsize="end"
-            android:textColor="?attr/colorOnSurface" />
+            android:textColor="@color/fcp_text_primary" />
 
         <TextView
             android:id="@+id/item_package"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
             android:textSize="11sp"
+            android:fontFamily="monospace"
             android:maxLines="1"
             android:ellipsize="end"
-            android:textColor="?attr/colorOnSurfaceVariant" />
+            android:textColor="@color/fcp_text_faint" />
     </LinearLayout>
 
     <com.google.android.material.checkbox.MaterialCheckBox

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Base application theme. Material 3 DayNight，青绿品牌色
-         （Android 12+ 由 FcpVpnApplication 里的 DynamicColors 覆盖为动态取色）。 -->
+    <!-- Base application theme. Material 3 DayNight，青绿品牌色（固定配色，
+         不启用 Material You 动态取色，见 FcpVpnApplication 注释）。 -->
     <style name="Theme.FcpVpn" parent="Theme.Material3.DayNight.NoActionBar">
         <item name="colorPrimary">@color/md_theme_primary</item>
         <item name="colorOnPrimary">@color/md_theme_onPrimary</item>
@@ -52,14 +52,18 @@
         <item name="cornerSize">24dp</item>
     </style>
 
-    <!-- 主按钮：56dp 高、28dp 全圆角（胶囊） -->
+    <!-- 主按钮：54dp 高、27dp 全圆角（胶囊）。颜色随状态在代码里渐变，
+         这里只定形状与排版。 -->
     <style name="Widget.FcpVpn.Button.PrimaryAction" parent="Widget.Material3.Button">
-        <item name="android:minHeight">56dp</item>
-        <item name="android:textAppearance">?attr/textAppearanceTitleMedium</item>
+        <item name="android:minHeight">54dp</item>
+        <item name="android:textSize">15.5sp</item>
+        <item name="android:textStyle">bold</item>
         <item name="iconGravity">textStart</item>
-        <item name="iconPadding">12dp</item>
+        <item name="iconPadding">8dp</item>
+        <item name="iconSize">18dp</item>
         <item name="android:insetTop">0dp</item>
         <item name="android:insetBottom">0dp</item>
+        <item name="cornerRadius">27dp</item>
     </style>
 
     <!-- 输入框：12dp 圆角 outlined box -->

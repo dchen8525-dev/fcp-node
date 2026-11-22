@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- ===== FCP 品牌色（seed #00BFA5 青绿，M3 harmonized，克制不艳） ===== -->
-    <color name="md_theme_primary">#006B5E</color>
+    <!-- ===== FCP 品牌色（seed #00B894 青绿） =====
+         浅色方案：白卡浮在很浅的灰绿底上，靠留白和层次而不是阴影区分。 -->
+    <color name="md_theme_primary">#00806B</color>
     <color name="md_theme_onPrimary">#FFFFFF</color>
     <color name="md_theme_primaryContainer">#9CF2E1</color>
     <color name="md_theme_onPrimaryContainer">#00201B</color>
@@ -16,31 +17,48 @@
     <color name="md_theme_errorContainer">#FFDAD6</color>
     <color name="md_theme_onErrorContainer">#410002</color>
 
-    <!-- Surface 层次：页面底 = surfaceContainer，卡片高一层的 fcp_card -->
-    <color name="md_theme_surface">#F6FBF6</color>
-    <color name="md_theme_onSurface">#181D1A</color>
-    <color name="md_theme_surfaceVariant">#DBE5DF</color>
-    <color name="md_theme_onSurfaceVariant">#3F4944</color>
-    <color name="md_theme_outline">#6F7974</color>
-    <color name="md_theme_outlineVariant">#BEC9C3</color>
-    <color name="md_theme_surfaceContainer">#EAEFEB</color>
-    <color name="md_theme_surfaceContainerHigh">#E4EFE9</color>
-    <color name="md_theme_surfaceContainerHighest">#DFE9E4</color>
+    <!-- Surface 层次 -->
+    <color name="md_theme_surface">#F7FBF9</color>
+    <color name="md_theme_onSurface">#16211D</color>
+    <color name="md_theme_surfaceVariant">#DCE7E2</color>
+    <color name="md_theme_onSurfaceVariant">#4A5751</color>
+    <color name="md_theme_outline">#6F7C76</color>
+    <color name="md_theme_outlineVariant">#C3CFC9</color>
+    <color name="md_theme_surfaceContainer">#EFF5F2</color>
+    <color name="md_theme_surfaceContainerHigh">#E8F0EC</color>
+    <color name="md_theme_surfaceContainerHighest">#E2EBE7</color>
 
-    <!-- 页面底色与卡片（浅色：白卡浮在灰绿底上） -->
-    <color name="fcp_page_bg">#EAEFEB</color>
+    <!-- 页面底色与卡片 -->
+    <color name="fcp_page_bg">#EEF4F1</color>
     <color name="fcp_card">#FFFFFF</color>
 
-    <!-- 状态语义色 -->
-    <color name="fcp_status_connected">#00BFA5</color>
-    <color name="fcp_status_connecting">#FFB300</color>
-    <color name="fcp_status_disconnected">#8A938E</color>
+    <!-- 文本层级：主 / 次 / 弱 -->
+    <color name="fcp_text_primary">#16211D</color>
+    <color name="fcp_text_muted">#6A7871</color>
+    <color name="fcp_text_faint">#8A968F</color>
+    <color name="fcp_divider">#EDF2EF</color>
 
-    <!-- 日志级别（控制台深底上的亮色） -->
-    <color name="log_debug">#7A8A85</color>
-    <color name="log_info">#6EC3FF</color>
-    <color name="log_warning">#FFC46B</color>
-    <color name="log_error">#FF7B72</color>
-    <color name="fcp_console_bg">#101418</color>
-    <color name="fcp_console_text">#C9D4D0</color>
+    <!-- 状态语义色 -->
+    <color name="fcp_status_connected">#00B894</color>
+    <color name="fcp_status_connecting">#E8A317</color>
+    <color name="fcp_status_disconnected">#9AA8A2</color>
+
+    <!-- 模式徽章 -->
+    <color name="fcp_badge_bg">#D7F2EA</color>
+    <color name="fcp_badge_text">#00604E</color>
+
+    <!-- 断开操作：柔和红底（不用高饱和红，避免抢视觉焦点） -->
+    <color name="fcp_danger_bg">#FBEAE8</color>
+    <color name="fcp_danger_text">#A3241C</color>
+    <color name="fcp_danger_border">#F3D3CF</color>
+
+    <!-- 主按钮（连接）渐变的起止色 -->
+    <color name="fcp_btn_dark_1">#0E3B33</color>
+    <color name="fcp_btn_dark_2">#16211D</color>
+
+    <!-- 日志级别：浅色卡底上可读的深色版本（深色主题在 values-night 覆盖） -->
+    <color name="log_debug">#8A968F</color>
+    <color name="log_info">#00806B</color>
+    <color name="log_warning">#A86200</color>
+    <color name="log_error">#A3241C</color>
 </resources>

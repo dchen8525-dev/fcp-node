@@ -92,6 +92,8 @@ public class HomeFragment extends Fragment {
         });
         binding.btnSettings.setOnClickListener(v ->
                 startActivity(new Intent(requireContext(), SettingsActivity.class)));
+        binding.vpnAppsCard.setOnClickListener(v ->
+                startActivity(new Intent(requireContext(), AppPickerActivity.class)));
 
         renderServerInfo();
         observeViewModel();
@@ -180,14 +182,28 @@ public class HomeFragment extends Fragment {
         }
         binding.proxyHint.setText(getString(R.string.fcp_mixed_proxy_hint,
                 ConfigStore.getProxyPort(requireContext())));
+
+        boolean proxyMode = ConfigStore.RUN_MODE_PROXY.equals(
+                ConfigStore.getRunMode(requireContext()));
+        binding.modeBadge.setText(proxyMode
+                ? R.string.fcp_mode_proxy : R.string.fcp_mode_vpn);
+        // 按应用代理只在 VPN 模式有意义：代理服务模式不接管流量，白名单没有作用对象。
+        if (proxyMode) {
+            binding.vpnAppsSub.setText(R.string.fcp_apps_proxy_mode_hint);
+        } else {
+            int apps = ConfigStore.getVpnApps(requireContext()).size();
+            binding.vpnAppsSub.setText(apps == 0
+                    ? getString(R.string.fcp_apps_all)
+                    : getString(R.string.fcp_apps_selected, apps));
+        }
     }
 
     private void observeViewModel() {
         viewModel.getConnectionState().observe(getViewLifecycleOwner(), this::renderState);
         viewModel.getUploadBytes().observe(getViewLifecycleOwner(),
-                v -> renderChip(binding.chipUpValue, v));
+                v -> renderRates());
         viewModel.getDownloadBytes().observe(getViewLifecycleOwner(),
-                v -> renderChip(binding.chipDownValue, v));
+                v -> renderRates());
         viewModel.getSessions().observe(getViewLifecycleOwner(), v -> {
             VpnConnectionState state = viewModel.getConnectionState().getValue();
             if (state == VpnConnectionState.CONNECTED && v != null && v >= 0) {
@@ -215,13 +231,54 @@ public class HomeFragment extends Fragment {
         renderState(state != null ? state : VpnConnectionState.DISCONNECTED);
     }
 
-    private void renderChip(android.widget.TextView view, Long bytes) {
+    /**
+     * 速率渲染：下行拆成「大数字 + 单位」两段（本屏的视觉焦点），上行是普通文本。
+     * 未连接时两处都回到占位符。
+     */
+    private void renderRates() {
+        if (binding == null) return;
         VpnConnectionState state = viewModel.getConnectionState().getValue();
-        if (state == VpnConnectionState.CONNECTED && bytes != null && bytes > 0) {
-            view.setText(formatBytes(bytes));
+        boolean on = state == VpnConnectionState.CONNECTED;
+        Long down = viewModel.getDownloadBytes().getValue();
+        Long up = viewModel.getUploadBytes().getValue();
+
+        if (on) {
+            // 连接状态下始终显示数值（0 也显示）：占位符会让人以为统计没在工作。
+            long d = down == null ? 0 : down;
+            String[] r = splitRate(d);
+            binding.chipDownValue.setText(r[0]);
+            binding.rateUnit.setText(r[1]);
+            long u = up == null ? 0 : up;
+            binding.chipUpValue.setText(formatRate(u));
         } else {
-            view.setText("—");
+            // 断开时回到「0.00 MB/s」的静止读数，并整体弱化：42sp 等宽粗体的「—」
+            // 渲染出来是一根粗黑条，容易被当成控件坏了。
+            binding.chipDownValue.setText("0.00");
+            binding.rateUnit.setText(R.string.fcp_unit_mb_s);
+            binding.chipUpValue.setText("—");
         }
+        int strong = androidx.core.content.ContextCompat.getColor(requireContext(),
+                on ? R.color.fcp_text_primary : R.color.fcp_text_faint);
+        binding.chipDownValue.setTextColor(strong);
+        binding.chipUpValue.setTextColor(strong);
+    }
+
+    /** 速率拆成 [数值, 单位]：MB/s 保留两位，KB/s 取整，避免大数字过长。 */
+    static String[] splitRate(long bps) {
+        if (bps < 1024) return new String[]{String.valueOf(bps), "B/s"};
+        double kb = bps / 1024.0;
+        if (kb < 1024) return new String[]{String.format(Locale.US, "%.0f", kb), "KB/s"};
+        double mb = kb / 1024.0;
+        if (mb < 1024) {
+            return new String[]{String.format(Locale.US, mb >= 100 ? "%.0f" : "%.2f", mb), "MB/s"};
+        }
+        return new String[]{String.format(Locale.US, "%.2f", mb / 1024.0), "GB/s"};
+    }
+
+    /** 单行速率文本，例如 "86 KB/s"。 */
+    static String formatRate(long bps) {
+        String[] r = splitRate(bps);
+        return r[0] + " " + r[1];
     }
 
     /** 五个状态在英雄卡内的完整表达：状态点、状态文案、主按钮、进度环、chips。 */
@@ -233,7 +290,8 @@ public class HomeFragment extends Fragment {
         String statusText;
         String buttonText;
         int buttonIcon;
-        int buttonColorAttr;
+        int buttonBgRes;
+        int buttonFgRes;
         boolean showProgress;
         boolean buttonEnabled = true;
 
@@ -242,7 +300,9 @@ public class HomeFragment extends Fragment {
                 statusText = getString(R.string.fcp_state_connected);
                 buttonText = getString(R.string.fcp_disconnect);
                 buttonIcon = R.drawable.ic_stop;
-                buttonColorAttr = com.google.android.material.R.attr.colorError;
+                // 断开是常规操作，用柔和红底而不是高饱和红，别抢走速率的视觉焦点
+                buttonBgRes = R.color.fcp_danger_bg;
+                buttonFgRes = R.color.fcp_danger_text;
                 showProgress = false;
                 break;
             case CONNECTING:
@@ -252,14 +312,16 @@ public class HomeFragment extends Fragment {
                         : getString(R.string.fcp_state_connecting);
                 buttonText = getString(R.string.fcp_state_connecting);
                 buttonIcon = R.drawable.ic_play_arrow;
-                buttonColorAttr = com.google.android.material.R.attr.colorPrimary;
+                buttonBgRes = R.color.fcp_status_connecting;
+                buttonFgRes = android.R.color.white;
                 showProgress = true;
                 break;
             case DISCONNECTING:
                 statusText = getString(R.string.fcp_state_disconnecting);
                 buttonText = getString(R.string.fcp_state_disconnecting);
                 buttonIcon = R.drawable.ic_stop;
-                buttonColorAttr = com.google.android.material.R.attr.colorError;
+                buttonBgRes = R.color.fcp_danger_bg;
+                buttonFgRes = R.color.fcp_danger_text;
                 showProgress = false;
                 buttonEnabled = false;
                 break;
@@ -271,7 +333,8 @@ public class HomeFragment extends Fragment {
                         : getString(R.string.fcp_state_unconfigured);
                 buttonText = getString(R.string.fcp_connect);
                 buttonIcon = R.drawable.ic_play_arrow;
-                buttonColorAttr = com.google.android.material.R.attr.colorPrimary;
+                buttonBgRes = R.color.fcp_btn_dark_2;
+                buttonFgRes = android.R.color.white;
                 showProgress = false;
                 break;
         }
@@ -288,49 +351,41 @@ public class HomeFragment extends Fragment {
         binding.progressRing.setVisibility(showProgress ? View.VISIBLE : View.GONE);
 
         binding.btnMain.setEnabled(buttonEnabled);
-        animateButtonColor(buttonColorAttr);
+        animateButtonColors(
+                androidx.core.content.ContextCompat.getColor(requireContext(), buttonBgRes),
+                androidx.core.content.ContextCompat.getColor(requireContext(), buttonFgRes));
         binding.btnMain.setText(buttonText);
         binding.btnMain.setIconResource(buttonIcon);
 
-        // chips：未连接时全部占位 "—"（Stub 阶段引擎无 stats，同样显示占位）
+        // chips：未连接时会话/时长置占位；速率文本与配色统一由 renderRates 负责
+        // （那里连接中也会显示 0.00，断开时用弱化的静止读数）。
         boolean connected = state == VpnConnectionState.CONNECTED;
         if (!connected) {
-            binding.chipDownValue.setText("—");
-            binding.chipUpValue.setText("—");
             binding.chipSessionsValue.setText("—");
             binding.chipDurationValue.setText("—");
         }
+        renderRates();
     }
 
     /**
-     * 主按钮颜色渐变（连接=primary，断开=error），250ms ArgbEvaluator 过渡，
-     * 避免状态切换时生硬跳变。
+     * 主按钮配色过渡：250ms ArgbEvaluator，避免状态切换时颜色硬跳。
+     * 背景与前景（文字 + 图标）一起切：深色底配白字，浅色底配深字。
      */
-    private void animateButtonColor(int colorAttr) {
-        int target = MaterialColors.getColor(binding.btnMain, colorAttr);
-        int onTarget = MaterialColors.getColor(binding.btnMain,
-                colorAttr == com.google.android.material.R.attr.colorError
-                        ? com.google.android.material.R.attr.colorOnError
-                        : com.google.android.material.R.attr.colorOnPrimary);
+    private void animateButtonColors(int bg, int fg) {
+        binding.btnMain.setTextColor(fg);
+        binding.btnMain.setIconTint(android.content.res.ColorStateList.valueOf(fg));
+
         android.content.res.ColorStateList currentTint = binding.btnMain.getBackgroundTintList();
-        int current = currentTint != null
-                ? currentTint.getDefaultColor()
-                : target;
-        if (current == target) {
-            binding.btnMain.setTextColor(onTarget);
+        int from = currentTint != null ? currentTint.getDefaultColor() : bg;
+        if (from == bg) {
+            binding.btnMain.setBackgroundTintList(android.content.res.ColorStateList.valueOf(bg));
             return;
         }
-        ValueAnimator animator = ValueAnimator.ofObject(new android.animation.ArgbEvaluator(),
-                current, target);
+        ValueAnimator animator = ValueAnimator.ofObject(new android.animation.ArgbEvaluator(), from, bg);
         animator.setDuration(250);
-        animator.addUpdateListener(anim -> {
-            int color = (int) anim.getAnimatedValue();
-            binding.btnMain.setBackgroundTintList(
-                    android.content.res.ColorStateList.valueOf(color));
-        });
+        animator.addUpdateListener(anim -> binding.btnMain.setBackgroundTintList(
+                android.content.res.ColorStateList.valueOf((int) anim.getAnimatedValue())));
         animator.start();
-        binding.btnMain.setTextColor(onTarget);
-        binding.btnMain.setIconTint(android.content.res.ColorStateList.valueOf(onTarget));
     }
 
     // ------------------------------------------------------------ 格式化

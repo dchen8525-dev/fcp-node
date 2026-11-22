@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FCP VPN · 界面方案对比</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+  }
+  body {
+    font-family: var(--font);
+    background: #101312;
+    color: #E8EDEB;
+    padding: 32px 24px 64px;
+    min-height: 100vh;
+  }
+  .page-head { max-width: 1720px; margin: 0 auto 28px; }
+  .page-head h1 { font-size: 22px; font-weight: 650; letter-spacing: -.01em; }
+  .page-head p { margin-top: 8px; font-size: 13px; color: #8A9691; line-height: 1.7; }
+  .page-head code {
+    font-family: var(--mono); font-size: 12px;
+    background: #1B201E; border: 1px solid #2A3130; border-radius: 6px; padding: 1px 6px;
+  }
+
+  .row {
+    display: flex; gap: 36px; justify-content: center;
+    flex-wrap: wrap; max-width: 1720px; margin: 0 auto;
+  }
+  .slot { width: 390px; }
+  .slot-head { margin-bottom: 14px; }
+  .slot-head h2 { font-size: 15px; font-weight: 650; }
+  .slot-head .tag {
+    display: inline-block; margin-left: 8px; font-size: 10px; font-weight: 600;
+    letter-spacing: .04em; text-transform: uppercase; color: #0B0F0E;
+    background: #7EE7CE; border-radius: 5px; padding: 2px 6px; vertical-align: 2px;
+  }
+  .slot-head p { margin-top: 6px; font-size: 12px; color: #8A9691; line-height: 1.6; }
+
+  /* ---------- 手机外壳 ---------- */
+  .phone {
+    width: 390px; height: 844px; border-radius: 42px; overflow: hidden;
+    position: relative; background: #000;
+    box-shadow: 0 24px 70px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.08);
+  }
+  .phone::after {
+    content: ""; position: absolute; left: 50%; bottom: 9px; transform: translateX(-50%);
+    width: 138px; height: 5px; border-radius: 3px; background: rgba(120,130,126,.55); z-index: 9;
+  }
+  .notch {
+    position: absolute; top: 11px; left: 50%; transform: translateX(-50%);
+    width: 118px; height: 30px; border-radius: 16px; background: #000; z-index: 8;
+  }
+  .status {
+    position: absolute; top: 0; left: 0; right: 0; height: 54px; z-index: 7;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 26px 0; font-size: 13px; font-weight: 600; letter-spacing: .01em;
+    pointer-events: none;
+  }
+  .status .icons { display: flex; gap: 5px; align-items: center; }
+  .status .icons i { display: block; height: 10px; border-radius: 2px; background: currentColor; }
+  .status .icons .sig { width: 15px; height: 10px; clip-path: polygon(0 70%,20% 70%,20% 100%,0 100%,0 70%,33% 46%,53% 46%,53% 100%,33% 100%,33% 46%,66% 22%,86% 22%,86% 100%,66% 100%,66% 22%,100% 0,100% 100%,100% 0); }
+  .status .icons .wifi { width: 14px; height: 10px; clip-path: polygon(50% 100%,0 32%,50% 0,100% 32%); }
+  .status .icons .batt { width: 22px; height: 11px; border-radius: 3px; position: relative; }
+  .status .icons .batt::after { content:""; position:absolute; right:-3px; top:3px; width:2px; height:5px; border-radius:0 2px 2px 0; background: currentColor; opacity:.6; }
+
+  .screen {
+    position: absolute; inset: 0; padding: 62px 22px 26px;
+    display: flex; flex-direction: column; overflow-y: auto; scrollbar-width: none;
+  }
+  .screen::-webkit-scrollbar { display: none; }
+  .screen[hidden] { display: none; }
+
+  button { font-family: inherit; cursor: pointer; border: 0; background: none; color: inherit; }
+  .ico { display: inline-flex; align-items: center; justify-content: center; }
+  .ico svg { width: 20px; height: 20px; display: block; }
+
+  /* ============================================================
+     A · 精致浅色卡片
+     ============================================================ */
+  .phone[data-t="a"] { background: linear-gradient(178deg,#F3F8F6 0%,#E8F1ED 62%,#E2EDE8 100%); }
+  .phone[data-t="a"] .status { color: #16211D; }
+  .phone[data-t="a"] .screen { color: #16211D; gap: 14px; }
+
+  .phone[data-t="a"] .brandbar {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px;
+  }
+  .phone[data-t="a"] .brand {
+    display: flex; align-items: center; gap: 9px;
+    font-size: 19px; font-weight: 700; letter-spacing: -.015em;
+  }
+  .phone[data-t="a"] .logo {
+    width: 28px; height: 28px; border-radius: 9px;
+    background: linear-gradient(145deg,#00B894,#00846A);
+    display: grid; place-items: center; color: #fff;
+  }
+  .phone[data-t="a"] .logo svg { width: 15px; height: 15px; }
+  .phone[data-t="a"] .gear { color: #5C6A64; padding: 4px; }
+
+  .phone[data-t="a"] .hero {
+    background: #fff; border-radius: 28px; padding: 22px;
+    box-shadow: 0 1px 2px rgba(16,33,29,.04), 0 10px 30px -12px rgba(16,33,29,.16);
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  .phone[data-t="a"] .hero-top { display: flex; align-items: flex-start; justify-content: space-between; }
+  .phone[data-t="a"] .state { display: flex; align-items: center; gap: 9px; }
+  .phone[data-t="a"] .dot { width: 9px; height: 9px; border-radius: 50%; background: #9AA8A2; }
+  .phone[data-t="a"] .hero[data-s="on"] .dot {
+    background: #00B894; box-shadow: 0 0 0 4px rgba(0,184,148,.16);
+    animation: pulse 2.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100%{box-shadow:0 0 0 3px rgba(0,184,148,.18)} 50%{box-shadow:0 0 0 7px rgba(0,184,148,.05)} }
+  .phone[data-t="a"] .hero[data-s="connecting"] .dot { background: #E8A317; box-shadow: 0 0 0 4px rgba(232,163,23,.16); }
+  .phone[data-t="a"] .state-label { font-size: 21px; font-weight: 650; letter-spacing: -.01em; }
+  .phone[data-t="a"] .badge {
+    font-size: 10.5px; font-weight: 600; color: #00604E; background: #D7F2EA;
+    border-radius: 7px; padding: 4px 8px; letter-spacing: .02em;
+  }
+  .phone[data-t="a"] .server {
+    font-family: var(--mono); font-size: 11.5px; color: #6A7871; margin-top: 5px;
+    letter-spacing: -.01em;
+  }
+  .phone[data-t="a"] .rate-block { padding: 2px 0 0; }
+  .phone[data-t="a"] .rate-label { font-size: 11px; color: #7A8780; font-weight: 500; margin-bottom: 3px; }
+  .phone[data-t="a"] .rate {
+    display: flex; align-items: baseline; gap: 6px;
+    font-variant-numeric: tabular-nums; letter-spacing: -.025em;
+  }
+  .phone[data-t="a"] .rate b { font-size: 42px; font-weight: 680; line-height: 1; }
+  .phone[data-t="a"] .rate span { font-size: 13px; font-weight: 600; color: #6A7871; }
+  .phone[data-t="a"] .metrics {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
+    padding-top: 16px; border-top: 1px solid #EDF2EF;
+  }
+  .phone[data-t="a"] .metric { display: flex; flex-direction: column; gap: 4px; }
+  .phone[data-t="a"] .metric .k { font-size: 10.5px; color: #8A968F; font-weight: 500; }
+  .phone[data-t="a"] .metric .v { font-size: 14px; font-weight: 620; font-variant-numeric: tabular-nums; }
+  .phone[data-t="a"] .main-btn {
+    height: 54px; border-radius: 27px; font-size: 15.5px; font-weight: 650;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    color: #fff; background: linear-gradient(135deg,#0E3B33,#16211D);
+    transition: transform .15s ease, box-shadow .2s ease, background .25s ease;
+    box-shadow: 0 8px 20px -10px rgba(16,33,29,.6);
+  }
+  .phone[data-t="a"] .main-btn:active { transform: scale(.975); }
+  .phone[data-t="a"] .hero[data-s="on"] .main-btn {
+    background: #FBEAE8; color: #A3241C; box-shadow: none;
+    border: 1px solid #F3D3CF;
+  }
+  .phone[data-t="a"] .hero[data-s="connecting"] .main-btn { background: linear-gradient(135deg,#E8A317,#C98A0B); }
+  .phone[data-t="a"] .main-btn .spin {
+    width: 15px; height: 15px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
+    animation: spin .8s linear infinite; display: none;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .phone[data-t="a"] .hero[data-s="connecting"] .main-btn .spin { display: block; }
+  .phone[data-t="a"] .hero[data-s="connecting"] .main-btn .play { display: none; }
+  .phone[data-t="a"] .hero[data-s="off"] .rate b,
+  .phone[data-t="a"] .hero[data-s="connecting"] .rate b { color: #B9C4BF; }
+
+  .phone[data-t="a"] .mini {
+    background: #fff; border-radius: 22px; padding: 16px 18px;
+    display: flex; align-items: center; justify-content: space-between;
+    box-shadow: 0 1px 2px rgba(16,33,29,.04);
+  }
+  .phone[data-t="a"] .mini .k { font-size: 13.5px; font-weight: 600; }
+  .phone[data-t="a"] .mini .sub { font-size: 11.5px; color: #8A968F; margin-top: 3px; }
+  .phone[data-t="a"] .mini .chev { color: #A8B4AE; }
+  .phone[data-t="a"] .foot {
+    margin-top: auto; display: flex; justify-content: center; gap: 26px; padding-top: 6px;
+  }
+  .phone[data-t="a"] .foot button { font-size: 12.5px; font-weight: 600; color: #5C6A64; display: flex; gap: 6px; align-items: center; }
+
+  /* ============================================================
+     B · 深色仪表盘
+     ============================================================ */
+  .phone[data-t="b"] { background: #0B1311; }
+  .phone[data-t="b"] .status { color: #C8D8D2; }
+  .phone[data-t="b"] .screen { color: #E6F1ED; gap: 12px; }
+
+  .phone[data-t="b"] .brandbar { display: flex; align-items: center; justify-content: space-between; }
+  .phone[data-t="b"] .brand { font-size: 15px; font-weight: 700; letter-spacing: .12em; color: #6F8A81; }
+  .phone[data-t="b"] .gear { color: #6F8A81; padding: 4px; }
+
+  .phone[data-t="b"] .strip {
+    display: flex; align-items: center; gap: 8px; font-size: 12px; color: #90A69E;
+  }
+  .phone[data-t="b"] .dot { width: 7px; height: 7px; border-radius: 50%; background: #4A5B55; }
+  .phone[data-t="b"] .strip[data-s="on"] .dot { background: #2EE6C5; box-shadow: 0 0 8px #2EE6C5; }
+  .phone[data-t="b"] .strip[data-s="connecting"] .dot { background: #F5B942; box-shadow: 0 0 8px #F5B942; }
+  .phone[data-t="b"] .strip .mono { font-family: var(--mono); font-size: 11.5px; color: #6F8A81; }
+  .phone[data-t="b"] .strip .sep { color: #33413C; }
+
+  .phone[data-t="b"] .chartcard {
+    background: #121D19; border: 1px solid #1E2C27; border-radius: 20px;
+    padding: 16px 16px 8px; position: relative; overflow: hidden;
+  }
+  .phone[data-t="b"] .chart-head { display: flex; align-items: baseline; justify-content: space-between; }
+  .phone[data-t="b"] .chart-head .now {
+    font-size: 30px; font-weight: 680; letter-spacing: -.03em; color: #2EE6C5;
+    font-variant-numeric: tabular-nums;
+  }
+  .phone[data-t="b"] .chart-head .now small { font-size: 12px; font-weight: 600; color: #6F8A81; margin-left: 4px; letter-spacing: 0; }
+  .phone[data-t="b"] .chart-head .lbl { font-size: 10.5px; color: #6F8A81; letter-spacing: .1em; text-transform: uppercase; }
+  .phone[data-t="b"] .chart { margin-top: 4px; display: block; width: 100%; height: 122px; }
+
+  .phone[data-t="b"] .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .phone[data-t="b"] .cell {
+    background: #121D19; border: 1px solid #1E2C27; border-radius: 16px; padding: 13px 15px;
+    display: flex; flex-direction: column; gap: 5px;
+  }
+  .phone[data-t="b"] .cell .k { font-size: 10.5px; color: #6F8A81; letter-spacing: .06em; text-transform: uppercase; }
+  .phone[data-t="b"] .cell .v { font-size: 16px; font-weight: 640; font-variant-numeric: tabular-nums; }
+  .phone[data-t="b"] .cell .v.mono { font-family: var(--mono); font-size: 12.5px; font-weight: 500; color: #B8CCC4; }
+  .phone[data-t="b"] .cell .v .u { font-size: 11px; color: #6F8A81; font-weight: 600; }
+
+  .phone[data-t="b"] .spacer { margin-top: auto; }
+  .phone[data-t="b"] .main-btn {
+    height: 52px; border-radius: 14px; font-size: 14.5px; font-weight: 650;
+    border: 1px solid #2EE6C5; color: #2EE6C5; background: rgba(46,230,197,.06);
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    transition: background .2s ease, color .2s ease;
+  }
+  .phone[data-t="b"] .main-btn:active { transform: scale(.985); }
+  .phone[data-t="b"] .main-btn[data-s="on"] { border-color: #4A5B55; color: #C8D8D2; background: rgba(255,255,255,.04); }
+  .phone[data-t="b"] .main-btn[data-s="connecting"] { border-color: #F5B942; color: #F5B942; background: rgba(245,185,66,.08); }
+  .phone[data-t="b"] .main-btn .spin {
+    width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid rgba(245,185,66,.3); border-top-color: #F5B942;
+    animation: spin .8s linear infinite; display: none;
+  }
+  .phone[data-t="b"] .main-btn[data-s="connecting"] .spin { display: block; }
+  .phone[data-t="b"] .main-btn[data-s="connecting"] .play { display: none; }
+
+  /* ============================================================
+     C · 中心圆环极简
+     ============================================================ */
+  .phone[data-t="c"] { background: #FAFBFA; }
+  .phone[data-t="c"] .status { color: #101413; }
+  .phone[data-t="c"] .screen { color: #101413; align-items: center; padding-top: 58px; }
+
+  .phone[data-t="c"] .topbar {
+    width: 100%; display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 4px;
+  }
+  .phone[data-t="c"] .brand { font-size: 13px; font-weight: 700; letter-spacing: .18em; color: #7C8983; }
+  .phone[data-t="c"] .gear { color: #7C8983; padding: 4px; }
+
+  .phone[data-t="c"] .ringwrap {
+    margin-top: 52px; position: relative; width: 250px; height: 250px;
+    display: grid; place-items: center;
+  }
+  .phone[data-t="c"] .ring {
+    position: absolute; inset: 0; transform: rotate(-90deg);
+  }
+  .phone[data-t="c"] .ring circle { fill: none; stroke-linecap: round; }
+  .phone[data-t="c"] .ring .track { stroke: #E7EDEA; stroke-width: 3; }
+  .phone[data-t="c"] .ring .prog {
+    stroke: #0AA88E; stroke-width: 3;
+    stroke-dasharray: 741; stroke-dashoffset: 0;
+    transition: stroke-dashoffset .5s ease, stroke .3s ease;
+  }
+  .phone[data-t="c"] .ringwrap[data-s="off"] .prog { stroke-dashoffset: 741; }
+  .phone[data-t="c"] .ringwrap[data-s="connecting"] .prog {
+    stroke-dashoffset: 555; stroke: #E8A317;
+    animation: spinslow 1.1s linear infinite; transform-origin: 50% 50%;
+  }
+  @keyframes spinslow { to { transform: rotate(360deg); } }
+
+  .phone[data-t="c"] .core {
+    width: 176px; height: 176px; border-radius: 50%;
+    background: #fff; display: grid; place-items: center; text-align: center;
+    box-shadow: 0 12px 40px -18px rgba(16,33,29,.35), 0 0 0 1px rgba(16,33,29,.04);
+    transition: box-shadow .3s ease;
+  }
+  .phone[data-t="c"] .ringwrap[data-s="on"] .core {
+    box-shadow: 0 0 0 1px rgba(10,168,142,.18), 0 16px 46px -18px rgba(10,168,142,.45);
+  }
+  .phone[data-t="c"] .core .power { color: #0AA88E; margin-bottom: 6px; }
+  .phone[data-t="c"] .ringwrap[data-s="off"] .core .power { color: #B4BFBA; }
+  .phone[data-t="c"] .ringwrap[data-s="connecting"] .core .power { color: #E8A317; }
+  .phone[data-t="c"] .core .lbl { font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
+  .phone[data-t="c"] .core .hint { font-size: 11px; color: #8A968F; margin-top: 4px; }
+
+  .phone[data-t="c"] .rates {
+    display: flex; gap: 44px; margin-top: 40px; text-align: center;
+  }
+  .phone[data-t="c"] .rates .col { display: flex; flex-direction: column; gap: 5px; }
+  .phone[data-t="c"] .rates .k { font-size: 11px; color: #8A968F; letter-spacing: .03em; }
+  .phone[data-t="c"] .rates .v { font-size: 19px; font-weight: 660; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .phone[data-t="c"] .rates .v small { font-size: 11px; color: #7C8983; font-weight: 600; }
+
+  .phone[data-t="c"] .bottom { margin-top: auto; width: 100%; text-align: center; padding-bottom: 6px; }
+  .phone[data-t="c"] .bottom .srv { font-family: var(--mono); font-size: 11.5px; color: #7C8983; }
+  .phone[data-t="c"] .bottom .mode { font-size: 11px; color: #A2ADA7; margin-top: 5px; }
+  .phone[data-t="c"] .bottom .links { margin-top: 14px; display: flex; justify-content: center; gap: 22px; }
+  .phone[data-t="c"] .bottom .links button { font-size: 12px; font-weight: 600; color: #4E5B56; }
+
+  /* ============================================================
+     D · 玻璃拟态
+     ============================================================ */
+  .phone[data-t="d"] {
+    background:
+      radial-gradient(120% 80% at 12% 4%, #6D5BF6 0%, transparent 58%),
+      radial-gradient(120% 90% at 88% 16%, #18B6A8 0%, transparent 56%),
+      radial-gradient(140% 100% at 50% 108%, #2B3BA0 0%, transparent 62%),
+      #0A0F2C;
+  }
+  .phone[data-t="d"] .status { color: #EDEFFF; }
+  .phone[data-t="d"] .screen { color: #F2F4FF; gap: 14px; }
+
+  .phone[data-t="d"] .brandbar { display: flex; align-items: center; justify-content: space-between; }
+  .phone[data-t="d"] .brand {
+    display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 680;
+    letter-spacing: -.01em;
+  }
+  .phone[data-t="d"] .logo {
+    width: 26px; height: 26px; border-radius: 8px;
+    background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.24);
+    backdrop-filter: blur(8px); display: grid; place-items: center;
+  }
+  .phone[data-t="d"] .logo svg { width: 14px; height: 14px; }
+  .phone[data-t="d"] .gear { color: rgba(255,255,255,.72); padding: 4px; }
+
+  .phone[data-t="d"] .glass {
+    background: rgba(255,255,255,.11);
+    border: 1px solid rgba(255,255,255,.2);
+    border-radius: 26px; padding: 20px;
+    backdrop-filter: blur(22px) saturate(160%);
+    -webkit-backdrop-filter: blur(22px) saturate(160%);
+    box-shadow: 0 20px 50px -24px rgba(4,8,32,.9), inset 0 1px 0 rgba(255,255,255,.22);
+  }
+  .phone[data-t="d"] .hero { display: flex; flex-direction: column; gap: 16px; }
+  .phone[data-t="d"] .state { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; letter-spacing: .01em; }
+  .phone[data-t="d"] .dot { width: 8px; height: 8px; border-radius: 50%; background: rgba(255,255,255,.42); }
+  .phone[data-t="d"] .hero[data-s="on"] .dot { background: #6EF0D2; box-shadow: 0 0 10px #6EF0D2; }
+  .phone[data-t="d"] .hero[data-s="connecting"] .dot { background: #FFD166; box-shadow: 0 0 10px #FFD166; }
+  .phone[data-t="d"] .srv { font-family: var(--mono); font-size: 11px; color: rgba(255,255,255,.6); margin-top: -6px; }
+
+  .phone[data-t="d"] .big {
+    display: flex; align-items: baseline; gap: 7px; font-variant-numeric: tabular-nums;
+    margin-top: 2px;
+  }
+  .phone[data-t="d"] .big b { font-size: 38px; font-weight: 700; letter-spacing: -.03em; }
+  .phone[data-t="d"] .big span { font-size: 12px; color: rgba(255,255,255,.66); font-weight: 600; }
+  .phone[data-t="d"] .big .dir { font-size: 11px; color: rgba(255,255,255,.5); margin-left: 2px; }
+
+  .phone[data-t="d"] .main-btn {
+    height: 52px; border-radius: 26px; font-size: 15px; font-weight: 660;
+    background: #fff; color: #14183C;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    box-shadow: 0 10px 26px -12px rgba(0,0,0,.6);
+    transition: transform .15s ease, background .25s ease, color .25s ease;
+  }
+  .phone[data-t="d"] .main-btn:active { transform: scale(.975); }
+  .phone[data-t="d"] .hero[data-s="on"] .main-btn {
+    background: rgba(10,15,44,.3); color: #fff; box-shadow: none;
+    border: 1px solid rgba(255,255,255,.36);
+  }
+  .phone[data-t="d"] .hero[data-s="connecting"] .main-btn { background: rgba(255,209,102,.16); color: #FFD166; box-shadow: none; }
+  .phone[data-t="d"] .main-btn .spin {
+    width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid rgba(255,209,102,.3); border-top-color: #FFD166;
+    animation: spin .8s linear infinite; display: none;
+  }
+  .phone[data-t="d"] .hero[data-s="connecting"] .main-btn .spin { display: block; }
+  .phone[data-t="d"] .hero[data-s="connecting"] .main-btn .play { display: none; }
+
+  .phone[data-t="d"] .tiles { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 9px; }
+  .phone[data-t="d"] .tile {
+    background: rgba(255,255,255,.09); border: 1px solid rgba(255,255,255,.16);
+    border-radius: 18px; padding: 12px 12px 11px;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  }
+  .phone[data-t="d"] .tile .k { font-size: 10px; color: rgba(255,255,255,.58); font-weight: 500; }
+  .phone[data-t="d"] .tile .v { font-size: 15px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+
+  .phone[data-t="d"] .linkcard {
+    display: flex; align-items: center; justify-content: space-between;
+    background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.15);
+    border-radius: 20px; padding: 15px 18px;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  }
+  .phone[data-t="d"] .linkcard .k { font-size: 13px; font-weight: 600; }
+  .phone[data-t="d"] .linkcard .sub { font-size: 11px; color: rgba(255,255,255,.6); margin-top: 3px; }
+  .phone[data-t="d"] .linkcard .chev { color: rgba(255,255,255,.55); }
+  .phone[data-t="d"] .foot { margin-top: auto; display: flex; justify-content: center; gap: 26px; padding-top: 4px; }
+  .phone[data-t="d"] .foot button { font-size: 12px; font-weight: 600; color: rgba(255,255,255,.72); }
+
+  /* ============================================================
+     设置页（四套共用结构，配色随主题）
+     ============================================================ */
+  .set-head { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .set-head .back { padding: 4px; }
+  .set-head h2 { font-size: 20px; font-weight: 680; letter-spacing: -.015em; }
+
+  .set-group { margin-bottom: 12px; }
+  .set-group > .glabel {
+    font-size: 11px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase;
+    margin: 0 4px 7px; opacity: .55;
+  }
+  .set-card { border-radius: 20px; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+  .set-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .set-row .k { font-size: 13.5px; font-weight: 500; }
+  .set-row .sub { font-size: 11px; opacity: .55; margin-top: 3px; }
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label { font-size: 11px; opacity: .55; }
+  .field input {
+    height: 44px; border-radius: 12px; padding: 0 13px; font-size: 14px;
+    font-family: inherit; width: 100%;
+  }
+  .split { display: grid; grid-template-columns: 1fr 96px; gap: 10px; }
+  .seg { display: flex; padding: 3px; border-radius: 13px; gap: 3px; }
+  .seg button {
+    flex: 1; height: 38px; border-radius: 10px; font-size: 13px; font-weight: 620;
+    transition: background .2s ease, color .2s ease;
+  }
+  .switch {
+    width: 42px; height: 25px; border-radius: 13px; position: relative; flex: none;
+    transition: background .2s ease;
+  }
+  .switch::after {
+    content: ""; position: absolute; top: 3px; width: 19px; height: 19px; border-radius: 50%;
+    background: #fff; transition: left .2s ease; box-shadow: 0 1px 3px rgba(0,0,0,.25);
+  }
+  .switch[data-on="1"]::after { left: 20px; }
+  .switch[data-on="0"]::after { left: 3px; }
+  .save-btn {
+    height: 52px; border-radius: 26px; font-size: 15px; font-weight: 650;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  /* 主题 A 设置页 */
+  .phone[data-t="a"] .set-card { background: #fff; box-shadow: 0 1px 2px rgba(16,33,29,.04); }
+  .phone[data-t="a"] .field input { background: #F4F8F6; border: 1px solid #E2EAE6; color: #16211D; }
+  .phone[data-t="a"] .field input:focus { outline: 2px solid #00B894; outline-offset: -1px; border-color: transparent; }
+  .phone[data-t="a"] .seg { background: #EFF4F1; }
+  .phone[data-t="a"] .seg button { color: #5C6A64; }
+  .phone[data-t="a"] .seg button[data-on="1"] { background: #fff; color: #00604E; box-shadow: 0 1px 4px rgba(16,33,29,.12); }
+  .phone[data-t="a"] .switch[data-on="1"] { background: #00B894; }
+  .phone[data-t="a"] .switch[data-on="0"] { background: #D3DDD8; }
+  .phone[data-t="a"] .save-btn { background: linear-gradient(135deg,#0E3B33,#16211D); color: #fff; margin-top: 4px; }
+
+  /* 主题 B 设置页 */
+  .phone[data-t="b"] .set-card { background: #121D19; border: 1px solid #1E2C27; }
+  .phone[data-t="b"] .field input { background: #0C1512; border: 1px solid #24332D; color: #E6F1ED; font-family: var(--mono); font-size: 12.5px; }
+  .phone[data-t="b"] .field input:focus { outline: 1px solid #2EE6C5; outline-offset: -1px; }
+  .phone[data-t="b"] .seg { background: #0C1512; border: 1px solid #24332D; }
+  .phone[data-t="b"] .seg button { color: #7A8F88; }
+  .phone[data-t="b"] .seg button[data-on="1"] { background: rgba(46,230,197,.14); color: #2EE6C5; }
+  .phone[data-t="b"] .switch[data-on="1"] { background: #2EE6C5; }
+  .phone[data-t="b"] .switch[data-on="0"] { background: #2A3934; }
+  .phone[data-t="b"] .save-btn { background: #2EE6C5; color: #06120F; margin-top: 4px; }
+
+  /* 主题 C 设置页 */
+  .phone[data-t="c"] .set-card { background: #fff; box-shadow: 0 1px 2px rgba(16,33,29,.05), 0 8px 24px -20px rgba(16,33,29,.4); }
+  .phone[data-t="c"] .field input { background: #F6F8F7; border: 1px solid #E6ECE9; color: #101413; }
+  .phone[data-t="c"] .field input:focus { outline: 2px solid #0AA88E; outline-offset: -1px; border-color: transparent; }
+  .phone[data-t="c"] .seg { background: #F1F5F3; }
+  .phone[data-t="c"] .seg button { color: #7C8983; }
+  .phone[data-t="c"] .seg button[data-on="1"] { background: #fff; color: #0A7F6B; box-shadow: 0 1px 4px rgba(16,33,29,.1); }
+  .phone[data-t="c"] .switch[data-on="1"] { background: #0AA88E; }
+  .phone[data-t="c"] .switch[data-on="0"] { background: #DBE3DF; }
+  .phone[data-t="c"] .save-btn { background: #101413; color: #fff; border-radius: 14px; margin-top: 4px; }
+
+  /* 主题 D 设置页 */
+  .phone[data-t="d"] .set-card {
+    background: rgba(255,255,255,.11); border: 1px solid rgba(255,255,255,.2);
+    backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+  }
+  .phone[data-t="d"] .field input {
+    background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.2); color: #F2F4FF;
+  }
+  .phone[data-t="d"] .field input:focus { outline: 2px solid rgba(255,255,255,.55); outline-offset: -1px; }
+  .phone[data-t="d"] .seg { background: rgba(255,255,255,.09); }
+  .phone[data-t="d"] .seg button { color: rgba(255,255,255,.66); }
+  .phone[data-t="d"] .seg button[data-on="1"] { background: rgba(255,255,255,.9); color: #14183C; }
+  .phone[data-t="d"] .switch[data-on="1"] { background: #6EF0D2; }
+  .phone[data-t="d"] .switch[data-on="0"] { background: rgba(255,255,255,.22); }
+  .phone[data-t="d"] .save-btn { background: #fff; color: #14183C; margin-top: 4px; }
+
+  /* C 的主页是居中布局（align-items:center），设置页必须恢复拉伸，
+     否则表单卡片和保存按钮会按内容宽度塌陷。 */
+  .phone[data-t="c"] .screen[data-view="settings"] { align-items: stretch; }
+
+  /* 各主题设置页文字色 */
+  .phone[data-t="b"] .glabel { color: #8FA79E; opacity: 1; }
+  .phone[data-t="d"] .glabel { color: rgba(255,255,255,.7); opacity: 1; }
+  .phone[data-t="a"] .set-card, .phone[data-t="c"] .set-card { color: #16211D; }
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <h1>FCP VPN · 界面方案对比</h1>
+  <p>
+    四套都做了<b>主页 + 设置页</b>，点手机里的按钮可切换 <code>已连接 / 连接中 / 断开</code>，点右上角齿轮进入设置。
+    数据用真实的（144.34.186.164:4461、1.24 MB/s、3 会话）。
+  </p>
+</div>
+
+<div class="row">
+
+  <!-- ================= A · 精致浅色卡片 ================= -->
+  <section class="slot">
+    <div class="slot-head">
+      <h2>A · 精致浅色卡片 <span class="tag">稳</span></h2>
+      <p>保留你现在的信息结构，但收紧层级：一个大数字做视觉焦点，卡片去阴影、加圆角与留白节奏。改动最小、最保险。</p>
+    </div>
+    <div class="phone" data-t="a">
+      <div class="notch"></div>
+      <div class="status"><span>3:55</span><span class="icons"><i class="sig"></i><i class="wifi"></i><i class="batt"></i></span></div>
+
+      <div class="screen" data-view="home">
+        <div class="brandbar">
+          <div class="brand">
+            <span class="logo"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 3 6v6c0 5.2 3.8 9.9 9 10 5.2-.1 9-4.8 9-10V6l-9-4z"/></svg></span>
+            FCP
+          </div>
+          <button class="gear" data-goto="settings"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2 2 2 0 1 1-4 0 1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15a2 2 0 1 1 0-4 1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 4.6a2 2 0 1 1 4 0 1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 21 11a2 2 0 1 1 0 4z"/></svg></span></button>
+        </div>
+
+        <div class="hero" data-s="on" data-hero="a">
+          <div class="hero-top">
+            <div>
+              <div class="state"><span class="dot"></span><span class="state-label">已连接</span></div>
+              <div class="server">144.34.186.164:4461</div>
+            </div>
+            <span class="badge">VPN 全局</span>
+          </div>
+
+          <div class="rate-block">
+            <div class="rate-label">↓ 下行速率</div>
+            <div class="rate"><b>1.24</b><span>MB/s</span></div>
+          </div>
+
+          <div class="metrics">
+            <div class="metric"><span class="k">↑ 上行</span><span class="v">86 KB/s</span></div>
+            <div class="metric"><span class="k">会话</span><span class="v">3</span></div>
+            <div class="metric"><span class="k">时长</span><span class="v">12:34</span></div>
+          </div>
+
+          <button class="main-btn" data-toggle="a" data-s="on">
+            <span class="spin"></span>
+            <span class="ico play"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></span>
+            <span class="label">断开</span>
+          </button>
+        </div>
+
+        <div class="mini">
+          <div>
+            <div class="k">按应用代理</div>
+            <div class="sub">仅 Chrome 走 VPN</div>
+          </div>
+          <span class="chev ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 6 6 6-6 6"/></svg></span>
+        </div>
+
+        <div class="foot">
+          <button><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M4 12h16M4 18h10"/></svg></span>日志</button>
+          <button data-goto="settings"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2 2 2 0 1 1-4 0 1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15a2 2 0 1 1 0-4 1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 4.6a2 2 0 1 1 4 0 1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 21 11a2 2 0 1 1 0 4z"/></svg></span>设置</button>
+        </div>
+      </div>
+
+      <div class="screen" data-view="settings" hidden>
+        <div class="set-head">
+          <button class="back" data-goto="home"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 6-6 6 6 6"/></svg></span></button>
+          <h2>设置</h2>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">服务器</div>
+          <div class="set-card">
+            <div class="split">
+              <div class="field"><label>地址</label><input value="144.34.186.164" readonly></div>
+              <div class="field"><label>UDP 端口</label><input value="4461" readonly></div>
+            </div>
+            <div class="field"><label>共享密钥 (32 位十六进制)</label><input value="••••••••••••••••••••••••••••••••" readonly></div>
+          </div>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">运行模式</div>
+          <div class="set-card">
+            <div class="seg"><button data-on="1">VPN 全局</button><button data-on="0">代理服务</button></div>
+            <div class="sub" style="font-size:11px;opacity:.55;line-height:1.6">接管手机上所有应用的流量（需要授权 VPN）</div>
+          </div>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">高级</div>
+          <div class="set-card">
+            <div class="set-row"><div><div class="k">按应用代理</div><div class="sub">仅 Chrome 走 VPN</div></div><span class="chev ico" style="opacity:.4"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 6 6 6-6 6"/></svg></span></div>
+            <div class="set-row"><div class="k">记住密钥</div><div class="switch" data-on="1"></div></div>
+          </div>
+        </div>
+
+        <button class="save-btn">保存</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= B · 深色仪表盘 ================= -->
+  <section class="slot">
+    <div class="slot-head">
+      <h2>B · 深色仪表盘 <span class="tag">专业</span></h2>
+      <p>把速率当主角：60 秒曲线 + 青色发光。适合长时间挂着的工具型使用，夜里看最舒服。</p>
+    </div>
+    <div class="phone" data-t="b">
+      <div class="notch"></div>
+      <div class="status"><span>3:55</span><span class="icons"><i class="sig"></i><i class="wifi"></i><i class="batt"></i></span></div>
+
+      <div class="screen" data-view="home">
+        <div class="brandbar">
+          <span class="brand">FCP</span>
+          <button class="gear" data-goto="settings"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2 2 2 0 1 1-4 0 1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15a2 2 0 1 1 0-4 1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 4.6a2 2 0 1 1 4 0 1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 21 11a2 2 0 1 1 0 4z"/></svg></span></button>
+        </div>
+
+        <div class="strip" data-s="on" data-strip="b"><span class="dot"></span><span>已连接</span><span class="sep">·</span><span class="mono">144.34.186.164:4461</span><span class="sep">·</span><span class="mono">12:34</span></div>
+
+        <div class="chartcard">
+          <div class="chart-head">
+            <div><div class="lbl">下行</div><div class="now">1.24<small>MB/s</small></div></div>
+            <div style="text-align:right"><div class="lbl">峰值</div><div style="font-size:12.5px;color:#90A69E;font-variant-numeric:tabular-nums">2.87 MB/s</div></div>
+          </div>
+          <svg class="chart" viewBox="0 0 320 122" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="gA" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#2EE6C5" stop-opacity=".42"/>
+                <stop offset="100%" stop-color="#2EE6C5" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <path d="M0 92 L20 84 L40 88 L60 66 L80 72 L100 48 L120 58 L140 38 L160 46 L180 30 L200 42 L220 24 L240 34 L260 18 L280 30 L300 22 L320 26 L320 122 L0 122 Z" fill="url(#gA)"/>
+            <path d="M0 92 L20 84 L40 88 L60 66 L80 72 L100 48 L120 58 L140 38 L160 46 L180 30 L200 42 L220 24 L240 34 L260 18 L280 30 L300 22 L320 26" fill="none" stroke="#2EE6C5" stroke-width="1.8" stroke-linejoin="round"/>
+          </svg>
+        </div>
+
+        <div class="grid2">
+          <div class="cell"><span class="k">上行</span><span class="v">86 <span class="u">KB/s</span></span></div>
+          <div class="cell"><span class="k">会话</span><span class="v">3</span></div>
+          <div class="cell"><span class="k">本地代理</span><span class="v mono">127.0.0.1:1080</span></div>
+          <div class="cell"><span class="k">模式</span><span class="v" style="font-size:13.5px">VPN 全局</span></div>
+        </div>
+
+        <div class="spacer"></div>
+        <button class="main-btn" data-toggle="b" data-s="on">
+          <span class="spin"></span>
+          <span class="ico play"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></span>
+          <span class="label">断开</span>
+        </button>
+      </div>
+
+      <div class="screen" data-view="settings" hidden>
+        <div class="set-head">
+          <button class="back" data-goto="home"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 6-6 6 6 6"/></svg></span></button>
+          <h2>设置</h2>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">服务器</div>
+          <div class="set-card">
+            <div class="split">
+              <div class="field"><label>地址</label><input value="144.34.186.164" readonly></div>
+              <div class="field"><label>UDP</label><input value="4461" readonly></div>
+            </div>
+            <div class="field"><label>密钥</label><input value="••••••••••••••••••••••••••••••••" readonly></div>
+          </div>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">运行模式</div>
+          <div class="set-card">
+            <div class="seg"><button data-on="1">VPN 全局</button><button data-on="0">代理服务</button></div>
+            <div style="font-size:11px;color:#7A8F88;line-height:1.6">接管手机上所有应用的流量（需要授权 VPN）</div>
+          </div>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">高级</div>
+          <div class="set-card">
+            <div class="set-row"><div><div class="k">按应用代理</div><div class="sub">仅 Chrome 走 VPN</div></div><span class="chev ico" style="opacity:.4"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 6 6 6-6 6"/></svg></span></div>
+            <div class="set-row"><div class="k">记住密钥</div><div class="switch" data-on="1"></div></div>
+          </div>
+        </div>
+
+        <button class="save-btn">保存</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= C · 中心圆环 ================= -->
+  <section class="slot">
+    <div class="slot-head">
+      <h2>C · 中心圆环 <span class="tag">极简</span></h2>
+      <p>向 WireGuard / 1.1.1.1 靠：一屏只有一个按钮，圆环本身就是状态。信息最少，抬手就能按。</p>
+    </div>
+    <div class="phone" data-t="c">
+      <div class="notch"></div>
+      <div class="status"><span>3:55</span><span class="icons"><i class="sig"></i><i class="wifi"></i><i class="batt"></i></span></div>
+
+      <div class="screen" data-view="home">
+        <div class="topbar">
+          <span class="brand">FCP VPN</span>
+          <button class="gear" data-goto="settings"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2 2 2 0 1 1-4 0 1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15a2 2 0 1 1 0-4 1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 4.6a2 2 0 1 1 4 0 1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 21 11a2 2 0 1 1 0 4z"/></svg></span></button>
+        </div>
+
+        <div class="ringwrap" data-s="on" data-ring="c">
+          <svg class="ring" viewBox="0 0 250 250">
+            <circle class="track" cx="125" cy="125" r="118"/>
+            <circle class="prog" cx="125" cy="125" r="118"/>
+          </svg>
+          <button class="core" data-toggle="c" data-s="on">
+            <div>
+              <div class="power ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:34px;height:34px"><path d="M12 3v9"/><path d="M6.4 6.4a8 8 0 1 0 11.2 0"/></svg></div>
+              <div class="lbl">已连接</div>
+              <div class="hint">轻触断开</div>
+            </div>
+          </button>
+        </div>
+
+        <div class="rates">
+          <div class="col"><span class="k">↓ 下行</span><span class="v">1.24 <small>MB/s</small></span></div>
+          <div class="col"><span class="k">↑ 上行</span><span class="v">86 <small>KB/s</small></span></div>
+        </div>
+
+        <div class="bottom">
+          <div class="srv">144.34.186.164:4461</div>
+          <div class="mode">VPN 全局 · 12:34 · 3 会话</div>
+          <div class="links">
+            <button data-goto="settings">设置</button>
+            <button>日志</button>
+            <button>按应用</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="screen" data-view="settings" hidden>
+        <div class="set-head">
+          <button class="back" data-goto="home"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 6-6 6 6 6"/></svg></span></button>
+          <h2>设置</h2>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">服务器</div>
+          <div class="set-card">
+            <div class="split">
+              <div class="field"><label>地址</label><input value="144.34.186.164" readonly></div>
+              <div class="field"><label>UDP</label><input value="4461" readonly></div>
+            </div>
+            <div class="field"><label>密钥</label><input value="••••••••••••••••••••••••••••••••" readonly></div>
+          </div>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">运行模式</div>
+          <div class="set-card">
+            <div class="seg"><button data-on="1">VPN 全局</button><button data-on="0">代理服务</button></div>
+            <div style="font-size:11px;color:#8A968F;line-height:1.6">接管手机上所有应用的流量（需要授权 VPN）</div>
+          </div>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">高级</div>
+          <div class="set-card">
+            <div class="set-row"><div><div class="k">按应用代理</div><div class="sub">仅 Chrome 走 VPN</div></div><span class="chev ico" style="opacity:.4"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 6 6 6-6 6"/></svg></span></div>
+            <div class="set-row"><div class="k">记住密钥</div><div class="switch" data-on="1"></div></div>
+          </div>
+        </div>
+
+        <button class="save-btn">保存</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= D · 玻璃拟态 ================= -->
+  <section class="slot">
+    <div class="slot-head">
+      <h2>D · 玻璃拟态 <span class="tag">新潮</span></h2>
+      <p>渐变底 + 半透明磨砂卡片，视觉最"贵"。注意：模糊背景在低端机上略耗电，深色下对比度要盯紧。</p>
+    </div>
+    <div class="phone" data-t="d">
+      <div class="notch"></div>
+      <div class="status"><span>3:55</span><span class="icons"><i class="sig"></i><i class="wifi"></i><i class="batt"></i></span></div>
+
+      <div class="screen" data-view="home">
+        <div class="brandbar">
+          <div class="brand">
+            <span class="logo"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 3 6v6c0 5.2 3.8 9.9 9 10 5.2-.1 9-4.8 9-10V6l-9-4z"/></svg></span>
+            FCP
+          </div>
+          <button class="gear" data-goto="settings"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2 2 2 0 1 1-4 0 1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15a2 2 0 1 1 0-4 1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 4.6a2 2 0 1 1 4 0 1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 21 11a2 2 0 1 1 0 4z"/></svg></span></button>
+        </div>
+
+        <div class="glass hero" data-s="on" data-hero="d">
+          <div class="state"><span class="dot"></span>已连接 · VPN 全局</div>
+          <div class="srv">144.34.186.164:4461</div>
+          <div class="big"><b>1.24</b><span>MB/s</span><span class="dir">↓ 下行</span></div>
+          <button class="main-btn" data-toggle="d" data-s="on">
+            <span class="spin"></span>
+            <span class="ico play"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></span>
+            <span class="label">断开</span>
+          </button>
+        </div>
+
+        <div class="tiles">
+          <div class="tile"><div class="k">↑ 上行</div><div class="v">86 KB/s</div></div>
+          <div class="tile"><div class="k">会话</div><div class="v">3</div></div>
+          <div class="tile"><div class="k">时长</div><div class="v">12:34</div></div>
+        </div>
+
+        <div class="linkcard">
+          <div>
+            <div class="k">按应用代理</div>
+            <div class="sub">仅 Chrome 走 VPN</div>
+          </div>
+          <span class="chev ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 6 6 6-6 6"/></svg></span>
+        </div>
+
+        <div class="foot">
+          <button>日志</button>
+          <button data-goto="settings">设置</button>
+        </div>
+      </div>
+
+      <div class="screen" data-view="settings" hidden>
+        <div class="set-head">
+          <button class="back" data-goto="home"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 6-6 6 6 6"/></svg></span></button>
+          <h2>设置</h2>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">服务器</div>
+          <div class="set-card">
+            <div class="split">
+              <div class="field"><label>地址</label><input value="144.34.186.164" readonly></div>
+              <div class="field"><label>UDP</label><input value="4461" readonly></div>
+            </div>
+            <div class="field"><label>密钥</label><input value="••••••••••••••••••••••••••••••••" readonly></div>
+          </div>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">运行模式</div>
+          <div class="set-card">
+            <div class="seg"><button data-on="1">VPN 全局</button><button data-on="0">代理服务</button></div>
+            <div style="font-size:11px;color:rgba(255,255,255,.6);line-height:1.6">接管手机上所有应用的流量（需要授权 VPN）</div>
+          </div>
+        </div>
+
+        <div class="set-group">
+          <div class="glabel">高级</div>
+          <div class="set-card">
+            <div class="set-row"><div><div class="k">按应用代理</div><div class="sub">仅 Chrome 走 VPN</div></div><span class="chev ico" style="opacity:.5"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 6 6 6-6 6"/></svg></span></div>
+            <div class="set-row"><div class="k">记住密钥</div><div class="switch" data-on="1"></div></div>
+          </div>
+        </div>
+
+        <button class="save-btn">保存</button>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+  // 视图切换（主页 <-> 设置）
+  document.querySelectorAll('[data-goto]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const phone = btn.closest('.phone');
+      const want = btn.dataset.goto;
+      phone.querySelectorAll('.screen').forEach((s) => {
+        s.hidden = s.dataset.view !== want;
+      });
+    });
+  });
+
+  // 状态切换：on -> connecting -> off -> on
+  const LABEL = { on: '断开', connecting: '连接中…', off: '连接' };
+  const STATE_TEXT = { on: '已连接', connecting: '连接中', off: '已断开' };
+  const HINT = { on: '轻触断开', connecting: '正在握手…', off: '轻触连接' };
+
+  document.querySelectorAll('[data-toggle]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const phone = btn.closest('.phone');
+      const key = btn.dataset.toggle;
+      let s = btn.dataset.s;
+      s = s === 'on' ? 'connecting' : (s === 'connecting' ? 'off' : 'on');
+      btn.dataset.s = s;
+
+      // 同步所有相关节点
+      phone.querySelectorAll('[data-s]').forEach((node) => {
+        if (node.hasAttribute('data-toggle') || node.hasAttribute('data-hero')
+            || node.hasAttribute('data-strip') || node.hasAttribute('data-ring')) {
+          node.dataset.s = s;
+        }
+      });
+      const label = btn.querySelector('.label');
+      if (label) label.textContent = LABEL[s];
+
+      // C 方案的状态文案在圆环内部
+      const ring = phone.querySelector('[data-ring]');
+      if (ring) {
+        ring.querySelector('.lbl').textContent = STATE_TEXT[s];
+        ring.querySelector('.hint').textContent = HINT[s];
+      }
+      // B 方案顶部状态条
+      const strip = phone.querySelector('[data-strip]');
+      if (strip) strip.querySelector('span:nth-child(2)').textContent = STATE_TEXT[s];
+      // A/D 方案的状态文字
+      const stLabel = phone.querySelector('.hero .state-label');
+      if (stLabel) stLabel.textContent = STATE_TEXT[s];
+      const dState = phone.querySelector('.hero .state');
+      if (dState && phone.dataset.t === 'd') {
+        dState.innerHTML = '<span class="dot"></span>' + STATE_TEXT[s] + ' · VPN 全局';
+      }
+    });
+  });
+
+  // 分段控件 / 开关的演示交互
+  document.querySelectorAll('.seg').forEach((seg) => {
+    seg.querySelectorAll('button').forEach((b) => {
+      b.addEventListener('click', () => {
+        seg.querySelectorAll('button').forEach((x) => x.dataset.on = '0');
+        b.dataset.on = '1';
+      });
+    });
+  });
+  document.querySelectorAll('.switch').forEach((sw) => {
+    sw.addEventListener('click', () => { sw.dataset.on = sw.dataset.on === '1' ? '0' : '1'; });
+  });
+</script>
+</body>
+</html>
