@@ -112,6 +112,10 @@
             <input id="remember" type="checkbox" checked />
             <span>记住设置（含密钥，保存在本机用户配置目录）</span>
           </label>
+          <label class="check">
+            <input id="sysProxy" type="checkbox" />
+            <span>连接时设为 Windows 系统代理（浏览器等应用无需单独配置；断开自动恢复）</span>
+          </label>
         </div>
 
         <div class="card">
@@ -193,6 +197,12 @@
             <div><span>已建立</span><strong id="kUp">0</strong></div>
             <div><span>运行时长</span><strong id="kUptime">—</strong></div>
             <div><span>本地代理</span><strong class="mono" id="kListen">—</strong></div>
+            <div><span>系统代理</span><strong id="kSysProxy">—</strong></div>
+          </div>
+          <div class="sysproxy-row">
+            <button class="ghost" id="sysProxyApplyBtn" type="button">设为系统代理</button>
+            <button class="ghost" id="sysProxyRestoreBtn" type="button">取消系统代理</button>
+            <span class="card-note" id="sysProxyNote"></span>
           </div>
         </div>
       </section>

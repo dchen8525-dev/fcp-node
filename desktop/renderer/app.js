@@ -17,6 +17,9 @@ const el = {
   rxRate: $('rxRate'), rxTotal: $('rxTotal'), txRate: $('txRate'), txTotal: $('txTotal'),
   chart: $('chart'), chartPeak: $('chartPeak'),
   kSessions: $('kSessions'), kUp: $('kUp'), kUptime: $('kUptime'), kListen: $('kListen'),
+  sysProxy: $('sysProxy'), kSysProxy: $('kSysProxy'),
+  sysProxyApplyBtn: $('sysProxyApplyBtn'), sysProxyRestoreBtn: $('sysProxyRestoreBtn'),
+  sysProxyNote: $('sysProxyNote'),
   probeNowBtn: $('probeNowBtn'),
   probeWhen: $('probeWhen'), probeDown: $('probeDown'), probeDownSub: $('probeDownSub'),
   probeUp: $('probeUp'), probeUpSub: $('probeUpSub'), probeAt: $('probeAt'),
@@ -251,6 +254,7 @@ function collectSettings() {
     probeInterval: probeMin > 0
       ? Math.min(86400, Math.max(30, Math.round(probeMin * 60))) : 0,
     remember: el.remember.checked,
+    systemProxy: el.sysProxy.checked,
   };
 }
 
@@ -298,16 +302,59 @@ function applySettings(s) {
   }
   if (s.probe === false) el.probeInterval.value = '0';
   if (typeof s.remember === 'boolean') el.remember.checked = s.remember;
+  if (typeof s.systemProxy === 'boolean') el.sysProxy.checked = s.systemProxy;
 }
 
 document.querySelectorAll('input, select').forEach((node) => {
   node.addEventListener('change', scheduleSave);
 });
 
+
+// ---------------------------------------------------------------- 系统代理
+
+/** 渲染 Windows 系统代理的接管状态。 */
+function renderSysProxy(st) {
+  if (!st) return;
+  if (!st.supported) {
+    el.kSysProxy.textContent = '仅 Windows';
+    el.sysProxyApplyBtn.disabled = true;
+    el.sysProxyRestoreBtn.disabled = true;
+    el.sysProxyNote.textContent = '当前平台不支持';
+    return;
+  }
+  el.kSysProxy.textContent = st.applied ? '已接管' : (st.enabled ? '其他代理' : '未设置');
+  el.kSysProxy.title = st.server ? `当前系统代理：${st.server}` : '当前未启用系统代理';
+  el.sysProxyApplyBtn.disabled = st.applied || !state.running;
+  el.sysProxyRestoreBtn.disabled = !st.applied;
+  el.sysProxyNote.textContent = st.applied
+    ? `全部应用经 ${st.target} 出网`
+    : (state.running ? '可手动接管，或勾选"连接时设为系统代理"' : '连接后可接管');
+}
+
+async function refreshSysProxy() {
+  try {
+    renderSysProxy(await window.fcp.sysProxyStatus());
+  } catch { /* 主进程退出中 */ }
+}
+
+el.sysProxyApplyBtn.addEventListener('click', async () => {
+  const r = await window.fcp.sysProxyApply();
+  if (!r.ok) el.sysProxyNote.textContent = r.reason || '设置失败';
+  refreshSysProxy();
+});
+el.sysProxyRestoreBtn.addEventListener('click', async () => {
+  const r = await window.fcp.sysProxyRestore();
+  if (!r.ok) el.sysProxyNote.textContent = r.reason || '恢复失败';
+  refreshSysProxy();
+});
+window.fcp.onSysProxy((st) => renderSysProxy(st));
+el.sysProxy.addEventListener('change', scheduleSave);
+
 // ---------------------------------------------------------------- start/stop
 
 function setRunning(on) {
   state.running = on;
+  refreshSysProxy();
   el.toggleBtn.textContent = on ? '停止代理' : '启动代理';
   el.toggleBtn.classList.toggle('is-stop', on);
   el.stateDot.classList.toggle('on', on);

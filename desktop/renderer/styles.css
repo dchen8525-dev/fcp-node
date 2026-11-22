@@ -886,7 +886,8 @@ select option { background: var(--card); color: var(--ink); }
 .chart-card { padding-bottom: 12px; }
 #chart { display: block; width: 100%; height: 150px; }
 
-.kv-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.kv-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+.sysproxy-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 .kv-grid > div { display: flex; flex-direction: column; gap: 5px; }
 .kv-grid span { font-size: 11px; color: var(--muted-2); }
 .kv-grid strong {

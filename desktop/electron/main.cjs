@@ -7,6 +7,7 @@ const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, nativeTheme
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
+const sysproxy = require('./system-proxy.cjs');
 
 const CLI_PATH = path.join(__dirname, '..', 'resources', 'cli.mjs');
 const ICON_PATH = path.join(__dirname, '..', 'resources', 'icon.png');
@@ -246,6 +247,12 @@ function startTunnel(cfg) {
   send('fcp:state', childState);
   rebuildTrayMenu();
 
+  // 系统代理跟随连接：开关开着就接管，失败只记日志（不影响隧道本身）。
+  if (readSettings().systemProxy) {
+    const r = sysProxyApply();
+    if (!r.ok) send('fcp:log', { level: 'warn', line: `系统代理设置失败：${r.reason || '未知原因'}` });
+  }
+
   let buf = '';
   proc.stdout.setEncoding('utf8');
   proc.stdout.on('data', (chunk) => {
@@ -343,7 +350,47 @@ function stopTunnel() {
   childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
   send('fcp:state', childState);
   rebuildTrayMenu();
+  // 断开就交还系统代理：留着它会让整机断网（代理端口已经不在了）。
+  const r = sysProxyRestore();
+  if (!r.ok) send('fcp:log', { level: 'warn', line: `系统代理恢复失败：${r.reason || '未知原因'}` });
   return { ok: true };
+}
+
+// ---------------------------------------------------------------- system proxy
+
+/** 当前本地代理地址（未连接时用设置里的值，保证"先设系统代理"也能用）。 */
+function currentListen() {
+  if (childState.listen && childState.listen !== ':') {
+    const parts = childState.listen.split(':');
+    return { host: parts[0] || '127.0.0.1', port: Number(parts[1]) || 1080 };
+  }
+  const s = readSettings();
+  return { host: s.listenHost || '127.0.0.1', port: s.listenPort || 1080 };
+}
+
+function sysProxyStatus() {
+  const { host, port } = currentListen();
+  const st = sysproxy.readState();
+  return {
+    supported: sysproxy.IS_WIN,
+    applied: sysproxy.isAppliedTo(app.getPath('userData'), host, port),
+    server: st ? st.server : '',
+    enabled: st ? st.enable === 1 : false,
+    target: `${host}:${port}`,
+  };
+}
+
+function sysProxyApply() {
+  const { host, port } = currentListen();
+  const r = sysproxy.apply(app.getPath('userData'), host, port);
+  send('fcp:sysproxy', sysProxyStatus());
+  return r;
+}
+
+function sysProxyRestore() {
+  const r = sysproxy.restore(app.getPath('userData'));
+  send('fcp:sysproxy', sysProxyStatus());
+  return r;
 }
 
 // ---------------------------------------------------------------- window
@@ -405,6 +452,11 @@ ipcMain.handle('fcp:probe:now', () => {
   return { ok: true };
 });
 ipcMain.handle('fcp:open-log-dir', async () => revealLogDir());
+
+// ---- 系统代理（WinINET）----
+ipcMain.handle('fcp:sysproxy:status', () => sysProxyStatus());
+ipcMain.handle('fcp:sysproxy:apply', (_e) => sysProxyApply());
+ipcMain.handle('fcp:sysproxy:restore', () => sysProxyRestore());
 app.on('second-instance', () => { showWindow(); });
 
 const gotLock = app.requestSingleInstanceLock();
@@ -412,6 +464,13 @@ if (!gotLock) {
   app.quit();
 } else {
   app.whenReady().then(() => {
+    // 上次进程如果没干净退出（崩溃 / 强杀），系统代理可能还指着我们的端口，
+    // 而端口已经没了 —— 那会让整机断网。启动时只有在当前代理确实是我们设的
+    // 值时才恢复，用户后来自己改过的不碰。
+    const leftover = sysproxy.restore(app.getPath('userData'), { onlyIfOurs: true });
+    if (leftover.ok && !leftover.skipped) {
+      send('fcp:log', { level: 'info', line: '已清理上次残留的系统代理设置' });
+    }
     // The stored theme decides the native title bar and the window background.
     // Doing it before createWindow() is what keeps a light theme from opening
     // with a dark frame for the first frame.
@@ -426,7 +485,7 @@ if (!gotLock) {
   });
   app.on('before-quit', () => {
     isQuitting = true;
-    stopTunnel();
+    stopTunnel();   // 内部会恢复系统代理
   });
   app.on('will-quit', () => {
     if (tray) { tray.destroy(); tray = null; }
