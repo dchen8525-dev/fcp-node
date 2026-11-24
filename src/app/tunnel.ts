@@ -1789,10 +1789,18 @@ export class TunnelServer {
    * round-robin set is a way in. A resolution failure is not a refusal: it
    * will surface as ENOTFOUND on connect(), which is the honest answer, and
    * refusing here would hide it behind a misleading "refused".
+   *
+   * The checked address is returned and MUST be the one dialled (see
+   * dialTarget). Checking here and letting connect() resolve again is a
+   * DNS-rebind race: the attacker's record answers public for the check and
+   * private for the dial, and the deny-list never sees the address actually
+   * connected to.
    */
-  private async targetAllowed(target: ProxyTarget, host: string): Promise<boolean> {
-    if (target.atyp === ATYP_IPV4) return !ipv4Denied([...target.addr]);
-    if (target.atyp === ATYP_IPV6) return !ipv6Denied(target.addr);
+  private async targetAllowed(
+    target: ProxyTarget, host: string,
+  ): Promise<{ allowed: boolean; address?: string }> {
+    if (target.atyp === ATYP_IPV4) return { allowed: !ipv4Denied([...target.addr]) };
+    if (target.atyp === ATYP_IPV6) return { allowed: !ipv6Denied(target.addr) };
     // family: 4 to match the dial below (a domain target connects with
     // family: 4, so the process never reaches the AAAA records). Resolving
     // with `all: true` alone pulled AAAA in as well and refused any public
@@ -1805,9 +1813,21 @@ export class TunnelServer {
         resolve(addrs as Array<{ address: string; family: number }>);
       });
     });
-    if (answers.length === 0) return true; // let connect() report the real error
+    if (answers.length === 0) return { allowed: true }; // let connect() report the real error
     // One private answer in a round-robin set is a way in.
-    return answers.every((a) => !ipDenied(a.family, a.address));
+    if (!answers.every((a) => !ipDenied(a.family, a.address))) return { allowed: false };
+    // Pin the first vetted answer, so the dial cannot be re-resolved to a
+    // private address between this check and the connect.
+    return { allowed: true, address: answers[0].address };
+  }
+
+  /**
+   * Connect to the vetted address when there is one: an IP literal never
+   * reaches the resolver, so the dial cannot be re-resolved to a private
+   * address between the check and the connect.
+   */
+  private dialTarget(host: string, port: number, family: 4 | 6, pinned?: string): TcpSocket {
+    return connect({ host: pinned ?? host, port, family });
   }
 
   private async onStreamBytes(t: ServerTunnel, bytes: Buffer): Promise<void> {
@@ -1870,6 +1890,7 @@ export class TunnelServer {
     const target = r.value;
     this.dbg(`[${t.key.slice(0, 8)}] OPEN rx target=${targetText(target)}:${target.port} firstPayload=${rest.length}B`);
     const host = dialHost(target);
+    let pinnedAddress: string | undefined;
     // --deny-private: refuse before connect() when the target points into the
     // server's own network. openDone is already set, so bytes that arrive while
     // the lookup runs land in pendingToTarget (see the openPending branch in
@@ -1877,18 +1898,20 @@ export class TunnelServer {
     // 'connect' fires.
     if (this.opts.denyPrivate) {
       t.openPending = true;
-      let allowed = false;
-      try { allowed = await this.targetAllowed(target, host); }
+      let verdict: { allowed: boolean; address?: string } = { allowed: false };
+      try { verdict = await this.targetAllowed(target, host); }
       finally { t.openPending = false; }
-      if (!allowed) {
+      if (!verdict.allowed) {
         this.log(`target refused (private address space): ${targetText(target)}`);
         t.pendingToTarget.length = 0;
         t.writeBuf(openWriteErr(OpenError.Refused));
         t.closeWriteBuf();
         return;
       }
+      // Dial the address that was vetted, not a fresh resolution of the name.
+      pinnedAddress = verdict.address;
     }
-    const sock = connect({ host, port: target.port, family: target.atyp === 0x04 ? 6 : 4 });
+    const sock = this.dialTarget(host, target.port, target.atyp === 0x04 ? 6 : 4, pinnedAddress);
     t.targetSock = sock;
     sock.setNoDelay(true);
     sock.setTimeout(10000);

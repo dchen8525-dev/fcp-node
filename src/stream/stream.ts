@@ -505,35 +505,74 @@ export class Stream {
       ++this.oobDrops;
       return;
     }
-    // Clip against already buffered ranges, then merge contiguous neighbours.
+    // Clip against already buffered ranges, then insert in order.
+    //
+    // `oob` is kept sorted and non-overlapping, so everything before the new
+    // chunk's own offset is untouched and a binary search finds it: only the
+    // chunks this write overlaps or touches are visited. The whole-buffer scan
+    // (and the sort that used to follow it) made 8192 arrivals from one
+    // authenticated peer — one hole at rcvNxt, 1-byte chunks at increasing
+    // offsets, up to oobMaxChunks — cost 8192² steps, measured as 1.3 s of
+    // blocked event loop.
     const end = (offset + bytes.length) >>> 0;
-    const kept: RcvChunk[] = [];
-    for (const c of this.oob) {
+    // First chunk that reaches past the new offset; everything before it ends
+    // at or before `offset` and cannot overlap.
+    let lo = 0, hi = this.oob.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const c = this.oob[mid];
+      if (seqAtOrAfter(offset, (c.offset + c.bytes.length) >>> 0)) lo = mid + 1; else hi = mid;
+    }
+    const tails: RcvChunk[] = [];
+    let newOff = offset;
+    let newBytes: Buffer = Buffer.from(bytes);
+    let ourEnd = end;
+    let i = lo;
+    for (; i < this.oob.length; ++i) {
+      const c = this.oob[i];
+      if (seqAtOrAfter(c.offset, ourEnd)) break; // no more overlap
       const cEnd = (c.offset + c.bytes.length) >>> 0;
-      if (seqAtOrAfter(c.offset, end) || seqAtOrAfter(offset, cEnd)) { kept.push(c); continue; }
-      // overlap: keep only the non-overlapping prefix/suffix of the old chunk
-      if (seqAfter(c.offset, offset) === false && seqDist(c.offset, offset) < 0) {
-        const headLen = seqDist(offset, c.offset);
-        if (headLen > 0) kept.push({ offset: c.offset, bytes: c.bytes.subarray(0, headLen) });
+      if (seqDist(c.offset, newOff) < 0) {
+        // The chunk starts before our bytes: its head stays owned by it, and
+        // ours are spliced on behind.
+        newBytes = Buffer.concat([c.bytes.subarray(0, seqDist(newOff, c.offset)), newBytes]);
+        newOff = c.offset;
       }
-      if (seqAfter(cEnd, end)) {
-        const tailOff = seqDist(end, c.offset);
-        if (tailOff > 0 && tailOff < c.bytes.length) kept.push({ offset: end, bytes: c.bytes.subarray(tailOff) });
-      }
-    }
-    kept.push({ offset, bytes: Buffer.from(bytes) });
-    kept.sort((a, b) => seqDist(a.offset, b.offset));
-    const merged: RcvChunk[] = [];
-    for (const c of kept) {
-      const last = merged[merged.length - 1];
-      if (last && (last.offset + last.bytes.length) >>> 0 === c.offset) {
-        last.bytes = Buffer.concat([last.bytes, c.bytes]);
-      } else {
-        merged.push({ offset: c.offset, bytes: c.bytes });
+      if (seqAfter(cEnd, ourEnd)) {
+        // The chunk reaches past our bytes: keep its tail for the ARQ to skip.
+        const tailOff = seqDist(ourEnd, c.offset);
+        if (tailOff > 0 && tailOff < c.bytes.length) {
+          tails.push({ offset: ourEnd, bytes: c.bytes.subarray(tailOff) });
+          ourEnd = cEnd;
+        }
       }
     }
-    this.oob = merged;
-    this.oobBytes = merged.reduce((a, c) => a + c.bytes.length, 0);
+    const ins: RcvChunk[] = [{ offset: newOff, bytes: newBytes }, ...tails];
+    // Splice the repaired run in place. Appending at the tail — the shape a
+    // hostile peer uses to fill the buffer with 1-byte chunks — touches no
+    // existing element; rebuilding the whole array did, and that kept the cost
+    // quadratic even after the sort was gone. The byte count is carried
+    // incrementally for the same reason: recomputing it walked the buffer on
+    // every arrival.
+    let removed = 0;
+    for (let j = lo; j < i; ++j) removed += this.oob[j].bytes.length;
+    let added = 0;
+    for (const c of ins) added += c.bytes.length;
+    this.oobBytes += added - removed;
+    this.oob.splice(lo, i - lo, ...ins);
+    // Join contiguous neighbours around the seam (and inside the new run). The
+    // upper bound includes the pair (last inserted, its successor): a chunk
+    // landing exactly one byte before its neighbour must merge with it, and
+    // stopping at the last inserted index left that pair adjacent forever.
+    for (let j = Math.max(0, lo - 1); j < lo + ins.length; ++j) {
+      const a = this.oob[j], b = this.oob[j + 1];
+      if (!a || !b) break;
+      if (((a.offset + a.bytes.length) >>> 0) === b.offset) {
+        a.bytes = Buffer.concat([a.bytes, b.bytes]);
+        this.oob.splice(j + 1, 1);
+        --j; // the joined chunk may swallow the next one too
+      }
+    }
     // Whatever no longer fits is cut from the tail; the sender retransmits it.
     // The limit counts the host's un-taken backlog too, so the receive side
     // never holds more than the window rwndOut() advertises. C++ stream_recv.cc
@@ -1196,6 +1235,10 @@ export class Stream {
     // SendingFin until the idle timeout, with both sides silent.
     if (!hasData && !this.finPending) return;
     if (nowMs - this.lastZeroWinProbeMs < ZERO_WINDOW_PROBE_MS) return;
+    // Above the cap the probe is not sent, and the clock is deliberately left
+    // alone: the stale value makes the probe due the moment the queue drains
+    // below the cap, so it resumes on the next tick (~10 ms). Advancing the
+    // clock here would instead make the probe wait a fresh 50 ms.
     if (this.tx.length > 64) return;
     this.lastZeroWinProbeMs = nowMs;
     const chunk = hasData ? this.takePending(1) : Buffer.alloc(0);

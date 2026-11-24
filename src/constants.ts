@@ -233,6 +233,14 @@ export const PROBE_DRAIN_MS = 250;
 export const PROBE_SUM_COPIES = 3;
 /** Retry spacing when a probe could not start (no established session yet). */
 export const PROBE_RETRY_MS = 5000;
+/** Minimum gap between trains this end agrees to serve on someone else's DOWN
+ *  request. Serving is paced egress the responder pays for; without a floor a
+ *  peer could string requests together to hold the slot and keep the link busy
+ *  for as long as it likes. */
+export const PROBE_SERVE_COOLDOWN_MS = 1000;
+/** Sliding window for the served-train byte budget: at most one local probe
+ *  budget of egress per window, however many DOWN requests arrive. */
+export const PROBE_SERVE_WINDOW_MS = 10_000;
 
 // Defaults (defaults.h)
 export const DEFAULT_D = 10;

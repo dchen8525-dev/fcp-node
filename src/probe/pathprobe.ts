@@ -37,7 +37,7 @@ import {
   PROBE_FLAG_LAST, PROBE_FLAG_DOWN,
   PROBE_RATE_START_BPS, PROBE_RATE_CAP_BPS, PROBE_RAMP_ROUND,
   PROBE_LOSS_LIMIT, PROBE_SETTLE_FRACTION, PROBE_TIMEOUT_MS, PROBE_DRAIN_MS,
-  PROBE_SUM_COPIES,
+  PROBE_SUM_COPIES, PROBE_SERVE_COOLDOWN_MS, PROBE_SERVE_WINDOW_MS,
 } from '../constants.ts';
 import { bytesEqual, getLe16, getLe32, putLe16, putLe32 } from '../wire.ts';
 
@@ -304,6 +304,11 @@ export class PathProbe {
   private lastTickAt = 0;
 
   private localBudgetBytes: number;
+  /** Served (peer-requested) trains: last one's start and the bytes spent in
+   *  the current window. See onDownReq — a request is cheap, a train is not. */
+  private lastServedDownMs = Number.NEGATIVE_INFINITY;
+  private servedWindowStartMs = Number.NEGATIVE_INFINITY;
+  private servedWindowBytes = 0;
 
   /** `localBudgetBytes` is what THIS end is willing to spend on one run, i.e.
    *  the `--probe-budget` value. It is also the ceiling for a train we are
@@ -489,6 +494,19 @@ export class PathProbe {
   private applyPeerSum(): void {
     const s = this.peerSum;
     if (!s || !this.upResult || s.total <= 0) return;
+    // The summary describes the train we advertised: `total` travels in every
+    // DAT frame, so a value above the train length cannot be a measurement of
+    // it (a peer reporting 65535 segments received 0 would publish a 100% loss
+    // for an intact link).
+    //
+    // Bound by the ADVERTISED length, not by the count actually sent: a run
+    // that hits its timeout or settles early sends fewer frames than it named,
+    // and its legitimate summary still counts the unsent tail as lost — the
+    // same pessimistic convention the served-DOWN path documents. Bounding by
+    // `sent` would discard the summary exactly on the slow, lossy paths where
+    // the receiver-side number matters most.
+    const trainLen = Math.max(1, Math.floor(this.upBudget / Math.max(1, this.size)));
+    if (s.total > trainLen) return;
     this.upResult.lossRx = 1 - s.got / s.total;
     this.upResult.maxRun = s.maxRun;
   }
@@ -587,7 +605,21 @@ export class PathProbe {
     // its own train is refused — one 5-tuple cannot carry two paced trains and
     // still report either rate honestly.
     if (f.total < 4 || f.size < PROBE_HDR_LEN + 64) return;
+    // token 0 means "no measurement"; a train under it can never be correlated
+    // by the requester and only spends this end's bandwidth.
+    if (f.token === 0) return;
     if (this.up || this.token !== 0) return;
+    // The slot above is one train at a time, but a request re-issued the moment
+    // a train ends would keep this end transmitting indefinitely: serving is
+    // paced egress the responder pays for, and the requester spends one ~40-byte
+    // datagram to buy it. Floor the gap between served trains and cap the bytes
+    // per window, so a peer can be given a measurement but not a firehose.
+    if (now - this.lastServedDownMs < PROBE_SERVE_COOLDOWN_MS) return;
+    if (now - this.servedWindowStartMs >= PROBE_SERVE_WINDOW_MS) {
+      this.servedWindowStartMs = now;
+      this.servedWindowBytes = 0;
+    }
+    if (this.servedWindowBytes >= this.localBudgetBytes) return;
     // The responder's volume used to be whatever the request named: total and
     // size are both u16 wire fields, so ONE authenticated DOWN datagram could
     // order up total × size ≈ 4.3 GB of paced egress (fragmented UDP above the
@@ -600,7 +632,11 @@ export class PathProbe {
     // MTU gets a truncated train (its loss number reads pessimistically for the
     // missing tail — measurement degrades, nothing breaks).
     const size = Math.min(f.size, Math.max(PROBE_HDR_LEN + 64, this.host.dgramSize()));
-    const total = Math.min(f.total, Math.max(4, Math.floor(this.localBudgetBytes / size)));
+    const spendable = this.localBudgetBytes - this.servedWindowBytes;
+    const total = Math.min(f.total, Math.max(4, Math.floor(spendable / size)));
+    if (total * size > spendable) return; // window exhausted: refuse, do not truncate to nothing
+    this.servedWindowBytes += total * size;
+    this.lastServedDownMs = now;
     this.up = freshTx(f.token, total, size, PROBE_RATE_START_BPS, false, now);
   }
 
@@ -625,7 +661,10 @@ export class PathProbe {
     const delay = ((now >>> 0) - (f.sentMs >>> 0)) | 0;
     if (run.got === 0) { run.firstArrival = now; run.firstSent = f.sentMs; run.prevDelay = delay; }
     else { run.jitterSum += Math.abs(delay - run.prevDelay); run.jitterN += 1; run.prevDelay = delay; }
-    if (f.aux > 0) run.peerCleanBps = f.aux * 1000;
+    // aux rides as u16 kilobit/s and is the peer's claimed clean rate, which
+    // seeds the next run's pacing. Clamp it to the ceiling this end would ever
+    // use, so a forged 65535 does not become a 65 MB/s seed.
+    if (f.aux > 0) run.peerCleanBps = Math.min(f.aux * 1000, PROBE_RATE_CAP_BPS);
     run.lastArrival = now;
     run.lastSent = f.sentMs;
     if (!run.seen[f.seq]) { run.seen[f.seq] = 1; run.got += 1; }
@@ -720,7 +759,14 @@ export class PathProbe {
     // peer's last arrival, which can be before or after the train is retired
     // here. Late copies of a finished run are dropped by the token check.
     if (this.token === 0 || this.token !== f.token) return;
-    this.peerSum = { got: f.got, total: f.total, maxRun: f.aux };
+    // The summary describes the train WE sent, so its total is not a free
+    // number: trusting it let a peer report (got=0, total=65535) and publish a
+    // 100% receive loss for a link that lost nothing. It can arrive before the
+    // train is accounted (upResult is still null), so the bound is applied in
+    // applyPeerSum, against the number of datagrams actually sent.
+    if (f.total <= 0) return;
+    const got = Math.min(f.got, f.total); // got > total is a lie, not a measurement
+    this.peerSum = { got, total: f.total, maxRun: Math.min(f.aux, f.total) };
     this.applyPeerSum();
   }
 

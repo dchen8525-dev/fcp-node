@@ -380,14 +380,35 @@ export function httpParseForward(buf: Buffer): ParseResult<HttpForwardValue> {
   };
 }
 
+/** tchar as used by a few proxy clients in the method position (e.g. "M-SEARCH"). */
+function methodCharOk(c: number): boolean {
+  return (c >= 0x41 && c <= 0x5a) || c === 0x2d;
+}
+
+/**
+ * Classify the first bytes of a local connection.
+ *
+ * A TCP read can split anywhere, so a prefix that is still a plausible method
+ * name is 'need_more', not 'unknown'. It used to require the trailing space:
+ * a client whose first segment was exactly "POST" or "CONNECT" (no space yet)
+ * was classified 'unknown' and the caller destroyed the connection — GET and
+ * PUT only survived because the 4-byte floor happened to catch them.
+ */
 export function detectEntry(buf: Buffer): 'socks5' | 'connect' | 'forward' | 'need_more' | 'unknown' {
   if (buf.length === 0) return 'need_more';
   if (buf[0] === SOCKS5_VERSION) return 'socks5';
-  const s = buf.subarray(0, Math.min(buf.length, 16)).toString('latin1');
-  if (s.startsWith('CONNECT ')) return 'connect';
-  if (/^[A-Z]+ /.test(s)) return 'forward';
-  if (buf.length < 4) return 'need_more';
-  return 'unknown';
+  const win = buf.subarray(0, 16);
+  let i = 0;
+  while (i < win.length && methodCharOk(win[i])) ++i;
+  if (i === 0) return buf.length < 4 ? 'need_more' : 'unknown';
+  if (i === win.length && win.length === buf.length) {
+    // Buffer ends inside the method name: the space may be in the next read.
+    return 'need_more';
+  }
+  if (i === win.length) return 'unknown'; // 16-byte method name
+  // i is a non-method byte: if it is not the space, this is not a request line.
+  if (win[i] !== 0x20) return 'unknown';
+  return win.subarray(0, i).toString('latin1') === 'CONNECT' ? 'connect' : 'forward';
 }
 
 // ---- FCP OPEN --------------------------------------------------------------
