@@ -17,7 +17,7 @@ const el = {
   rxRate: $('rxRate'), rxTotal: $('rxTotal'), txRate: $('txRate'), txTotal: $('txTotal'),
   chart: $('chart'), chartPeak: $('chartPeak'),
   kSessions: $('kSessions'), kUp: $('kUp'), kUptime: $('kUptime'), kListen: $('kListen'),
-  sysProxy: $('sysProxy'), kSysProxy: $('kSysProxy'),
+  sysProxy: $('sysProxy'),
   probeNowBtn: $('probeNowBtn'),
   probeWhen: $('probeWhen'), probeDown: $('probeDown'), probeDownSub: $('probeDownSub'),
   probeUp: $('probeUp'), probeUpSub: $('probeUpSub'), probeAt: $('probeAt'),
@@ -340,32 +340,14 @@ document.querySelectorAll('input, select').forEach((node) => {
 
 // ---------------------------------------------------------------- 系统代理
 
-/** 渲染 Windows 系统代理的接管状态。 */
-function renderSysProxy(st) {
-  if (!st) return;
-  if (!st.supported) {
-    el.kSysProxy.textContent = '仅 Windows';
-    el.kSysProxy.title = '当前平台不支持系统代理接管';
-    return;
-  }
-  el.kSysProxy.textContent = st.applied ? '已接管' : (st.enabled ? '其他代理' : '未设置');
-  el.kSysProxy.title = st.server ? `当前系统代理：${st.server}` : '当前未启用系统代理';
-}
-
-async function refreshSysProxy() {
-  try {
-    renderSysProxy(await window.fcp.sysProxyStatus());
-  } catch { /* 主进程退出中 */ }
-}
-
-window.fcp.onSysProxy((st) => renderSysProxy(st));
+// 接管/恢复由主进程跟随连接自动完成，界面只保留"连接时设为系统代理"这个
+// 开关；运行状态卡片不再显示接管状态。
 el.sysProxy.addEventListener('change', scheduleSave);
 
 // ---------------------------------------------------------------- start/stop
 
 function setRunning(on) {
   state.running = on;
-  refreshSysProxy();
   el.toggleBtn.textContent = on ? '停止代理' : '启动代理';
   el.toggleBtn.classList.toggle('is-stop', on);
   el.stateDot.classList.toggle('on', on);
