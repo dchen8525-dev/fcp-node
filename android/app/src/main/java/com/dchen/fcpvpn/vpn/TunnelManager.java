@@ -2,6 +2,10 @@ package com.dchen.fcpvpn.vpn;
 
 import android.content.Context;
 import android.content.Intent;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
@@ -44,6 +48,8 @@ public class TunnelManager {
     private static final int INITIAL_DELAY_MS = 1000;
     private static final int MAX_DELAY_MS = 60000;
     private static final int DELAY_FACTOR = 2;
+    /** 一次切换会连着来 onLost(old)/onAvailable(new)，合并成一次路径探测。 */
+    private static final long PATH_NOTIFY_DEBOUNCE_MS = 300;
 
     private static volatile TunnelManager sInstance;
 
@@ -77,6 +83,10 @@ public class TunnelManager {
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
     private final AtomicInteger reconnectDelayMs = new AtomicInteger(INITIAL_DELAY_MS);
     private ScheduledFuture<?> reconnectFuture;
+
+    /** 底层网络（非 VPN）变化监听：Wi-Fi↔蜂窝切换后立刻让引擎探测新路径。 */
+    private ConnectivityManager.NetworkCallback networkWatch;
+    private final AtomicBoolean pathNotifyPending = new AtomicBoolean(false);
 
     /** 单线程调度器：引擎启动（阻塞握手）与重连任务串行执行，天然互斥。 */
     private final ScheduledExecutorService scheduler =
@@ -122,23 +132,17 @@ public class TunnelManager {
                 + " parityMax=" + config.fecParityMax + " mtuMin=" + config.mtuMin
                 + " probe=" + config.probeIntervalSec + "s protector=" + (protector != null));
 
+        registerNetworkWatch();
         connectNow();
     }
 
     /** 用户请求停止：不再重连，拆除引擎。 */
     public synchronized void stop() {
         stopped.set(true);
+        unregisterNetworkWatch();
         cancelReconnect();
         stopProxyListener();
-        TunnelEngine e = engine;
-        engine = null;
-        if (e != null) {
-            try {
-                e.stop();
-            } catch (RuntimeException ex) {
-                Logger.error(LogConfig.MODULE_VPN, "engine stop failed: " + ex.getMessage());
-            }
-        }
+        stopEngineQuietly();
         establishedAtMs = 0;
         lastStatsLine = null;
         updateState(VpnConnectionState.DISCONNECTED);
@@ -207,6 +211,11 @@ public class TunnelManager {
         if (stopped.get()) {
             return;
         }
+        // 断链重连：旧引擎必须显式停掉。它的泵线程、UDP socket 和 4 条会话都还活着，
+        // 只把 engine 字段换掉的话，每次重连都会留下一个僵尸引擎——服务端也会多出
+        // 4 条会话，直到它自己按 peer_dead 超时清掉。
+        stopEngineQuietly();
+
         updateState(VpnConnectionState.CONNECTING);
 
         TunnelEngine newEngine = createEngine();
@@ -233,6 +242,10 @@ public class TunnelManager {
             if (stopped.get()) {
                 return;
             }
+            // 之前排队的一次重连必须取消：断网期间的握手往往在恢复瞬间就成功了，
+            // 而那个已经排上队的 connectNow 会把刚建好的引擎拆掉重建——一次切换
+            // 变成两次断链，在途的 TCP 全被 RST。
+            cancelReconnect();
             Logger.info(LogConfig.MODULE_VPN, "引擎已建立会话 salt=" + salt);
             reconnectAttempts.set(0);
             reconnectDelayMs.set(INITIAL_DELAY_MS);
@@ -324,19 +337,108 @@ public class TunnelManager {
         }
     }
 
+    // ------------------------------------------------------------ 底层网络变化
+
+    /**
+     * 监听底层网络（非 VPN）的上下线。
+     *
+     * <p>为什么要监听：VPN 起来后 {@code tun0} 一直在，系统和应用都感知不到底层换网，
+     * 而我们的 UDP socket 不 connect、不绑网络，只是被 protect 过——换网后它会自动
+     * 从新网卡发出，两端跟随地址漂移即可续传。问题在"没人告诉引擎去探测"：空闲时
+     * 只有 45 秒一次的保活，静默判死要 135 秒。这里补上那一刻的触发。</p>
+     *
+     * <p>用 {@code NOT_VPN + INTERNET} 的 NetworkRequest 而不是
+     * {@code registerDefaultNetworkCallback}：VPN 模式下本进程的默认网络就是 VPN
+     * 本身，底层网络只能这样单独观察。</p>
+     */
+    private void registerNetworkWatch() {
+        if (networkWatch != null) {
+            return;
+        }
+        try {
+            ConnectivityManager cm = (ConnectivityManager)
+                    appContext.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return;
+            }
+            NetworkRequest request = new NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    .build();
+            ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    notifyPathChanged("underlying-up");
+                }
+
+                @Override
+                public void onLost(Network network) {
+                    notifyPathChanged("underlying-down");
+                }
+            };
+            cm.registerNetworkCallback(request, cb);
+            networkWatch = cb;
+            Logger.info(LogConfig.MODULE_VPN, "已监听底层网络变化（切换后立即探测新路径）");
+        } catch (Exception e) {
+            // 注册失败（极少数 ROM 限制）：退回到保活/静默判死，功能不受影响。
+            Logger.warning(LogConfig.MODULE_VPN, "网络变化监听注册失败: " + e.getMessage());
+        }
+    }
+
+    private void unregisterNetworkWatch() {
+        ConnectivityManager.NetworkCallback cb = networkWatch;
+        networkWatch = null;
+        pathNotifyPending.set(false);
+        if (cb == null) {
+            return;
+        }
+        try {
+            ConnectivityManager cm = (ConnectivityManager)
+                    appContext.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                cm.unregisterNetworkCallback(cb);
+            }
+        } catch (RuntimeException ignored) {
+            // 已注销/系统正在重启：无需处理
+        }
+    }
+
+    /** 去抖后把"路径变了"交给引擎；引擎据此让每个会话立刻探测新路径。 */
+    private void notifyPathChanged(String why) {
+        if (!pathNotifyPending.compareAndSet(false, true)) {
+            return;
+        }
+        Logger.info(LogConfig.MODULE_RECONNECT, "底层网络变化(" + why + ")，即将探测新路径");
+        scheduler.schedule(() -> {
+            pathNotifyPending.set(false);
+            TunnelEngine e = engine;
+            if (stopped.get() || e == null) {
+                return;
+            }
+            e.onPathChanged(true);
+        }, PATH_NOTIFY_DEBOUNCE_MS, TimeUnit.MILLISECONDS);
+    }
+
     /** start(新配置) 前的静默清理：不发 DISCONNECTED 广播（马上会进 CONNECTING）。 */
     private void stopInternalQuietly() {
         stopped.set(true);
+        unregisterNetworkWatch();
         cancelReconnect();
         stopProxyListener();
+        stopEngineQuietly();
+    }
+
+    /** 停掉当前引擎并清空引用；可重复调用。 */
+    private void stopEngineQuietly() {
         TunnelEngine e = engine;
         engine = null;
-        if (e != null) {
-            try {
-                e.stop();
-            } catch (RuntimeException ex) {
-                Logger.error(LogConfig.MODULE_VPN, "old engine stop failed: " + ex.getMessage());
-            }
+        if (e == null) {
+            return;
+        }
+        try {
+            e.stop();
+        } catch (RuntimeException ex) {
+            Logger.error(LogConfig.MODULE_VPN, "old engine stop failed: " + ex.getMessage());
         }
     }
 

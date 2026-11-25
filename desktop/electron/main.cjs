@@ -321,6 +321,10 @@ function startTunnel(cfg) {
     if (wasRunning) {
       send('fcp:log', { level: code === 0 ? 'info' : 'error',
         line: `tunnel exited: code=${code} signal=${signal || 'none'}` });
+      // 异常退出也要交还可能由我们接管的系统代理，否则浏览器会继续访问
+      // 已经关闭的本地端口，表现为整机无法上网。
+      const r = sysProxyRestore();
+      if (!r.ok) send('fcp:log', { level: 'warn', line: `系统代理恢复失败：${r.reason || '未知原因'}` });
     }
   });
   proc.on('error', (e) => {
@@ -330,22 +334,25 @@ function startTunnel(cfg) {
     childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
     send('fcp:state', childState);
     rebuildTrayMenu();
+    const r = sysProxyRestore();
+    if (!r.ok) send('fcp:log', { level: 'warn', line: `系统代理恢复失败：${r.reason || '未知原因'}` });
   });
   return { ok: true, pid: proc.pid };
 }
 
 function stopTunnel() {
-  if (!child) return { ok: true };
   const c = child;
-  child = null;
-  try {
-    // SIGTERM lets the tunnel close its sockets; the forced kill is the escape
-    // hatch for a wedged process (Windows has no SIGTERM delivery for GUI
-    // children, so taskkill is what actually lands there).
-    c.kill('SIGTERM');
-    setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* already gone */ } }, 1500);
-  } catch {
-    /* already gone */
+  if (c) {
+    child = null;
+    try {
+      // SIGTERM lets the tunnel close its sockets; the forced kill is the escape
+      // hatch for a wedged process (Windows has no SIGTERM delivery for GUI
+      // children, so taskkill is what actually lands there).
+      c.kill('SIGTERM');
+      setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* already gone */ } }, 1500);
+    } catch {
+      /* already gone */
+    }
   }
   childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
   send('fcp:state', childState);
@@ -361,8 +368,8 @@ function stopTunnel() {
 /** 当前本地代理地址（未连接时用设置里的值，保证"先设系统代理"也能用）。 */
 function currentListen() {
   if (childState.listen && childState.listen !== ':') {
-    const parts = childState.listen.split(':');
-    return { host: parts[0] || '127.0.0.1', port: Number(parts[1]) || 1080 };
+    const i = childState.listen.lastIndexOf(':');
+    return { host: childState.listen.slice(0, i) || '127.0.0.1', port: Number(childState.listen.slice(i + 1)) || 1080 };
   }
   const s = readSettings();
   return { host: s.listenHost || '127.0.0.1', port: s.listenPort || 1080 };
@@ -388,7 +395,7 @@ function sysProxyApply() {
 }
 
 function sysProxyRestore() {
-  const r = sysproxy.restore(app.getPath('userData'));
+  const r = sysproxy.restore(app.getPath('userData'), { onlyIfOurs: true });
   send('fcp:sysproxy', sysProxyStatus());
   return r;
 }
@@ -454,9 +461,8 @@ ipcMain.handle('fcp:probe:now', () => {
 ipcMain.handle('fcp:open-log-dir', async () => revealLogDir());
 
 // ---- 系统代理（WinINET）----
+// 只暴露只读状态：接管/恢复由连接与断开自动完成，界面不提供手动开关。
 ipcMain.handle('fcp:sysproxy:status', () => sysProxyStatus());
-ipcMain.handle('fcp:sysproxy:apply', (_e) => sysProxyApply());
-ipcMain.handle('fcp:sysproxy:restore', () => sysProxyRestore());
 app.on('second-instance', () => { showWindow(); });
 
 const gotLock = app.requestSingleInstanceLock();

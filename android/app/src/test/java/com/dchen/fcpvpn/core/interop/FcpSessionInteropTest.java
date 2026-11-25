@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -213,7 +214,50 @@ public class FcpSessionInteropTest {
             byte[] echoed = java.util.Arrays.copyOfRange(all, 8, 8 + payloadSize);
             assertArrayEquals("echo 数据必须逐字节一致", payload, echoed);
 
-            // ---- 用例 2：FIN 半关闭 ----
+            // ---- 用例 2：底层网络切换（Wi-Fi → 蜂窝）----
+            // 客户端不重建 socket：发一次认证保活让服务端跟随新源地址，把 PMTU 打回
+            // 起点重测（新路径的 MTU 可能更小），PMTU 探测的 ACK 同时就是"新路径通
+            // 不通"的回音。会话必须保持可用，数据必须继续往返。
+            long pmtuDeadline = System.currentTimeMillis() + 20000;
+            while (session.currentMtu() < 1500 && System.currentTimeMillis() < pmtuDeadline) {
+                Thread.sleep(50);
+            }
+            assertEquals("前置：PMTU 应已爬到上限 1500", 1500, session.currentMtu());
+
+            actions.put(() -> session.onPathChanged(System.currentTimeMillis(), true));
+            Thread.sleep(200);
+            assertNull("换路径不应关闭会话", closeReason.get());
+            assertTrue("PMTU 应被打回起点重测，实际 " + session.currentMtu(),
+                    session.currentMtu() <= 1140);
+
+            final int extra = 8192;
+            final byte[] extraPayload = new byte[extra];
+            rnd.nextBytes(extraPayload);
+            final int base = received.size();
+            for (int off2 = 0; off2 < extra; off2 += 4096) {
+                final int fOff = off2;
+                final int fTake = Math.min(4096, extra - off2);
+                actions.put(() -> sid.write(extraPayload, fOff, fTake, System.currentTimeMillis()));
+                Thread.sleep(2);
+            }
+            long echoDeadline = System.currentTimeMillis() + 15000;
+            while (received.size() < base + extra && System.currentTimeMillis() < echoDeadline) {
+                Thread.sleep(20);
+            }
+            byte[] afterPath = received.toByteArray();
+            assertEquals("换路径后 echo 应完整返回", base + extra, afterPath.length);
+            assertArrayEquals("换路径后的数据必须逐字节一致", extraPayload,
+                    java.util.Arrays.copyOfRange(afterPath, base, base + extra));
+
+            pmtuDeadline = System.currentTimeMillis() + 20000;
+            while (session.currentMtu() < 1500 && System.currentTimeMillis() < pmtuDeadline) {
+                Thread.sleep(50);
+            }
+            assertEquals("新路径的 PMTU 应重新爬到上限（回音窗口已被 ACK 解除）",
+                    1500, session.currentMtu());
+            assertNull("换路径全过程不应关闭会话", closeReason.get());
+
+            // ---- 用例 3：FIN 半关闭 ----
             actions.put(() -> sid.closeWrite(System.currentTimeMillis()));
             Thread.sleep(300);
             assertEquals("FIN 后会话不应被 RST", null, closeReason.get());

@@ -49,7 +49,7 @@ export function nonceValid(n: Uint8Array): boolean {
   // the missing bytes read as undefined, which ORs to 0, so only the bytes that
   // were actually present counted — and the failure surfaced two modules
   // later, as an uncaught throw out of deriveSessionKeyV7.
-  if (n.length < HANDSHAKE_NONCE_LEN) return false;
+  if (n.length !== HANDSHAKE_NONCE_LEN) return false;
   let acc = 0;
   for (let i = 0; i < HANDSHAKE_NONCE_LEN; ++i) acc |= n[i];
   return acc !== 0;

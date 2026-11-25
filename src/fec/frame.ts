@@ -265,7 +265,7 @@ interface RxSet {
   data: Map<number, Buffer>; parity: Map<number, Buffer>;
   orig: Set<number>; recov: Set<number>;
   tFirstMs: number; accounted: boolean; tombstoneUntilMs: number;
-  hasAnySymbol: boolean; decodeAttempts: number;
+  hasAnySymbol: boolean; decodeAttempts: number; pinned: number;
 }
 
 export interface RxCounters {
@@ -397,53 +397,58 @@ export class FrameRx {
 
     const set = this.getOrCreate(hdr.setId, nowMs);
     if (!set) { ++this.counters.structFail; return; }
-    // k is first-wins and clamped to the negotiated parity ceiling (C++ A9).
-    // Once known, a symbol declaring a different k is a structural violation:
-    // decoding with the wrong geometry could reconstruct corrupt data. C++
-    // note_k() returns false in that case and the datagram is dropped with
-    // struct_fail; do the same instead of silently keeping the first value.
-    const kClamped = Math.min(kField, this.p);
-    if (!set.kKnown) { set.k = kClamped; set.kKnown = true; }
-    else if (set.k !== kClamped) { ++this.counters.structFail; return; }
-    // Same rule for the group size: first symbol wins, and a later symbol of
-    // the same set declaring a different d is a structural violation. Mixing
-    // geometries inside one set would decode against the wrong code length.
-    if (!set.dKnown) { set.d = hdr.d; set.dKnown = true; }
-    else if (set.d !== hdr.d) { ++this.counters.structFail; return; }
+    ++set.pinned;
+    try {
+      // k is first-wins and clamped to the negotiated parity ceiling (C++ A9).
+      // Once known, a symbol declaring a different k is a structural violation:
+      // decoding with the wrong geometry could reconstruct corrupt data. C++
+      // note_k() returns false in that case and the datagram is dropped with
+      // struct_fail; do the same instead of silently keeping the first value.
+      const kClamped = Math.min(kField, this.p);
+      if (!set.kKnown) { set.k = kClamped; set.kKnown = true; }
+      else if (set.k !== kClamped) { ++this.counters.structFail; return; }
+      // Same rule for the group size: first symbol wins, and a later symbol of
+      // the same set declaring a different d is a structural violation. Mixing
+      // geometries inside one set would decode against the wrong code length.
+      if (!set.dKnown) { set.d = hdr.d; set.dKnown = true; }
+      else if (set.d !== hdr.d) { ++this.counters.structFail; return; }
 
-    if (type === SymbolType.Data) {
-      const idx = hdr.index;
-      if (set.orig.has(idx) || set.recov.has(idx)) { ++this.counters.lateDup; this.emit('data_duplicate', hdr.setId); return; }
-      set.orig.add(idx);
-      set.maxDataIndex = Math.max(set.maxDataIndex, idx);
-      this.store(set, idx, symbol);
-      const late = set.accounted;
-      const boundary = this.accountBoundary.get(hdr.setId);
-      const lateUnexpected = late && (boundary === undefined || idx >= boundary);
-      // Shard counters are settlement-based (see accountSet): counting an
-      // arrival here would put shards from still-active sets into the period's
-      // numerator while their sets have not entered the denominator yet.
-      ++this.counters.dataDelivered;
-      // FECSTAT data_late_rx counts unique originals arriving during the
-      // tombstone window WITHIN the accounted code length (C++ settle.cc:188).
-      // late_unexpected (k-unknown / index past the accounted boundary) is a
-      // separate condition and must not inflate this field, or the peer's
-      // data_lost() identity would exceed expected.
-      if (late && !lateUnexpected) ++this.counters.dataLateRx;
-      this.deliverFn(symbol.subarray(2), { recovered: false, late: late || lateUnexpected });
+      if (type === SymbolType.Data) {
+        const idx = hdr.index;
+        if (set.orig.has(idx) || set.recov.has(idx)) { ++this.counters.lateDup; this.emit('data_duplicate', hdr.setId); return; }
+        set.orig.add(idx);
+        set.maxDataIndex = Math.max(set.maxDataIndex, idx);
+        this.store(set, idx, symbol);
+        const late = set.accounted;
+        const boundary = this.accountBoundary.get(hdr.setId);
+        const lateUnexpected = late && (boundary === undefined || idx >= boundary);
+        // Shard counters are settlement-based (see accountSet): counting an
+        // arrival here would put shards from still-active sets into the period's
+        // numerator while their sets have not entered the denominator yet.
+        ++this.counters.dataDelivered;
+        // FECSTAT data_late_rx counts unique originals arriving during the
+        // tombstone window WITHIN the accounted code length (C++ settle.cc:188).
+        // late_unexpected (k-unknown / index past the accounted boundary) is a
+        // separate condition and must not inflate this field, or the peer's
+        // data_lost() identity would exceed expected.
+        if (late && !lateUnexpected) ++this.counters.dataLateRx;
+        this.deliverFn(symbol.subarray(2), { recovered: false, late: late || lateUnexpected });
+        this.tryDecode(set, nowMs);
+        return;
+      }
+
+      // Parity: n = index - j is the only source of n.
+      if (set.parity.has(hdr.index)) return;
+      if (!set.nKnown && set.maxDataIndex >= nNew) { ++this.counters.structFail; return; }
+      set.n = nNew; set.nKnown = true;
+      // Only register the parity when the byte budget accepted it, otherwise
+      // retirement would subtract bytes that were never added and the global
+      // budget could drift below zero, silently disabling the ceiling.
+      if (this.store(set, hdr.index, symbol)) set.parity.set(hdr.index, symbol);
       this.tryDecode(set, nowMs);
-      return;
+    } finally {
+      --set.pinned;
     }
-
-    // Parity: n = index - j is the only source of n.
-    if (set.parity.has(hdr.index)) return;
-    if (!set.nKnown && set.maxDataIndex >= nNew) { ++this.counters.structFail; return; }
-    set.n = nNew; set.nKnown = true;
-    // Only register the parity when the byte budget accepted it, otherwise
-    // retirement would subtract bytes that were never added and the global
-    // budget could drift below zero, silently disabling the ceiling.
-    if (this.store(set, hdr.index, symbol)) set.parity.set(hdr.index, symbol);
-    this.tryDecode(set, nowMs);
   }
 
   private store(set: RxSet, idx: number, symbol: Buffer): boolean {
@@ -561,8 +566,10 @@ export class FrameRx {
     if (found) return found;
     if (this.sets.size >= MAX_ACTIVE_SETS) {
       let victim: number | undefined;
-      for (const [id, st] of this.sets) if (!st.accounted) { victim = id; break; }
-      if (victim === undefined) for (const id of this.sets.keys()) { victim = id; break; }
+      for (const [id, st] of this.sets) if (!st.accounted && !st.pinned) { victim = id; break; }
+      if (victim === undefined) for (const id of this.sets.keys()) {
+        if (!this.sets.get(id)!.pinned) { victim = id; break; }
+      }
       if (victim === undefined) return null;
       const victimSet = this.sets.get(victim);
       if (victimSet) {
@@ -585,7 +592,7 @@ export class FrameRx {
       setId, n: 0, nKnown: false, k: 0, kKnown: false, d: 0, dKnown: false, symbolMax: 0, maxDataIndex: 0,
       data: new Map(), parity: new Map(), orig: new Set(), recov: new Set(),
       tFirstMs: nowMs, accounted: false, tombstoneUntilMs: 0,
-      hasAnySymbol: false, decodeAttempts: 0,
+      hasAnySymbol: false, decodeAttempts: 0, pinned: 0,
     };
     this.sets.set(setId, set);
     return set;
@@ -600,7 +607,7 @@ export class FrameRx {
         setId: id, n: 0, nKnown: false, k: 0, kKnown: false, d: 0, dKnown: false, symbolMax: 0, maxDataIndex: 0,
         data: new Map(), parity: new Map(), orig: new Set(), recov: new Set(),
         tFirstMs: nowMs, accounted: false, tombstoneUntilMs: 0,
-        hasAnySymbol: false, decodeAttempts: 0,
+        hasAnySymbol: false, decodeAttempts: 0, pinned: 0,
       };
       this.sets.set(id, set);
     }
@@ -616,18 +623,24 @@ export class FrameRx {
   /** Settle sets that have gone quiet; mirrors FcpSettle's 1 s / 2 s clocks. */
   onTick(nowMs: number): void {
     for (const [id, set] of [...this.sets]) {
-      const boundary = set.hasAnySymbol ? (set.nKnown ? set.n : set.maxDataIndex + 1) : 0;
-      if (!set.accounted && nowMs - set.tFirstMs >= 1000) {
-        set.accounted = true;
-        this.accountBoundary.set(id, boundary);
-        this.accountSet(set);
-        this.emit('accounted', id);
-      }
-      if (nowMs - set.tFirstMs >= 2000) {
-        this.symbolBytes -= this.setBytes(set);
-        if (set.accounted) { this.retired.add(id); this.pruneRetired(); }
-        this.sets.delete(id);
-        this.accountBoundary.delete(id);
+      if (set.pinned) continue;
+      ++set.pinned;
+      try {
+        const boundary = set.hasAnySymbol ? (set.nKnown ? set.n : set.maxDataIndex + 1) : 0;
+        if (!set.accounted && nowMs - set.tFirstMs >= 1000) {
+          set.accounted = true;
+          this.accountBoundary.set(id, boundary);
+          this.accountSet(set);
+          this.emit('accounted', id);
+        }
+        if (nowMs - set.tFirstMs >= 2000) {
+          this.symbolBytes -= this.setBytes(set);
+          if (set.accounted) { this.retired.add(id); this.pruneRetired(); }
+          this.sets.delete(id);
+          this.accountBoundary.delete(id);
+        }
+      } finally {
+        --set.pinned;
       }
     }
   }
@@ -645,6 +658,16 @@ export class FrameRx {
       // NOT a tail drop, which is the 1 s heuristic for a set that had data
       // but no parity. Reporting it as tailDropped also mis-set FLG_TAIL_DROPPED.
       ++this.counters.setsKUnknown;
+      return;
+    }
+    if (!this.haveAccounted || seqAfter(set.setId, this.accountedThrough)) {
+      this.accountedThrough = set.setId;
+      this.haveAccounted = true;
+    }
+    // Data without any parity is an incomplete tail once the settle clock fires.
+    // Counting it as a full expected set inflated the controller's denominator.
+    if (!set.nKnown && set.kKnown && set.k > 0) {
+      ++this.counters.setsTailDropped;
       return;
     }
     const nUsed = set.nKnown ? set.n : set.maxDataIndex + 1;
@@ -671,10 +694,6 @@ export class FrameRx {
       ++this.counters.ledgerGroups;
       this.counters.ledgerKHist[set.k] = (this.counters.ledgerKHist[set.k] ?? 0) + 1;
       if (orig + recov < nUsed) ++this.counters.ledgerFailed;
-    }
-    if (!this.haveAccounted || seqAfter(set.setId, this.accountedThrough)) {
-      this.accountedThrough = set.setId;
-      this.haveAccounted = true;
     }
   }
 

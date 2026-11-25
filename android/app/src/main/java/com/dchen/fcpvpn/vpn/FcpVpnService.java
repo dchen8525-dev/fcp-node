@@ -45,7 +45,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>数据流：TUN 读 IP 包 → PacketRouter（虚拟 TCP + LAN/DNS 豁免）→
  * TunnelManager（引擎生命周期 + 指数退避重连）→ TunnelEngine → FCP 隧道。</p>
  *
- * <p>TUN 配置照搬 kcp：仅通告 IPv4 0.0.0.0/0（Happy Eyeballs 正确回退，见下），
+ * <p>TUN 配置：IPv4 走 0.0.0.0/0；IPv6 也通告（fd00::2/128 + ::/0）后由
+ * PacketRouter 快速拒绝——不收进 TUN 的话 IPv6 会绕过隧道直出（见 buildVpnInterface）。
  * DNS 通告 1.1.1.1/8.8.8.8 由 PacketRouter 本地中继，排除本应用自身。</p>
  */
 public class FcpVpnService extends VpnService {
@@ -91,6 +92,15 @@ public class FcpVpnService extends VpnService {
     private final AtomicInteger closeEpoch = new AtomicInteger(0);
 
     private final AtomicBoolean running = new AtomicBoolean(false);
+    // 用户明确要求停止：拆到一半时来的 stop 不能被"重建"覆盖回去。
+    private final AtomicBoolean stopRequested = new AtomicBoolean(false);
+    // 重建流程的同步标志：restartPending = 有新配置待应用；restarting = 正在重建。
+    private final AtomicBoolean restartPending = new AtomicBoolean(false);
+    private final AtomicBoolean restarting = new AtomicBoolean(false);
+    // startVpn() 正在装配：整个装配期间持有，避免重建与启动两条路径同时建 TUN。
+    private final AtomicBoolean starting = new AtomicBoolean(false);
+    /** 当前 TUN 实际生效的 MTU（establish 成功后写入）。 */
+    private volatile int tunMtuInUse;
     private volatile VpnConnectionState connectionState;
 
     // 配置参数
@@ -148,9 +158,14 @@ public class FcpVpnService extends VpnService {
 
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             Logger.info(LogConfig.MODULE_VPN, "Stop action received");
+            stopRequested.set(true);
             stopVpn();
             return START_NOT_STICKY;
         }
+
+        // 新的启动请求：撤销之前记录的"停止"意图（服务被 stopSelf 后又被拉起
+        // 是合法的重启流程）。
+        stopRequested.set(false);
 
         if (intent != null) {
             serverHost = intent.getStringExtra(EXTRA_SERVER_HOST);
@@ -188,18 +203,75 @@ public class FcpVpnService extends VpnService {
         startForegroundService();
         Log.i(TAG, "Foreground started, starting VPN engine");
 
+        // 装配与重建必须互斥：restartVpn() 在 closeVpn() 里会把 running 置回 false，
+        // 那个窗口里若再走一次 running.compareAndSet(false,true) 就会另起一个
+        // VPN-Start 线程，与重建自己的 startVpn 同时装配——两个 TUN、两个读线程、
+        // fd 泄漏。所以在 CAS 之前先看这两个标志，有请求就排队。
+        if (restarting.get() || starting.get()) {
+            Logger.info(LogConfig.MODULE_VPN,
+                    "Start/restart in progress; queued new config for the running one");
+            restartPending.set(true);
+            return START_STICKY;
+        }
+
         if (running.compareAndSet(false, true)) {
             Logger.info(LogConfig.MODULE_VPN, "Starting VPN on background thread...");
+            // 在 CAS 之后、线程真正跑起来之前就占住 starting：否则这中间到达的
+            // 第二个 intent 会看到 running=true 而 starting 还是 false，转去走
+            // 重建路径，与即将开始的这次装配撞车。
+            starting.set(true);
             // 在后台线程执行网络 I/O，避免主线程 ANR
             Thread startThread = new Thread(this::startVpn, "VPN-Start");
             startThread.start();
         } else {
-            // TODO(M4+): 已在运行时收到新配置应先拆旧再按新参数重启；
-            // 目前沿用 kcp 行为（UI 层"先断开再连接"保证参数生效）。
-            Logger.info(LogConfig.MODULE_VPN, "VPN already running");
+            // 已在运行：白名单（按应用代理）和服务器参数都只在 establish() 建立
+            // TUN 时生效，不重建就还是老配置——这正是"改了按应用代理却没反应"
+            // 的原因。这里拆旧建新（等价于 UI 的"断开再连接"）。
+            Logger.info(LogConfig.MODULE_VPN, "VPN already running, restarting to apply new config");
+            restartPending.set(true);
+            scheduleRestart();
         }
 
         return START_STICKY;
+    }
+
+    /** 安排一次重建：拆掉当前 TUN/引擎，按最新参数重新装一遍。 */
+    private void scheduleRestart() {
+        if (!restarting.compareAndSet(false, true)) {
+            return; // 已经在重建了（循环里会带上这次的新请求）
+        }
+        Thread t = new Thread(() -> {
+            try {
+                while (restartPending.getAndSet(false)) {
+                    if (stopRequested.get()) break;
+                    restartVpn();
+                }
+            } finally {
+                restarting.set(false);
+                // 收尾竞态：刚退出循环又来了新请求 → 再拉起一轮
+                if (restartPending.get() && !stopRequested.get()) {
+                    scheduleRestart();
+                }
+            }
+        }, "VPN-Restart");
+        t.start();
+    }
+
+    /**
+     * 按最新参数重建 VPN。白名单与服务器参数都只在建立 TUN 时生效，所以必须
+     * 拆掉旧的再装新的——等价于 UI 的"断开再连接"，但不用用户手动操作。
+     */
+    private void restartVpn() {
+        // 重建不能清持久化参数，也不能先拷贝旧快照：closeVpn 执行期间到达的新
+        // intent 已经更新字段，下一轮必须直接使用这份最新配置。
+        Logger.info(LogConfig.MODULE_VPN, "restartVpn(): 重建 TUN 以应用新配置/新白名单");
+        closeVpn(false);
+        if (stopRequested.get()) {
+            running.set(false);
+            return;
+        }
+        running.set(true);
+        startVpn();
     }
 
     /** 参数健全性检查（UI 已校验过，这里兜底防 START_STICKY 恢复出坏值）。 */
@@ -282,14 +354,41 @@ public class FcpVpnService extends VpnService {
      * 启动 VPN：建 TUN → 引擎 → 路由器 → 读线程。
      */
     private void startVpn() {
+        starting.set(true);
+        try {
+            doStartVpn();
+        } finally {
+            starting.set(false);
+            // 装配期间攒下的重建请求：这一轮结束后再应用（此时 restarting 可能
+            // 仍为真，scheduleRestart 会直接返回，由重建循环的下一轮接手）。
+            if (running.get() && !stopRequested.get() && restartPending.get()) {
+                scheduleRestart();
+            }
+        }
+    }
+
+    private void doStartVpn() {
         Logger.info(LogConfig.MODULE_VPN, "startVpn() begin");
 
-        // 重置 closeVpn 的一次性标志。同步块保证：任何在此刻之前开始执行的
-        // closeVpn 已经完整退出，不会与新启动的装配交错。
-        synchronized (this) {
-            vpnClosed = false;
+        // 用户在装配途中点了"断开"：不要把隧道又拉起来。
+        if (stopRequested.get()) {
+            Logger.info(LogConfig.MODULE_VPN, "startVpn() aborted: stop requested");
+            running.set(false);
+            return;
         }
-        final int startEpoch = closeEpoch.get();
+
+        // 重置 closeVpn 的一次性标志。同步块保证：任何在此刻之前开始执行的
+        // closeVpn 已经完整退出，不会与新启动的装配交错；若停止恰好落在检查
+        // 与拿锁之间，也必须在这里拦住，不能重置 epoch 后把 VPN 重新拉起来。
+        final int startEpoch;
+        synchronized (this) {
+            if (stopRequested.get()) {
+                running.set(false);
+                return;
+            }
+            vpnClosed = false;
+            startEpoch = closeEpoch.get();
+        }
 
         connectionState = VpnConnectionState.CONNECTING;
         broadcastState();
@@ -328,7 +427,7 @@ public class FcpVpnService extends VpnService {
             tm.start(engineCfg, protector);
 
             // 数据包路由器：TUN ↔ 隧道流搬运（含 LAN/DNS 豁免）
-            PacketRouter pr = new PacketRouter(tm, mtuMin);
+            PacketRouter pr = new PacketRouter(tm, activeTunMtu());
             packetRouter = pr;
             pr.setSocketProtector(protector);
             pr.start();
@@ -367,54 +466,117 @@ public class FcpVpnService extends VpnService {
 
     /**
      * 建 TUN。路由与 DNS 豁免策略照搬 kcp：
-     * 只通告 IPv4（0.0.0.0/0）——把 IPv6 也收进隧道会让所有 IPv6 目标在服务端
-     * 连接失败，而本地合成的 SYN-ACK 又击穿应用的 Happy Eyeballs 回退。不通告
-     * ::/0 后，应用的 IPv6 连接立即因无路由失败，Happy Eyeballs 正确回退到 IPv4。
-     * DNS 通告 1.1.1.1/8.8.8.8，由 PacketRouter 本地中继（不经隧道）。
+     * IPv4 走 0.0.0.0/0；IPv6 也通告（fd00::2/128 + ::/0），但路由器会把 IPv6
+     * 全部快速拒绝（回 ICMPv6 unreachable），应用于是立刻回退到 IPv4。
+     *
+     * <p>为什么必须通告 IPv6：不通告的话，Android 的 per-UID VPN 规则只把 IPv4
+     * 收进 TUN，应用的 IPv6 流量会绕过隧道从物理网卡直出——"按应用代理"看上去
+     * 就完全没生效。收了再拒，既堵住泄漏，又能让 Happy Eyeballs 正确回退。</p>
+     *
+     * <p>DNS 通告 1.1.1.1/8.8.8.8，由 PacketRouter 本地中继（不经隧道）。</p>
      */
     private ParcelFileDescriptor buildVpnInterface() throws IOException,
             android.content.pm.PackageManager.NameNotFoundException {
+        // IPv6 必须收进 TUN 后拒绝；建立失败时退回 IPv4-only 会让应用绕过隧道。
+        return establishInterface(true);
+    }
+
+    /** 按模式建立 TUN。ipv6=true 时同时通告 IPv6 地址与 ::/0 路由。 */
+    private ParcelFileDescriptor establishInterface(boolean ipv6) throws IOException,
+            android.content.pm.PackageManager.NameNotFoundException {
+        // IPv6 要求链路 MTU ≥ 1280，否则内核不在该接口启用 IPv6（::/0 就白通告了）。
+        final int tunMtu = ipv6
+                ? Math.max(baseMtu(), VpnConfig.VPN_MTU_V6_MIN)
+                : baseMtu();
         Builder builder = new Builder();
         builder.setSession(VpnConfig.VPN_SESSION_NAME)
-                .setMtu(mtuMin > 0 ? mtuMin : VpnConfig.VPN_MTU)
+                .setMtu(tunMtu)
                 .addAddress(VpnConfig.VPN_ADDRESS, VpnConfig.VPN_ADDRESS_PREFIX)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8");
+        if (ipv6) {
+            builder.addAddress(VpnConfig.VPN_ADDRESS_V6, VpnConfig.VPN_ADDRESS_V6_PREFIX)
+                    .addRoute("::", 0);
+        }
+        String routeDesc = ipv6 ? "0.0.0.0/0 + ::/0 (IPv6 收进 TUN 后快速拒绝)"
+                : "0.0.0.0/0 (IPv4 only)";
 
         // 分应用代理：白名单非空时只有选中的应用走 VPN，其余直连。
-        // addAllowedApplication 与 addDisallowedApplication 互斥，因此两种情形
-        // 只能二选一；白名单里若出现自己会被 VPN 回环，这里跳过。
+        //
+        // addAllowedApplication 与 addDisallowedApplication 互斥，而且
+        // Builder 内部是"两个列表各一个"：只要 addAllowedApplication 被调用过
+        // （哪怕紧接着抛 NameNotFoundException），allowed 列表就已经非空，
+        // 此后再调 addDisallowedApplication 会抛 IllegalStateException。
+        // 所以这里不靠异常控制流：先把"哪些包真的能用"算清楚，再二选一。
         java.util.Set<String> onlyApps = ConfigStore.getVpnApps(this);
-        int applied = 0;
+        java.util.List<String> usable = new java.util.ArrayList<>();
         int missing = 0;
+        for (String pkg : onlyApps) {
+            if (pkg == null || pkg.trim().isEmpty()) continue;
+            if (pkg.equals(getPackageName())) continue; // 自己走 VPN 会回环
+            if (isPackageUsable(pkg)) {
+                usable.add(pkg);
+            } else {
+                ++missing;
+            }
+        }
+
         if (onlyApps.isEmpty()) {
+            // 没有白名单 = 全部应用走 VPN，只排除自己
             builder.addDisallowedApplication(getPackageName());
-            Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=0.0.0.0/0 (IPv4 only)"
+            Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=" + routeDesc
                     + " dns=1.1.1.1,8.8.8.8 mode=all-apps excludedApp=" + getPackageName());
+        } else if (usable.isEmpty()) {
+            // 白名单全部失效时不能改成代理所有应用，那会把未授权应用也送进隧道。
+            Logger.error(LogConfig.MODULE_VPN,
+                    "VPN 白名单里的 " + missing + " 个应用全部已卸载/已禁用，拒绝启动");
+            return null;
         } else {
-            for (String pkg : onlyApps) {
-                if (pkg == null || pkg.equals(getPackageName())) continue;
+            for (String pkg : usable) {
                 try {
                     builder.addAllowedApplication(pkg);
-                    ++applied;
                 } catch (android.content.pm.PackageManager.NameNotFoundException e) {
-                    // 应用已卸载：跳过，不让整条隧道建不起来
+                    // 检查与调用之间应用被卸载：跳过，不让整条隧道建不起来
                     ++missing;
                 }
             }
-            if (applied == 0) {
-                // 白名单里的应用全都没了：退回全部应用，总比建一个空隧道强
-                builder.addDisallowedApplication(getPackageName());
-                Logger.warning(LogConfig.MODULE_VPN,
-                        "VPN 白名单里的应用都已卸载，退回全部应用模式");
-            } else {
-                Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=0.0.0.0/0 (IPv4 only)"
-                        + " dns=1.1.1.1,8.8.8.8 mode=whitelist apps=" + applied
-                        + " missing=" + missing);
-            }
+            Logger.info(LogConfig.MODULE_VPN, "VPN Builder route=" + routeDesc
+                    + " dns=1.1.1.1,8.8.8.8 mode=whitelist apps=" + usable.size()
+                    + " missing=" + missing);
         }
-        return builder.establish();
+        ParcelFileDescriptor pfd = builder.establish();
+        if (pfd != null) {
+            // 记下这次真正生效的 TUN MTU：PacketRouter 的分段上限与读线程缓冲区
+            // 都必须与它一致（IPv6 模式下它可能高于 mtuMin）。
+            tunMtuInUse = tunMtu;
+        }
+        return pfd;
+    }
+
+    /** 引擎/接口的基础 MTU（未通告 IPv6 时的 TUN MTU）。 */
+    private int baseMtu() {
+        return mtuMin > 0 ? mtuMin : VpnConfig.VPN_MTU;
+    }
+
+    /** 当前 TUN 实际 MTU；还没建立接口时退回基础值。 */
+    private int activeTunMtu() {
+        int m = tunMtuInUse;
+        return m > 0 ? m : baseMtu();
+    }
+
+    /**
+     * 包是否还能被 addAllowedApplication 接受：必须已安装且未被禁用
+     * （Builder 内部的校验对"已禁用"同样抛 NameNotFoundException）。
+     */
+    private boolean isPackageUsable(String pkg) {
+        try {
+            android.content.pm.ApplicationInfo info =
+                    getPackageManager().getApplicationInfo(pkg, 0);
+            return info.enabled;
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            return false;
+        }
     }
 
     /**
@@ -472,7 +634,9 @@ public class FcpVpnService extends VpnService {
 
     private void startVpnReadThread(PacketRouter router) {
         vpnReadThread = new Thread(() -> {
-            ByteBuffer buffer = ByteBuffer.allocate(mtuMin > 0 ? mtuMin + 64 : 1104);
+            // 缓冲区按实际 TUN MTU 取：IPv6 模式下 MTU 会被抬到 1280，
+            // 仍按 mtuMin 分配会把超出的包截断。
+            ByteBuffer buffer = ByteBuffer.allocate(Math.max(activeTunMtu() + 64, 1104));
 
             while (running.get()) {
                 try {
@@ -563,6 +727,10 @@ public class FcpVpnService extends VpnService {
      * 调用，且 writeToVpn 也锁 this；没有它两个 closeVpn 会交错地把字段置 null。
      */
     private synchronized void closeVpn() {
+        closeVpn(true);
+    }
+
+    private synchronized void closeVpn(boolean clearParams) {
         if (vpnClosed) {
             return;
         }
@@ -629,15 +797,16 @@ public class FcpVpnService extends VpnService {
         vpnOutputChannel = null;
         vpnInterface = null;
 
-        // 清除保存的参数（完整拆除意味着用户停止或授权被撤销，
-        // START_STICKY 不应再用旧参数复活）
-        clearSavedParams();
+        // 完整拆除意味着用户停止或授权被撤销，START_STICKY 不应再用旧参数复活。
+        // 配置重建只拆装 TUN，必须保留 onStartCommand 刚保存的最新参数。
+        if (clearParams) clearSavedParams();
 
         Logger.info(LogConfig.MODULE_VPN, "VPN closed");
     }
 
     @Override
     public void onDestroy() {
+        stopRequested.set(true);
         closeVpn();
         connectionState = VpnConnectionState.DISCONNECTED;
         broadcastState();
@@ -648,6 +817,7 @@ public class FcpVpnService extends VpnService {
     @Override
     public void onRevoke() {
         Logger.warning(LogConfig.MODULE_VPN, "VPN authorization revoked");
+        stopRequested.set(true);
         closeVpn();
         connectionState = VpnConnectionState.DISCONNECTED;
         broadcastState();
@@ -657,6 +827,7 @@ public class FcpVpnService extends VpnService {
 
     /** 停止 VPN（ACTION_STOP 与外部调用）。 */
     public void stopVpn() {
+        stopRequested.set(true);
         closeVpn();
         connectionState = VpnConnectionState.DISCONNECTED;
         broadcastState();

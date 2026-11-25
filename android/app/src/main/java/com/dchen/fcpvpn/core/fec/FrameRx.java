@@ -551,6 +551,20 @@ public final class FrameRx {
             ++counters.setsKUnknown;
             return;
         }
+        // 单调键先推进：即使这个集合被下面判成尾巴丢弃，它也已经被结算过了，
+        // 迟到的符号不得再让它进入结算（frame.ts:663-666）。
+        if (!haveAccounted || Seq.seqAfter(set.setId, accountedThrough)) {
+            accountedThrough = set.setId;
+            haveAccounted = true;
+        }
+        // 结算钟响时只有 data、始终没有 parity 声明的集合是不完整的尾巴：它没有
+        // n，只能按 maxDataIndex+1 猜一个码长，计进 setsExpected/dataExpected 会
+        // 把控制器的分母撑大（frame.ts:667-672）。k 未知的集合不走这条：
+        // 那连组大小都没有依据（空隙占位在上面已单列）。
+        if (!set.nKnown && set.kKnown && set.k > 0) {
+            ++counters.setsTailDropped;
+            return;
+        }
         int nUsed = set.nKnown ? set.n : set.maxDataIndex + 1;
         int orig = 0;
         int recov = 0;
@@ -572,10 +586,6 @@ public final class FrameRx {
             ++counters.ledgerGroups;
             counters.ledgerKHist[set.k]++;
             if (orig + recov < nUsed) ++counters.ledgerFailed;
-        }
-        if (!haveAccounted || Seq.seqAfter(set.setId, accountedThrough)) {
-            accountedThrough = set.setId;
-            haveAccounted = true;
         }
     }
 

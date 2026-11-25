@@ -25,9 +25,12 @@ import java.util.Arrays;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -78,6 +81,8 @@ public class PacketRouter {
     // 隧道内 TCP DNS：服务端监听 53/tcp 做 UDP->DNS 转发（受限网络里本地公共解析器不通时的回退）。
     private static final int DNS_TUNNEL_PORT = 53;
     private static final int DNS_TUNNEL_TIMEOUT_MS = 6000;
+    private static final int DNS_RELAY_THREADS = 4;
+    private static final int DNS_RELAY_QUEUE_CAPACITY = 64;
 
     private final TunnelManager tunnelManager;
     private final int tunMtu;
@@ -88,9 +93,15 @@ public class PacketRouter {
     private final AtomicLong nextTcpSequence = new AtomicLong(System.nanoTime());
     private final AtomicLong udpTraceCounter = new AtomicLong(0);
     private volatile boolean running;
+    // 连接注册与 stop 清表必须互斥：否则 running 检查后仍可能把新连接插回已停表。
+    private final Object lifecycleLock = new Object();
     private volatile SocketProtector socketProtector;
-    // DNS 中继线程池：固定小池排队即可，单个查询有 5s socket 超时，任务时长有界。
+    // DNS 中继线程池：固定小池 + 有界队列。队列满时丢弃最新查询，绝不在 TUN
+    // 读取线程里等待 DNS；shutdownNow 会清空排队任务并中断正在执行的任务。
     private volatile ExecutorService dnsRelayExecutor;
+    private final AtomicLong dnsRelayRejections = new AtomicLong();
+    // 本地 UDP fallback 的在途 socket：stop 不能只靠 shutdownNow，receive 还需要显式关闭。
+    private final java.util.Set<DatagramSocket> inFlightDnsSockets = ConcurrentHashMap.newKeySet();
     // DNS 应答缓存：key = "name|qtype"（小写），TTL 取自应答报文并钳位。
     private final java.util.concurrent.ConcurrentHashMap<String, DnsCacheEntry> dnsCache =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -98,7 +109,30 @@ public class PacketRouter {
     private static final int DNS_CACHE_MIN_TTL_S = 30;     // 太短的 TTL 不值得缓存
     private static final int DNS_CACHE_MAX_TTL_S = 3600;   // 上限 1 小时
     private static final int DNS_CACHE_NEGATIVE_TTL_S = 15; // 负应答（无记录/错误）短缓存
-    private Thread cleanupThread;
+    // 已告警过的 UDP 目的端口：非 DNS 的 UDP 一律丢弃，每个端口只告警一次。
+    private final java.util.Set<Integer> warnedUdpPorts = ConcurrentHashMap.newKeySet();
+    // 已被就地空应答过的 AAAA 域名：只为前 64 个域名打日志，避免刷屏。
+    private final java.util.Set<String> loggedAaaaNames = ConcurrentHashMap.newKeySet();
+    // IPv6 拒绝：限流 + 已告警过的目的地址（每个地址只告警一次，且设上限）。
+    // 上限取得够宽：一个页面同时开几十条 IPv6 连接是常态，限得太死会让后一半
+    // 连接拿不到 ICMPv6、退化成干等超时。
+    private static final int IPV6_REJECT_MAX_PER_SEC = 200;
+    /** TUN 的本地 IPv6 地址：ICMPv6 拒绝报文按 RFC 4443 用它做源地址。 */
+    private static final byte[] TUN_ADDR_V6 = parseIpv6Literal(VpnConfig.VPN_ADDRESS_V6);
+    private final java.util.Set<String> warnedIpv6Targets = ConcurrentHashMap.newKeySet();
+    private final AtomicLong ipv6RejectSecond = new AtomicLong(0);
+    private final java.util.concurrent.atomic.AtomicInteger ipv6RejectCount =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /** 解析 IPv6 字面量（只用于本地常量，不会走 DNS）。 */
+    private static byte[] parseIpv6Literal(String literal) {
+        try {
+            return java.net.InetAddress.getByName(literal).getAddress();
+        } catch (java.net.UnknownHostException e) {
+            return new byte[IPV6_ADDR_LEN];
+        }
+    }
+    private volatile Thread cleanupThread;
 
     public PacketRouter(TunnelManager tunnelManager) {
         this(tunnelManager, VpnConfig.VPN_MTU);
@@ -114,41 +148,67 @@ public class PacketRouter {
     }
 
     public void start() {
-        running = true;
-        dnsRelayExecutor = Executors.newFixedThreadPool(4, r -> {
-            Thread t = new Thread(r, "Fcp-DNS-Relay");
-            t.setDaemon(true);
-            return t;
-        });
-        startCleanupThread();
+        synchronized (lifecycleLock) {
+            if (running) {
+                return;
+            }
+            running = true;
+            dnsRelayExecutor = new ThreadPoolExecutor(
+                    DNS_RELAY_THREADS, DNS_RELAY_THREADS, 0L, TimeUnit.MILLISECONDS,
+                    new ArrayBlockingQueue<>(DNS_RELAY_QUEUE_CAPACITY),
+                    r -> {
+                        Thread t = new Thread(r, "Fcp-DNS-Relay");
+                        t.setDaemon(true);
+                        return t;
+                    },
+                    (task, executor) -> {
+                        // 有界队列的明确丢弃策略：不让 execute() 阻塞 TUN 读取线程。
+                        // 限流日志，避免恶意 DNS 洪泛把 logcat 也打满。
+                        long rejected = dnsRelayRejections.incrementAndGet();
+                        if (rejected == 1 || rejected % 64 == 0) {
+                            Logger.warning(TAG_MODULE, "DNS relay queue full; dropped query #"
+                                    + rejected + ", capacity=" + DNS_RELAY_QUEUE_CAPACITY);
+                        }
+                    });
+            startCleanupThread();
+        }
         Logger.info(TAG_MODULE, "PacketRouter started tunMtu=" + tunMtu
                 + ", socketProtectorSet=" + (socketProtector != null));
     }
 
+    /**
+     * 幂等停止。这里绝不能 join 清理线程：TUN 写入需要 FcpVpnService 的同一把锁，
+     * 而 closeVpn 持锁调用 stop，等待清理线程完成写入会形成 ANR。
+     */
     public void stop() {
-        running = false;
-        // 先 join 清理线程再动它正在迭代的 map：中断对 sleep 生效前的那一轮迭代
-        // 若与 clear() 并发，会对已拆除的连接继续写 TUN / 回调（kcp 教训）。
-        Thread sweeper = cleanupThread;
-        cleanupThread = null;
-        if (sweeper != null) {
-            sweeper.interrupt();
-            try {
-                sweeper.join(2000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        synchronized (lifecycleLock) {
+            if (!running) {
+                return;
             }
-        }
-        dnsCache.clear();
-        if (dnsRelayExecutor != null) {
-            dnsRelayExecutor.shutdownNow();
+            running = false;
+            Thread sweeper = cleanupThread;
+            cleanupThread = null;
+            if (sweeper != null) {
+                sweeper.interrupt();
+            }
+
+            dnsCache.clear();
+            ExecutorService relay = dnsRelayExecutor;
             dnsRelayExecutor = null;
+            if (relay != null) {
+                relay.shutdownNow();
+            }
+            for (DatagramSocket socket : inFlightDnsSockets) {
+                socket.close();
+            }
+            inFlightDnsSockets.clear();
+
+            for (TcpConnection conn : connectionsById.values()) {
+                conn.close();
+            }
+            connectionsByKey.clear();
+            connectionsById.clear();
         }
-        for (TcpConnection conn : connectionsById.values()) {
-            conn.close();
-        }
-        connectionsByKey.clear();
-        connectionsById.clear();
         Logger.info(TAG_MODULE, "PacketRouter stopped");
     }
 
@@ -180,12 +240,15 @@ public class PacketRouter {
 
             if (version == 4) {
                 ipHeaderLen = (buf.get(0) & 0x0F) * 4;
-                if (packet.length < ipHeaderLen + 8) {
+                if (ipHeaderLen < IPV4_HEADER_LEN || packet.length < ipHeaderLen + 8) {
                     return;
                 }
 
                 totalLen = buf.getShort(2) & 0xFFFF;
-                if (totalLen <= 0 || totalLen > packet.length) {
+                if (totalLen < ipHeaderLen) {
+                    return;
+                }
+                if (totalLen > packet.length) {
                     totalLen = packet.length;
                 }
 
@@ -203,25 +266,21 @@ public class PacketRouter {
                     return;
                 }
 
-                // IPv6 固定 40 字节头：没有 IHL、没有头校验和；负载长度字段不含头本身。
-                ipHeaderLen = IPV6_HEADER_LEN;
+                // 本隧道只有 IPv4 通路：所有 IPv6 出站一律就地快速失败。
+                // 必须把 IPv6 收进 TUN 才能拒——不通告 ::/0 的话，应用的 IPv6
+                // 流量会绕过隧道从物理网卡直出（见 rejectIpv6 的说明）。
+                // 拒绝放在扩展头检查之前：带扩展头（分片头等）的报文同样要回
+                // ICMPv6，否则应用只能干等超时——而那正是这次改动要消除的现象。
                 int payloadLength = buf.getShort(4) & 0xFFFF;
-                totalLen = payloadLength + IPV6_HEADER_LEN;
-                if (totalLen > packet.length) {
-                    totalLen = packet.length;
+                int totalLen6 = payloadLength + IPV6_HEADER_LEN;
+                if (totalLen6 > packet.length) {
+                    totalLen6 = packet.length;
                 }
-
-                protocol = buf.get(6) & 0xFF;
-                // 扩展头会把"上层协议"挤到后面的 next header 里，分片头则意味着我们
-                // 手里只是一个片段。两者都直接丢弃——与 IPv4 路径丢弃分片的策略一致。
-                if (isIpv6ExtensionHeader(protocol)) {
-                    Logger.debug(TAG_MODULE,
-                            "Ignoring IPv6 packet with extension header nextHeader=" + protocol);
-                    return;
-                }
-
-                srcAddr = Arrays.copyOfRange(packet, 8, 24);
-                dstAddr = Arrays.copyOfRange(packet, 24, 40);
+                rejectIpv6(packet,
+                        Arrays.copyOfRange(packet, 8, 24),
+                        Arrays.copyOfRange(packet, 24, 40),
+                        totalLen6, writePacketCallback);
+                return;
             } else {
                 return;
             }
@@ -286,6 +345,13 @@ public class PacketRouter {
             }
             conn = createConnection(key, srcAddr, srcPort, dstAddr, dstPort, clientSeq,
                     writePacketCallback);
+            if (conn == null) {
+                return;
+            }
+        }
+
+        if (!running || conn.closed) {
+            return;
         }
 
         if (isSyn && !isAck) {
@@ -314,6 +380,7 @@ public class PacketRouter {
 
         if (isAck) {
             UnackedSegment retransmit = null;
+            boolean sendPendingFin = false;
             synchronized (conn) {
                 conn.lastAckFromClient = clientAck;
                 // 窗口随每个应用报文按 RFC 793 规则刷新；窗口重新打开时要先
@@ -324,6 +391,9 @@ public class PacketRouter {
                 }
                 int removed = conn.removeAckedServerSegments(clientAck);
                 flushPendingSegments(conn, writePacketCallback);
+                if (conn.serverFinPending && !conn.hasPendingSegments()) {
+                    sendPendingFin = true;
+                }
                 if (removed > 0 || !conn.hasUnackedServerData()) {
                     conn.resetDupAcks();
                 } else if (conn.tickDupAck()) {
@@ -350,6 +420,9 @@ public class PacketRouter {
                         + ", seq=" + (retransmit.seq & 0xFFFFFFFFL)
                         + ", len=" + retransmit.length);
             }
+            if (sendPendingFin) {
+                sendFinToApp(conn);
+            }
         }
 
         if (isRst) {
@@ -368,48 +441,68 @@ public class PacketRouter {
         if (payloadLen > 0) {
             byte[] payload = new byte[payloadLen];
             System.arraycopy(packet, payloadOffset, payload, 0, payloadLen);
+            byte[] newPayload = null;
             synchronized (conn) {
-                if (clientSeq < conn.clientNextSeq) {
-                    byte[] ackPacket = buildTcpPacket(conn, new byte[0], (byte) 0x10,
-                            conn.serverNextSeq, conn.clientNextSeq);
-                    writePacketCallback.onWritePacket(ackPacket);
-                    logTcpOut(conn, 0x10, conn.serverNextSeq, conn.clientNextSeq, 0);
-                    Logger.debug(TAG_MODULE, "Ignoring duplicate TCP payload: connectionId="
-                            + conn.connectionId + ", seq=" + clientSeq
-                            + ", expected=" + conn.clientNextSeq);
-                    return;
-                }
-                if (clientSeq != conn.clientNextSeq) {
+                if (seqBefore(clientSeq, conn.clientNextSeq)) {
+                    // 只丢已确认前缀；部分重叠的新后缀仍必须转发。int 减法保留
+                    // 低 32 位，因此跨 wrap 的重传前缀长度同样正确。
+                    int duplicateBytes = conn.clientNextSeq - clientSeq;
+                    if (duplicateBytes < payloadLen) {
+                        newPayload = Arrays.copyOfRange(payload, duplicateBytes, payloadLen);
+                        conn.clientNextSeq += newPayload.length;
+                        conn.touch();
+                    } else {
+                        Logger.debug(TAG_MODULE, "Ignoring duplicate TCP payload: connectionId="
+                                + conn.connectionId + ", seq=" + clientSeq
+                                + ", expected=" + conn.clientNextSeq);
+                    }
+                } else if (clientSeq != conn.clientNextSeq) {
                     Logger.warning(TAG_MODULE, "Dropping out-of-order TCP payload: connectionId="
                             + conn.connectionId + ", seq=" + clientSeq
                             + ", expected=" + conn.clientNextSeq + ", payloadLength=" + payloadLen);
-                    return;
+                } else {
+                    newPayload = payload;
+                    conn.clientNextSeq += payloadLen;
+                    conn.touch();
                 }
-                conn.clientNextSeq += payloadLen;
-                conn.touch();
             }
 
-            sendOutboundTcpData(conn, payload);
+            if (newPayload != null) {
+                sendOutboundTcpData(conn, newPayload);
+            }
+            int dataAckSeq;
+            int dataAck;
+            synchronized (conn) {
+                dataAckSeq = conn.serverNextSeq;
+                dataAck = conn.clientNextSeq;
+            }
+            // 重传与乱序包都回当前 next，促使对端重传缺口并推进窗口。
             byte[] ackPacket = buildTcpPacket(conn, new byte[0], (byte) 0x10,
-                    conn.serverNextSeq, conn.clientNextSeq);
+                    dataAckSeq, dataAck);
             writePacketCallback.onWritePacket(ackPacket);
-            logTcpOut(conn, 0x10, conn.serverNextSeq, conn.clientNextSeq, 0);
+            logTcpOut(conn, 0x10, dataAckSeq, dataAck, 0);
             Logger.debug(TAG_MODULE, "DATA frame: connectionId=" + conn.connectionId
                     + ", src=" + conn.srcHost + ":" + conn.srcPort
                     + ", dst=" + conn.dstHost + ":" + conn.dstPort
-                    + ", payloadLength=" + payloadLen);
+                    + ", payloadLength=" + (newPayload == null ? 0 : newPayload.length));
         }
 
         if (isFin) {
-            boolean firstFin;
+            boolean firstFin = false;
+            boolean finAccepted = false;
             synchronized (conn) {
-                firstFin = !conn.clientFinSeen;
-                conn.clientFinSeen = true;
-                conn.clientNextSeq = Math.max(conn.clientNextSeq, clientSeq + payloadLen + 1);
-                conn.state = TcpState.CLOSING;
-                conn.touch();
+                // FIN 只有落在当前 next 才能消费；有缺口或重复 FIN 都不能推进序号。
+                int finSeq = clientSeq + payloadLen;
+                if (finSeq == conn.clientNextSeq) {
+                    finAccepted = true;
+                    firstFin = !conn.clientFinSeen;
+                    conn.clientFinSeen = true;
+                    conn.clientNextSeq = finSeq + 1;
+                    conn.state = TcpState.CLOSING;
+                    conn.touch();
+                }
             }
-            if (firstFin) {
+            if (finAccepted && firstFin) {
                 // 应用半关闭：隧道侧 closeWrite（发完已排队数据后发 FIN），保留
                 // 连接继续接收对端在途数据（StreamHandle 半关闭语义）。
                 sendCloseToOutbound(conn, false);
@@ -417,7 +510,7 @@ public class PacketRouter {
                         + ", src=" + conn.srcHost + ":" + conn.srcPort
                         + ", dst=" + conn.dstHost + ":" + conn.dstPort + ", payloadLength=0");
             }
-            // 本地 FIN 只回 ACK，会话保留至远端把在途数据排空。
+            // 本地 FIN（含缺口/重复 FIN）只回当前 ACK，不越过空洞。
             int finAckSeq;
             int finAckAck;
             synchronized (conn) {
@@ -427,7 +520,7 @@ public class PacketRouter {
             byte[] ackPacket = buildTcpPacket(conn, new byte[0], (byte) 0x10, finAckSeq, finAckAck);
             writePacketCallback.onWritePacket(ackPacket);
             logTcpOut(conn, 0x10, finAckSeq, finAckAck, 0);
-            if (conn.serverFinSeen) {
+            if (finAccepted && conn.serverFinSeen) {
                 removeConnection(conn);
             }
         }
@@ -440,18 +533,22 @@ public class PacketRouter {
                 srcPort, dstAddr, dstPort, (int) nextTcpSequence.addAndGet(0x10000L),
                 writePacketCallback);
         conn.clientNextSeq = clientSeq + 1;
-        connectionsByKey.put(key, conn);
-        connectionsById.put(conn.connectionId, conn);
-
-        if (dstAddr.length == 4 && isLanAddress(dstAddr)) {
-            // 局域网豁免：不经隧道，用受保护 socket 直连目标并双向搬运。
-            Logger.info(TAG_MODULE, "TCP SYN connectionId=" + conn.connectionId
-                    + " mode=LAN_DIRECT dst=" + conn.dstHost + ":" + conn.dstPort);
-            startLanRelay(conn);
-        } else {
-            Logger.info(TAG_MODULE, "TCP SYN connectionId=" + conn.connectionId
-                    + " mode=TUNNEL dst=" + conn.dstHost + ":" + conn.dstPort);
-            startTunnelOpen(conn);
+        synchronized (lifecycleLock) {
+            if (!running) {
+                return null;
+            }
+            connectionsByKey.put(key, conn);
+            connectionsById.put(conn.connectionId, conn);
+            if (dstAddr.length == 4 && isLanAddress(dstAddr)) {
+                // 局域网豁免：不经隧道，用受保护 socket 直连目标并双向搬运。
+                Logger.info(TAG_MODULE, "TCP SYN connectionId=" + conn.connectionId
+                        + " mode=LAN_DIRECT dst=" + conn.dstHost + ":" + conn.dstPort);
+                startLanRelay(conn);
+            } else {
+                Logger.info(TAG_MODULE, "TCP SYN connectionId=" + conn.connectionId
+                        + " mode=TUNNEL dst=" + conn.dstHost + ":" + conn.dstPort);
+                startTunnelOpen(conn);
+            }
         }
         return conn;
     }
@@ -484,12 +581,18 @@ public class PacketRouter {
 
     /** 引擎流就绪：挂 listener，把建流期间缓冲的应用数据灌入隧道。 */
     private void attachTunnelStream(TcpConnection conn, StreamHandle stream) {
-        if (conn.closed) {
+        boolean attached;
+        synchronized (conn) {
+            attached = !conn.closed;
+            if (attached) {
+                conn.tunnelStream = stream;
+                conn.sink = new TunnelSink(stream, conn);
+            }
+        }
+        if (!attached) {
             stream.abort();
             return;
         }
-        conn.tunnelStream = stream;
-        conn.sink = new TunnelSink(stream);
         stream.setListener(new StreamHandle.Listener() {
             @Override
             public void onData(byte[] data, int offset, int len) {
@@ -519,6 +622,9 @@ public class PacketRouter {
         boolean doCloseWrite;
         boolean doAbort;
         synchronized (conn) {
+            if (conn.closed) {
+                return;
+            }
             buffered = conn.drainOutboundBuffer();
             doCloseWrite = conn.pendingCloseWrite;
             conn.pendingCloseWrite = false;
@@ -531,9 +637,8 @@ public class PacketRouter {
         }
         if (doAbort) {
             // 建流期间应用已 RST：立即中止刚建立的流。
-            stream.abort();
+            conn.abortTunnelStream();
             sendRstToApp(conn);
-            removeConnection(conn);
             return;
         }
         for (byte[] chunk : buffered) {
@@ -557,6 +662,11 @@ public class PacketRouter {
         Thread connector = new Thread(() -> {
             Socket socket = new Socket();
             try {
+                // 在 connect 前登记，stop/removeConnection 才能关闭正在连接的 socket。
+                if (!conn.registerLanSocket(socket)) {
+                    closeQuietly(socket);
+                    return;
+                }
                 SocketProtector protector = socketProtector;
                 if (protector != null) {
                     // 先 protect 再 connect：VPN 进程内新建的 socket 默认走 TUN。
@@ -571,11 +681,9 @@ public class PacketRouter {
                         InetAddress.getByAddress(conn.dstAddr), conn.dstPort),
                         LAN_CONNECT_TIMEOUT_MS);
                 socket.setTcpNoDelay(true);
-                if (conn.closed) {
-                    closeQuietly(socket);
+                if (conn.closed || !conn.attachLanSink(socket)) {
                     return;
                 }
-                conn.sink = new LanSink(socket);
                 Logger.info(TAG_MODULE, "LAN relay connected connectionId=" + conn.connectionId
                         + " dst=" + conn.dstHost + ":" + conn.dstPort);
 
@@ -583,6 +691,9 @@ public class PacketRouter {
                 boolean doCloseWrite;
                 boolean doAbort;
                 synchronized (conn) {
+                    if (conn.closed) {
+                        return;
+                    }
                     buffered = conn.drainOutboundBuffer();
                     doCloseWrite = conn.pendingCloseWrite;
                     conn.pendingCloseWrite = false;
@@ -594,10 +705,8 @@ public class PacketRouter {
                     conn.touch();
                 }
                 if (doAbort) {
-                    // 建连期间应用已 RST：直接关闭 socket 并拆除。
-                    closeQuietly(socket);
+                    // 建连期间应用已 RST：sendRstToApp 会经 removeConnection 统一关 socket。
                     sendRstToApp(conn);
-                    removeConnection(conn);
                     return;
                 }
                 OutputStream out = socket.getOutputStream();
@@ -616,14 +725,17 @@ public class PacketRouter {
             } catch (Exception e) {
                 Logger.warning(TAG_MODULE, "LAN relay failed connectionId=" + conn.connectionId
                         + " dst=" + conn.dstHost + ":" + conn.dstPort + " error=" + e.getMessage());
-                closeQuietly(socket);
                 if (!conn.closed) {
                     abortConnection(conn, "lan_connect_failed");
                 }
+            } finally {
+                conn.finishLanConnector(Thread.currentThread());
             }
         }, "Fcp-Lan-Connect-" + conn.connectionId);
         connector.setDaemon(true);
-        connector.start();
+        if (conn.registerLanConnector(connector)) {
+            connector.start();
+        }
     }
 
     /** socket→应用方向的常驻泵：读到 EOF 视为对端 FIN，异常视为 RST。 */
@@ -647,14 +759,16 @@ public class PacketRouter {
                     Logger.info(TAG_MODULE, "LAN relay read error connectionId="
                             + conn.connectionId + ": " + e.getMessage());
                     sendRstToApp(conn);
-                    removeConnection(conn);
                 }
             } finally {
-                closeQuietly(socket);
+                // socket 由 TcpConnection.close 统一关闭；这里只释放线程引用。
+                conn.finishLanPump(Thread.currentThread());
             }
         }, "Fcp-Lan-Pump-" + conn.connectionId);
         pump.setDaemon(true);
-        pump.start();
+        if (conn.registerLanPump(pump)) {
+            pump.start();
+        }
     }
 
     // ================================================================ 出站数据通路
@@ -765,14 +879,28 @@ public class PacketRouter {
         int ack;
         boolean bothDone;
         synchronized (conn) {
+            if (conn.serverFinSeen) {
+                return;
+            }
+            // 先冲刷窗口允许的 pending；仍有空洞时只记住远端 FIN，等 ACK/窗口
+            // 或清理线程的超时重传继续推进，绝不能直接用 serverNextSeq 越过数据。
+            conn.serverFinPending = true;
+            flushPendingSegments(conn, writePacketCallback);
+            if (conn.hasPendingSegments()) {
+                return;
+            }
             seq = conn.serverNextSeq;
             ack = conn.clientNextSeq;
             finPacket = buildTcpPacket(conn, new byte[0], (byte) 0x11, seq, ack);
             conn.serverNextSeq += 1;
             conn.serverFinSeen = true;
+            conn.serverFinPending = false;
             conn.state = TcpState.CLOSING;
             conn.touch();
             bothDone = conn.clientFinSeen;
+        }
+        if (!running || conn.closed) {
+            return;
         }
         try {
             writePacketCallback.onWritePacket(finPacket);
@@ -788,7 +916,7 @@ public class PacketRouter {
 
     /** 对端/本端异常中止：向应用回 RST 并摘除连接。 */
     private void sendRstToApp(TcpConnection conn) {
-        if (conn.closed) {
+        if (!running || conn.closed) {
             return;
         }
         WritePacketCallback writePacketCallback = conn.writePacketCallback;
@@ -812,6 +940,9 @@ public class PacketRouter {
      * 应用看到的是明确的连接重置（可以立即重试），而不是静默丢段导致的挂死。
      */
     private void abortConnection(TcpConnection conn, String reason) {
+        if (!running || conn.closed) {
+            return;
+        }
         sendCloseToOutbound(conn, true);
         sendRstToApp(conn);
         Logger.info(TAG_MODULE, "ABORT connectionId=" + conn.connectionId + " reason=" + reason);
@@ -823,7 +954,7 @@ public class PacketRouter {
      * dup-ACK，所以必须在 dup-ACK 判定之前冲刷。
      */
     private void flushPendingSegments(TcpConnection conn, WritePacketCallback writePacketCallback) {
-        while (conn.hasPendingSegments()) {
+        while (running && !conn.closed && conn.hasPendingSegments()) {
             UnackedSegment seg = conn.peekFirstPending();
             if (!conn.fitsInSendWindow(seg.seq, seg.length)) {
                 return;
@@ -838,8 +969,9 @@ public class PacketRouter {
 
     private void removeConnection(TcpConnection conn) {
         conn.close();
-        connectionsByKey.remove(conn.key);
-        connectionsById.remove(conn.connectionId);
+        // 旧连接的回调不能误删 stop/start 后同四元组的新连接。
+        connectionsByKey.remove(conn.key, conn);
+        connectionsById.remove(conn.connectionId, conn);
     }
 
     /** 该连接的 IP 族对应的单包最大 TCP 负载（保证 头 + TCP头 + 负载 ≤ MTU）。 */
@@ -849,8 +981,86 @@ public class PacketRouter {
                 : tunMtu - TCP_IPV4_HEADER_LEN;
     }
 
-    // ================================================================ UDP
+    // ================================================================ IPv6 拒绝
 
+    /**
+     * 拒绝 IPv6 出站流量（本隧道只有 IPv4 通路）。
+     *
+     * <p>为什么非拒不可：Android 的 per-UID VPN 规则只把本接口通告过的地址族收进
+     * TUN。如果接口只通告 0.0.0.0/0，应用的 IPv6 流量根本不会进 TUN，而是绕过
+     * 隧道从物理网卡直出——这正是"按应用代理看起来没生效"的直接原因：应用拿到
+     * AAAA（或走 DoH/DoT 拿到）就优先走 IPv6，那部分流量根本没进隧道。</p>
+     *
+     * <p>回 ICMPv6 Destination Unreachable 而不是静默丢弃：应用会立刻拿到
+     * "连接失败"并回退到 IPv4（Happy Eyeballs），而不是干等 IPv6 超时。</p>
+     */
+    private void rejectIpv6(byte[] packet, byte[] srcAddr, byte[] dstAddr, int totalLen,
+                            WritePacketCallback writePacketCallback) {
+        // 组播（ff00::/8，mDNS/ND 之类）不回 ICMPv6 错误：RFC 4443 明确禁止，
+        // 回了内核也只会丢掉。这类报文静默失败即可。
+        if ((dstAddr[0] & 0xFF) == 0xFF) {
+            return;
+        }
+        if (!allowIpv6Reject()) {
+            return; // 限流：别被 IPv6 洪泛打爆
+        }
+        String dst = addressToString(dstAddr);
+        // 只记前 64 个地址：IPv6 目的地址是无限的，不设上限就是个慢性内存泄漏。
+        if (warnedIpv6Targets.size() < 64 && warnedIpv6Targets.add(dst)) {
+            Logger.info(LogConfig.MODULE_VPN, "IPv6 rejected dst=" + dst
+                    + "（本隧道只支持 IPv4，已回 ICMPv6 unreachable，应用会回退 IPv4）");
+        }
+        byte[] icmp = buildIcmpv6Unreachable(srcAddr, packet, totalLen);
+        writePacketCallback.onWritePacket(icmp);
+    }
+
+    /** 每秒最多回多少个 ICMPv6 拒绝（避免 IPv6 洪泛把写队列打爆）。 */
+    private boolean allowIpv6Reject() {
+        long sec = System.currentTimeMillis() / 1000;
+        if (ipv6RejectSecond.get() != sec) {
+            ipv6RejectSecond.set(sec);
+            ipv6RejectCount.set(0);
+        }
+        return ipv6RejectCount.incrementAndGet() <= IPV6_REJECT_MAX_PER_SEC;
+    }
+
+    /**
+     * 构造 ICMPv6 Destination Unreachable（type=1, code=0），并带上被触发的
+     * 原报文（内核靠它把错误匹配回对应的 socket）。
+     *
+     * <p>源地址用 TUN 自己的 IPv6 地址（RFC 4443：ICMPv6 错误的源必须是本机
+     * 某个接口上的地址），目的地址是原包的源地址。</p>
+     */
+    private byte[] buildIcmpv6Unreachable(byte[] srcAddr, byte[] originalPacket, int originalLen) {
+        // 尽量带上原报文，但别超过 MTU；至少要含 IPv6 头 + 8 字节传输层头。
+        int include = Math.min(originalLen, tunMtu - IPV6_HEADER_LEN - 8);
+        if (include < IPV6_HEADER_LEN + 8) {
+            include = Math.min(originalLen, IPV6_HEADER_LEN + 8);
+        }
+        int icmpLen = 8 + include;
+        byte[] packet = new byte[IPV6_HEADER_LEN + icmpLen];
+        ByteBuffer buf = ByteBuffer.wrap(packet).order(ByteOrder.BIG_ENDIAN);
+        // IPv6 头
+        buf.putInt(0x60000000);            // version 6
+        buf.putShort((short) icmpLen);     // payload length
+        buf.put((byte) 58);                // next header = ICMPv6
+        buf.put((byte) 64);                // hop limit
+        buf.put(TUN_ADDR_V6);              // 源地址 = TUN 的本地 IPv6 地址
+        buf.put(srcAddr);                  // 目的地址 = 原包的源地址
+        // ICMPv6 头
+        buf.put((byte) 1);                 // type = Destination Unreachable
+        buf.put((byte) 0);                 // code = 0 (no route to destination)
+        buf.putShort((short) 0);           // checksum（稍后回填）
+        buf.putInt(0);                     // unused
+        System.arraycopy(originalPacket, 0, packet, IPV6_HEADER_LEN + 8, include);
+        // 校验和：IPv6 伪首部（源=TUN 地址，目的=原包源地址）+ ICMPv6 报文。
+        // 注意 ICMPv6 没有 UDP 那条"算出 0 就写 0xFFFF"的规则，值 0 必须原样写出。
+        int sum = protocolChecksum(packet, IPV6_HEADER_LEN, icmpLen, TUN_ADDR_V6, srcAddr, 58);
+        putChecksum(packet, IPV6_HEADER_LEN + 2, sum);
+        return packet;
+    }
+
+    // ================================================================ UDP
     private void handleOutboundUdp(byte[] packet, ByteBuffer buf, int ipHeaderLen, int totalLen,
                                    byte[] srcAddr, byte[] dstAddr,
                                    WritePacketCallback writePacketCallback) {
@@ -858,9 +1068,10 @@ public class PacketRouter {
         if (totalLen < udpOffset + 8) {
             return;
         }
-        // UDP 只处理 IPv4 的 DNS（53）：本地解析、不经隧道。其余 UDP（含 IPv6 的
-        // QUIC/mDNS）一律丢弃——与 kcp 的"仅中继 DNS"策略一致。DNS 不受影响：
+        // UDP 只处理 IPv4 的 DNS（53）：本地解析、不经隧道。其余 UDP（QUIC/mDNS）
+        // 一律丢弃——与 kcp 的"仅中继 DNS"策略一致。DNS 不受影响：
         // Builder 里通告的解析器是 IPv4 的 1.1.1.1 / 8.8.8.8。
+        // （IPv6 根本走不到这里：出站 IPv6 在解析阶段就被 rejectIpv6 拒掉了。）
         if (srcAddr.length != 4 || dstAddr.length != 4) {
             Logger.debug(TAG_MODULE, "Ignoring IPv6 UDP dst="
                     + addressToString(dstAddr) + ":" + (buf.getShort(udpOffset + 2) & 0xFFFF));
@@ -882,6 +1093,14 @@ public class PacketRouter {
             // 本地解析 DNS（豁免）：受保护 socket 直连上游解析器，应答写回 TUN。
             relayDnsLocally(srcAddr, srcPort, dstAddr, dstPort, udpPayload, writePacketCallback);
         } else {
+            // 非 DNS 的 UDP（含 QUIC/HTTP3 的 UDP 443）一律丢弃：每个端口只告警
+            // 一次，避免刷屏——之前这里只打 DEBUG，release 包里完全看不到，
+            // 用户只会觉得"应用没走代理"。
+            if (warnedUdpPorts.add(dstPort)) {
+                Logger.warning(TAG_MODULE, "Ignoring non-DNS UDP dst="
+                        + addressToString(dstAddr) + ":" + dstPort
+                        + "（QUIC/HTTP3 走不通，应用应回退到 TCP；本通道只支持 TCP）");
+            }
             Logger.debug(TAG_MODULE, "Ignoring non-DNS UDP dst="
                     + addressToString(dstAddr) + ":" + dstPort + " len=" + payloadLen);
         }
@@ -895,13 +1114,45 @@ public class PacketRouter {
     private void relayDnsLocally(byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort,
                                  byte[] payload, WritePacketCallback writePacketCallback) {
         ExecutorService relay = dnsRelayExecutor;
-        if (relay == null) {
+        if (relay == null || relay.isShutdown() || !running) {
             return; // 路由器已停止
         }
         relay.execute(() -> {
-            // 0. 缓存命中：直接回写，不产生任何网络往返。
+            if (!running || relay.isShutdown()) {
+                return;
+            }
+            // 0. AAAA 查询就地过滤（不进缓存、不出网）：本客户端只提供 IPv4 隧道。
+            //    Android 的 per-UID VPN 规则只把 IPv4 收进 TUN——AAAA 一旦交给
+            //    应用，应用就会优先走 IPv6，那部分流量从物理网卡直出、绕过隧道，
+            //    真机上的表现正是"选了应用但流量没走代理"。这里用空应答
+            //    （NOERROR + 0 条记录）告诉应用"该类型没有记录"，应用会立刻
+            //    改用 A，而不是干等 IPv6 超时。
+            DnsWire.Query query = DnsWire.parseQuery(payload);
+            if (DnsWire.isIpv6Query(query)) {
+                if (!running || relay.isShutdown()) {
+                    return;
+                }
+                // 不写缓存：过滤在 dnsCacheLookup 之前，存进去的条目永远读不到，
+                // 只会占满 512 条上限并把有用的 A 记录一起冲掉。
+                byte[] nodata = DnsWire.buildNoData(query);
+                byte[] udpPacketAaaa = buildUdpPacket(nodata, dstAddr, dstPort, srcAddr, srcPort);
+                writePacketCallback.onWritePacket(udpPacketAaaa);
+                if (loggedAaaaNames.size() < 64 && loggedAaaaNames.add(query.name)) {
+                    Logger.info(TAG_MODULE, "DNS AAAA filtered name=" + query.name
+                            + "（只提供 IPv4 隧道，AAAA 一律就地空应答）");
+                }
+                logUdpTrace(() -> "UDP OUT (DNS AAAA filtered) src="
+                        + addressToString(dstAddr) + ":" + dstPort
+                        + " len=" + nodata.length, dstPort, srcPort);
+                return;
+            }
+
+            // 1. 缓存命中：直接回写，不产生任何网络往返。
             byte[] hit = dnsCacheLookup(payload);
             if (hit != null) {
+                if (!running || relay.isShutdown()) {
+                    return;
+                }
                 byte[] pkt = buildUdpPacket(hit, dstAddr, dstPort, srcAddr, srcPort);
                 writePacketCallback.onWritePacket(pkt);
                 logUdpTrace(() -> "UDP OUT (DNS cache hit) src="
@@ -910,42 +1161,72 @@ public class PacketRouter {
                 return;
             }
 
-            // 1. 优先走协议内 DNS：oob FCP_DNS1 随隧道本身走，不占流、不开新端口，
+            // 2. 优先走协议内 DNS：oob FCP_DNS1 随隧道本身走，不占流、不开新端口，
             //    且由服务端解析——结果与 OPEN(domain) 路径完全一致。移动网络 /
             //    模拟器里本地公共解析器常被阻断，这条路径始终可用。
             TunnelManager tm = tunnelManager;
             byte[] tunneled = tm != null
                     ? tm.queryDns(payload, DNS_TUNNEL_TIMEOUT_MS) : null;
+            if (!running || relay.isShutdown()) {
+                return;
+            }
+            if (tunneled != null && !DnsWire.responseMatchesQuery(tunneled, payload)) {
+                Logger.warning(TAG_MODULE, "DNS tunneled response did not match query; falling back");
+                tunneled = null;
+            }
             if (tunneled != null) {
-                dnsCacheStore(payload, tunneled);
-                byte[] udpPacket0 = buildUdpPacket(tunneled, dstAddr, dstPort, srcAddr, srcPort);
+                final byte[] response = tunneled;
+                dnsCacheStore(payload, response);
+                if (!running || relay.isShutdown()) {
+                    return;
+                }
+                byte[] udpPacket0 = buildUdpPacket(response, dstAddr, dstPort, srcAddr, srcPort);
                 writePacketCallback.onWritePacket(udpPacket0);
                 logUdpTrace(() -> "UDP OUT (DNS relay via tunnel oob) src="
                         + addressToString(dstAddr) + ":" + dstPort
-                        + " len=" + tunneled.length, dstPort, srcPort);
+                        + " len=" + response.length, dstPort, srcPort);
                 return;
             }
 
             // 回退路径：本地 UDP 直连公共解析器。
             String[] upstreams = {"1.1.1.1", "8.8.8.8"};
             for (String upstream : upstreams) {
+                if (!running || relay.isShutdown()) {
+                    return;
+                }
                 DatagramSocket socket = null;
                 try {
                     socket = new DatagramSocket();
+                    inFlightDnsSockets.add(socket);
+                    if (!running || relay.isShutdown()) {
+                        return;
+                    }
                     boolean protectedOk = socketProtector == null || socketProtector.protect(socket);
                     if (!protectedOk) {
                         Logger.error(TAG_MODULE, "DNS_FAILED reason=protect_failed");
                         return;
                     }
-                    socket.setSoTimeout(DNS_RELAY_TIMEOUT_MS);
                     InetAddress server = InetAddress.getByName(upstream);
+                    socket.connect(server, 53);
+                    socket.setSoTimeout(DNS_RELAY_TIMEOUT_MS);
                     socket.send(new DatagramPacket(payload, payload.length, server, 53));
                     byte[] buf = new byte[1500];
                     DatagramPacket response = new DatagramPacket(buf, buf.length);
                     socket.receive(response);
                     byte[] dnsPayload = Arrays.copyOfRange(response.getData(), response.getOffset(),
                             response.getOffset() + response.getLength());
+                    if (!running || relay.isShutdown()) {
+                        return;
+                    }
+                    if (!DnsWire.responseMatchesQuery(dnsPayload, payload)) {
+                        Logger.warning(TAG_MODULE, "DNS UDP response did not match query via "
+                                + upstream + ", trying next upstream");
+                        continue;
+                    }
                     dnsCacheStore(payload, dnsPayload);
+                    if (!running || relay.isShutdown()) {
+                        return;
+                    }
                     byte[] udpPacket = buildUdpPacket(dnsPayload, dstAddr, dstPort, srcAddr, srcPort);
                     writePacketCallback.onWritePacket(udpPacket);
                     logUdpTrace(() -> "UDP OUT (DNS relay via " + upstream + ") src="
@@ -961,6 +1242,7 @@ public class PacketRouter {
                     return;
                 } finally {
                     if (socket != null) {
+                        inFlightDnsSockets.remove(socket);
                         socket.close();
                     }
                 }
@@ -992,6 +1274,7 @@ public class PacketRouter {
     private void dnsCacheStore(byte[] query, byte[] response) {
         DnsWire.Query q = DnsWire.parseQuery(query);
         if (q == null || response == null || response.length < 12) return;
+        if (!DnsWire.responseMatchesQuery(response, query)) return;
         int rcode = response[3] & 0x0f;
         int ancount = ((response[6] & 0xff) << 8) | (response[7] & 0xff);
         int ttlSec;
@@ -1035,14 +1318,17 @@ public class PacketRouter {
 
     private void startCleanupThread() {
         cleanupThread = new Thread(() -> {
-            while (running) {
+            while (running && Thread.currentThread() == cleanupThread) {
                 try {
                     Thread.sleep(1000);
-                    if (!running) {
+                    if (!running || Thread.currentThread() != cleanupThread) {
                         break;
                     }
                     long now = System.currentTimeMillis();
                     for (TcpConnection conn : connectionsById.values()) {
+                        if (!running || Thread.currentThread() != cleanupThread) {
+                            return;
+                        }
                         // 兜底重传先于回收判定：有未确认在途段时连接是"停滞"而非
                         // "陈旧"。尾部段丢失收不到 dup-ACK，只有这里能把流救回来。
                         List<UnackedSegment> stalledBatch =
@@ -1051,6 +1337,9 @@ public class PacketRouter {
                             // 与 TCP RTO 的整窗重传同形：一次探测把窗口允许范围内
                             // 的全部未确认段一并重发。
                             for (UnackedSegment stalled : stalledBatch) {
+                                if (!running || Thread.currentThread() != cleanupThread) {
+                                    return;
+                                }
                                 byte[] packet;
                                 int ack;
                                 synchronized (conn) {
@@ -1070,8 +1359,18 @@ public class PacketRouter {
                                     + conn.connectionId
                                     + ", segments=" + stalledBatch.size()
                                     + ", attempt=" + conn.stalledRetransmitCount());
+                            if (!running || Thread.currentThread() != cleanupThread) {
+                                return;
+                            }
                             if (conn.stalledRetransmitCount() > MAX_STALL_RETRANSMITS) {
                                 abortConnection(conn, "stall_retransmit_exhausted");
+                            }
+                            boolean finishFin;
+                            synchronized (conn) {
+                                finishFin = conn.serverFinPending && !conn.hasPendingSegments();
+                            }
+                            if (finishFin) {
+                                sendFinToApp(conn);
                             }
                             continue;
                         }
@@ -1092,6 +1391,9 @@ public class PacketRouter {
                         Logger.info(TAG_MODULE, "Stale connection cleanup: connectionId="
                                 + conn.connectionId + ", state=" + conn.state
                                 + ", idleMs=" + age);
+                        if (!running || Thread.currentThread() != cleanupThread) {
+                            return;
+                        }
                         sendCloseToOutbound(conn, conn.state != TcpState.ESTABLISHED);
                         // 回收时必须向应用回 RST：远端已消失，缺了这个包应用只会
                         // 看到连接静默挂死，直到自己的超时才放弃。
@@ -1101,6 +1403,9 @@ public class PacketRouter {
                                     conn.serverNextSeq, conn.clientNextSeq);
                         }
                         try {
+                            if (!running || Thread.currentThread() != cleanupThread) {
+                                return;
+                            }
                             conn.writePacketCallback.onWritePacket(rst);
                         } catch (Exception e) {
                             Logger.error(TAG_MODULE, "Cleanup RST write failed: " + e.getMessage());
@@ -1280,20 +1585,17 @@ public class PacketRouter {
         packet[offset + 1] = (byte) (checksum & 0xFF);
     }
 
-    private static boolean seqAfterOrEqual(int a, int b) {
+    /** u32 序列号的模 2^32 半窗比较；有符号 int 减法保留低 32 位环绕语义。 */
+    static boolean seqAfterOrEqual(int a, int b) {
         return a == b || (a - b) > 0;
+    }
+
+    static boolean seqBefore(int a, int b) {
+        return a != b && (a - b) < 0;
     }
 
     private static String connectionKey(byte[] srcAddr, int srcPort, byte[] dstAddr, int dstPort) {
         return addressToString(srcAddr) + ":" + srcPort + "->" + addressToString(dstAddr) + ":" + dstPort;
-    }
-
-    /**
-     * 是否是我们不解析的 IPv6 扩展头（next header 字段里的值）。
-     */
-    private static boolean isIpv6ExtensionHeader(int nextHeader) {
-        return nextHeader == 0 || nextHeader == 43 || nextHeader == 44
-                || nextHeader == 51 || nextHeader == 60;
     }
 
     private static String addressToString(byte[] addr) {
@@ -1375,9 +1677,11 @@ public class PacketRouter {
     /** StreamHandle 适配：引擎内部负责缓冲/背压/FCP 分段。 */
     private static final class TunnelSink implements OutboundSink {
         private final StreamHandle stream;
+        private final TcpConnection connection;
 
-        TunnelSink(StreamHandle stream) {
+        TunnelSink(StreamHandle stream, TcpConnection connection) {
             this.stream = stream;
+            this.connection = connection;
         }
 
         @Override
@@ -1392,16 +1696,24 @@ public class PacketRouter {
 
         @Override
         public void abort() {
-            stream.abort();
+            connection.abortTunnelStream();
         }
     }
 
     /** 局域网直连 socket 适配：closeWrite = shutdownOutput，abort = close。 */
     private static final class LanSink implements OutboundSink {
         private final Socket socket;
+        private final AtomicBoolean closed = new AtomicBoolean();
 
         LanSink(Socket socket) {
             this.socket = socket;
+        }
+
+        /** sink.abort 与连接回收共用同一次 close，避免重复关闭。 */
+        void closeSocket() {
+            if (closed.compareAndSet(false, true)) {
+                closeQuietly(socket);
+            }
         }
 
         @Override
@@ -1418,7 +1730,7 @@ public class PacketRouter {
 
         @Override
         public void abort() {
-            closeQuietly(socket);
+            closeSocket();
         }
     }
 
@@ -1470,8 +1782,10 @@ public class PacketRouter {
         private TcpState state;
         private boolean synAckSent;
         private boolean clientFinSeen;
-        // 远端已声明不再发送（收到 FIN / LAN 读到 EOF）。
+        // 远端 FIN 已排到 pending 之后，可以进入 TUN 关闭流程。
         private boolean serverFinSeen;
+        // 远端 FIN 已收到但 pending 尚未发完；窗口/ACK/超时重传后继续尝试发 FIN。
+        private boolean serverFinPending;
         // 隧道/LAN 侧尚未就绪时缓冲的应用方向数据（有界）。
         private final Deque<byte[]> outboundBuffer = new ArrayDeque<>();
         private int outboundBufferedBytes;
@@ -1480,6 +1794,11 @@ public class PacketRouter {
         // 隧道流句柄（close 时 abort 释放引擎侧 sid；sink 持有实际写入通道）。
         private volatile StreamHandle tunnelStream;
         private volatile OutboundSink sink;
+        // LAN socket 从建连开始就登记，close 必须能中断 connect/read；线程只跟踪不 join，
+        // 避免清理线程或 pump 自身调用 close 时发生自等待死锁。
+        private volatile Socket lanSocket;
+        private volatile Thread lanConnector;
+        private volatile Thread lanPump;
         private volatile boolean closed;
 
         TcpConnection(long connectionId, String key, byte[] srcAddr, int srcPort, byte[] dstAddr,
@@ -1687,21 +2006,132 @@ public class PacketRouter {
             }
         }
 
-        void close() {
-            if (closed) {
-                return;
+        boolean registerLanConnector(Thread thread) {
+            synchronized (this) {
+                if (closed) {
+                    return false;
+                }
+                lanConnector = thread;
+                return true;
             }
-            closed = true;
-            // 释放隧道/LAN 侧资源：流 abort（发 RST、回收 sid）、socket close。
-            StreamHandle stream = tunnelStream;
-            tunnelStream = null;
-            sink = null;
+        }
+
+        void finishLanConnector(Thread thread) {
+            synchronized (this) {
+                if (lanConnector == thread) {
+                    lanConnector = null;
+                }
+            }
+        }
+
+        boolean registerLanSocket(Socket socket) {
+            synchronized (this) {
+                if (closed) {
+                    return false;
+                }
+                lanSocket = socket;
+                return true;
+            }
+        }
+
+        boolean attachLanSink(Socket socket) {
+            synchronized (this) {
+                if (closed) {
+                    return false;
+                }
+                lanSocket = socket;
+                sink = new LanSink(socket);
+                return true;
+            }
+        }
+
+        boolean registerLanPump(Thread thread) {
+            synchronized (this) {
+                if (closed) {
+                    return false;
+                }
+                lanPump = thread;
+                return true;
+            }
+        }
+
+        void finishLanPump(Thread thread) {
+            synchronized (this) {
+                if (lanPump == thread) {
+                    lanPump = null;
+                }
+            }
+        }
+
+        /** 与 TunnelSink.abort/close 共用单次 detach，防止并发回调重复 abort。 */
+        void abortTunnelStream() {
+            StreamHandle stream;
+            synchronized (this) {
+                stream = tunnelStream;
+                tunnelStream = null;
+                if (sink instanceof TunnelSink) {
+                    sink = null;
+                }
+            }
             if (stream != null) {
                 try {
                     stream.abort();
                 } catch (RuntimeException ignored) {
                     // 引擎侧清理失败不影响本地拆除
                 }
+            }
+        }
+
+        /** 完整、幂等回收；外部 close/abort 调用不持有连接锁，避免回调死锁。 */
+        void close() {
+            StreamHandle stream;
+            Socket socket;
+            OutboundSink outboundSink;
+            Thread connector;
+            Thread pump;
+            synchronized (this) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                stream = tunnelStream;
+                tunnelStream = null;
+                outboundSink = sink;
+                sink = null;
+                socket = lanSocket;
+                lanSocket = null;
+                connector = lanConnector;
+                lanConnector = null;
+                pump = lanPump;
+                lanPump = null;
+                unackedServerData.clear();
+                unackedBytes = 0;
+                pendingQueue.clear();
+                pendingBytes = 0;
+                outboundBuffer.clear();
+                outboundBufferedBytes = 0;
+            }
+
+            if (stream != null) {
+                try {
+                    stream.abort();
+                } catch (RuntimeException ignored) {
+                    // 引擎侧清理失败不影响本地拆除
+                }
+            }
+            if (outboundSink instanceof LanSink) {
+                ((LanSink) outboundSink).closeSocket();
+            } else if (socket != null) {
+                // 建连期间尚未挂 LanSink：由连接回收负责关闭已登记的 socket。
+                closeQuietly(socket);
+            }
+            interruptUnlessCurrent(connector);
+            interruptUnlessCurrent(pump);
+        }
+
+        private static void interruptUnlessCurrent(Thread thread) {
+            if (thread != null && thread != Thread.currentThread()) {
+                thread.interrupt();
             }
         }
     }

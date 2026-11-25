@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * - 会话死亡自动换新盐重建（fcp-node 池行为）；全部会话死亡才回调 onDown
  *   （整体重连由 TunnelManager 决定）。
  * - 未知 salt 的数据报以 ≤1Hz 回无状态复位（#86）；认证数据报刷新对端地址
- *   （NAT 重绑定）。
+ *   （NAT 重绑定），但路径验证期间冻结地址，避免旧路径报文冒充新路径。
  */
 public final class FcpTunnelEngine implements TunnelEngine {
 
@@ -48,7 +48,11 @@ public final class FcpTunnelEngine implements TunnelEngine {
     private final ConcurrentLinkedQueue<Runnable> actions = new ConcurrentLinkedQueue<>();
     private final ConcurrentLinkedQueue<PendingOpen> pendingOpens = new ConcurrentLinkedQueue<>();
     private final Map<String, PoolSlot> slotsBySalt = new HashMap<>();
-    private final List<PoolSlot> slots = new ArrayList<>();
+    /**
+     * 写操作只在引擎线程（建槽/回收死槽），但 queryDns 会从调用线程按索引读，
+     * 所以用写时复制：迭代/取下标不会撞上并发修改。
+     */
+    private final List<PoolSlot> slots = new java.util.concurrent.CopyOnWriteArrayList<>();
     private int establishedCount = 0;
     /** onDown 只报一次，直到池里再次有会话建立（防多条会话同时死时重复重连）。 */
     private volatile boolean downNotified = false;
@@ -208,7 +212,9 @@ public final class FcpTunnelEngine implements TunnelEngine {
                     for (PoolSlot slot : slots) {
                         if (slot.dead || slot.session == null) continue;
                         slot.session.onTick(now);
-                        if (!slot.established && slot.session.isEstablished()) {
+                        // onTick 里可能刚判死这一槽（换路径超时/静默超时）：dead 复检，
+                        // 否则会把刚清掉的 established 又记回来，抵消死亡计数。
+                        if (!slot.dead && !slot.established && slot.session.isEstablished()) {
                             slot.established = true;
                             // 池里 4 条会话各自建立：只有第一条代表"隧道可用"，
                             // 否则上层会收到 4 次 CONNECTED 与 4 次广播。
@@ -252,10 +258,15 @@ public final class FcpTunnelEngine implements TunnelEngine {
         }
         boolean ok = slot.session.onWire(datagram, now);
         if (ok && from != null) {
-            // NAT 重绑定：认证数据报刷新对端地址（tunnel.ts:1379-1391）。
-            if (!from.equals(peerAddress) || fromPort != peerPort) {
-                peerAddress = from;
-                peerPort = fromPort;
+            // NAT 重绑定：认证数据报刷新对端地址（tunnel.ts:1379-1391）。但换路径
+            // 验证窗口内不能把旧 socket/旧 IP 的来包设成当前地址：回音要凭换网后
+            // 发出的探测（PMTU token）判定，地址一漂走，探测的 ACK 也会被当成
+            // 另一个对端。窗口结束（到期或已证明）后恢复正常跟随。
+            if (!anyPathAddressFrozen(now)) {
+                if (!from.equals(peerAddress) || fromPort != peerPort) {
+                    peerAddress = from;
+                    peerPort = fromPort;
+                }
             }
         }
     }
@@ -274,6 +285,9 @@ public final class FcpTunnelEngine implements TunnelEngine {
         if (slot.established) --establishedCount;
         slot.established = false;
         slotsBySalt.remove(saltKey(slot.salt));
+        // 死槽必须从池里摘掉：否则每次死一条就留一个闭包引用（FcpSession 的收发
+        // 缓冲还在），长连接反复断链时是实打实的内存泄漏，stats 也会越报越多。
+        slots.remove(slot);
         // 换新盐重建该槽（池保持 4 个活跃会话）
         actions.add(() -> {
             if (running.get()) createSlot(System.currentTimeMillis());
@@ -296,6 +310,14 @@ public final class FcpTunnelEngine implements TunnelEngine {
     private boolean anyEstablished() {
         for (PoolSlot slot : slots) {
             if (slot.established && !slot.dead) return true;
+        }
+        return false;
+    }
+
+    /** 任一池会话仍在验证或地址冻结窗口内时，拒绝旧路径报文改写全局对端地址。 */
+    private boolean anyPathAddressFrozen(long nowMs) {
+        for (PoolSlot slot : slots) {
+            if (!slot.dead && slot.session != null && slot.session.isPathAddressFrozen(nowMs)) return true;
         }
         return false;
     }
@@ -514,6 +536,23 @@ public final class FcpTunnelEngine implements TunnelEngine {
     @Override
     public DatagramSocket socket() {
         return udpSocket;
+    }
+
+    /**
+     * 底层网络换了：把"探测新路径"投递到引擎线程（FcpSession 是单写者）。
+     * 每个会话各自发认证保活、重测 PMTU、上膛回音窗口；socket 本身不重建——
+     * 它不 connect、不绑网络，换网后自然从新网卡发出。
+     */
+    @Override
+    public void onPathChanged(boolean reset) {
+        actions.add(() -> {
+            if (!running.get()) return;
+            long now = System.currentTimeMillis();
+            for (PoolSlot slot : slots) {
+                if (slot.dead || slot.session == null) continue;
+                slot.session.onPathChanged(now, reset);
+            }
+        });
     }
 
     @Override

@@ -18,8 +18,6 @@ const el = {
   chart: $('chart'), chartPeak: $('chartPeak'),
   kSessions: $('kSessions'), kUp: $('kUp'), kUptime: $('kUptime'), kListen: $('kListen'),
   sysProxy: $('sysProxy'), kSysProxy: $('kSysProxy'),
-  sysProxyApplyBtn: $('sysProxyApplyBtn'), sysProxyRestoreBtn: $('sysProxyRestoreBtn'),
-  sysProxyNote: $('sysProxyNote'),
   probeNowBtn: $('probeNowBtn'),
   probeWhen: $('probeWhen'), probeDown: $('probeDown'), probeDownSub: $('probeDownSub'),
   probeUp: $('probeUp'), probeUpSub: $('probeUpSub'), probeAt: $('probeAt'),
@@ -50,6 +48,8 @@ const state = {
   probeCount: 0,
   probeWait: false,
 };
+const rateWindow = { rx: [], tx: [] };
+let probeNowTimer = null;
 
 function fmtBytes(n) {
   if (!Number.isFinite(n) || n <= 0) return '0 B';
@@ -259,16 +259,17 @@ function collectSettings() {
 }
 
 function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
   if (!el.remember.checked) {
     // Wipe every stored field, including the key, so unchecking really forgets.
     window.fcp.saveSettings({
       remember: false, key: '', host: '', port: 4460, listenHost: '127.0.0.1',
       listenPort: 1080, mtu: 1040, fecData: 10, fecParityMax: 4, logLevel: '',
-      probeInterval: 300,
+      probeInterval: 300, systemProxy: false,
     });
     return;
   }
-  clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     // Keep remember:true in the stored object. Dropping it saved the key but
     // left the flag false, so after a restart the checkbox was unchecked while
@@ -280,7 +281,7 @@ function scheduleSave() {
 function applySettings(s) {
   if (!s || typeof s !== 'object') return;
   const set = (node, v) => { if (v !== undefined && v !== null) node.value = v; };
-  if (typeof s.key === 'string' && s.key) {
+  if (s.remember && typeof s.key === 'string' && s.key) {
     el.key.value = s.key;
   }
   // 存档仍按拆开的四字段写,这里拼回两个合并框。旧存档也是这四字段,
@@ -317,18 +318,11 @@ function renderSysProxy(st) {
   if (!st) return;
   if (!st.supported) {
     el.kSysProxy.textContent = '仅 Windows';
-    el.sysProxyApplyBtn.disabled = true;
-    el.sysProxyRestoreBtn.disabled = true;
-    el.sysProxyNote.textContent = '当前平台不支持';
+    el.kSysProxy.title = '当前平台不支持系统代理接管';
     return;
   }
   el.kSysProxy.textContent = st.applied ? '已接管' : (st.enabled ? '其他代理' : '未设置');
   el.kSysProxy.title = st.server ? `当前系统代理：${st.server}` : '当前未启用系统代理';
-  el.sysProxyApplyBtn.disabled = st.applied || !state.running;
-  el.sysProxyRestoreBtn.disabled = !st.applied;
-  el.sysProxyNote.textContent = st.applied
-    ? `全部应用经 ${st.target} 出网`
-    : (state.running ? '可手动接管，或勾选"连接时设为系统代理"' : '连接后可接管');
 }
 
 async function refreshSysProxy() {
@@ -337,16 +331,6 @@ async function refreshSysProxy() {
   } catch { /* 主进程退出中 */ }
 }
 
-el.sysProxyApplyBtn.addEventListener('click', async () => {
-  const r = await window.fcp.sysProxyApply();
-  if (!r.ok) el.sysProxyNote.textContent = r.reason || '设置失败';
-  refreshSysProxy();
-});
-el.sysProxyRestoreBtn.addEventListener('click', async () => {
-  const r = await window.fcp.sysProxyRestore();
-  if (!r.ok) el.sysProxyNote.textContent = r.reason || '恢复失败';
-  refreshSysProxy();
-});
 window.fcp.onSysProxy((st) => renderSysProxy(st));
 el.sysProxy.addEventListener('change', scheduleSave);
 
@@ -365,7 +349,19 @@ function setRunning(on) {
     el.kListen.textContent = '—';
     state.samples = [];
     state.peak = 0;
+    state.startedAt = 0;
+    state.probes = [];
+    state.probeRunning = false;
+    state.probeNextSec = -1;
+    state.probeCount = 0;
+    state.probeWait = false;
+    rateWindow.rx.length = 0;
+    rateWindow.tx.length = 0;
+    clearTimeout(probeNowTimer);
+    probeNowTimer = null;
     drawChart();
+    renderProbe();
+    return;
   }
   renderProbeWhen();
 }
@@ -405,6 +401,8 @@ async function start() {
     if (!r || r.ok === false) return flashNote(r && r.error ? r.error : '启动失败', 'error');
     setRunning(true);
     flashNote('已启动');
+  } catch (e) {
+    flashNote(`启动失败：${e.message || e}`, 'error');
   } finally {
     el.toggleBtn.disabled = false;
   }
@@ -416,6 +414,8 @@ async function stop() {
     await window.fcp.stop();
     setRunning(false);
     flashNote('已停止');
+  } catch (e) {
+    flashNote(`停止失败：${e.message || e}`, 'error');
   } finally {
     el.toggleBtn.disabled = false;
   }
@@ -433,7 +433,6 @@ el.toggleBtn.addEventListener('click', () => {
 // 卡片显示用 2 样本滑动平均压掉 0.5s 采样的抖动(单样本曾显示 629 B/s)。
 // 4 样本(2s 窗口)在速度爬坡时滞后 1.5s+,与浏览器速度偏差肉眼可见;
 // 2 样本只滞后一个采样周期(0.5s),抖动压平效果仍然够用。
-const rateWindow = { rx: [], tx: [] };
 function avgRate(win, v) {
   win.push(v);
   while (win.length > 2) win.shift();
@@ -767,7 +766,6 @@ function renderProbe() {
 
 // 立即体检:绕过空闲与排期,由隧道在下一次 tick 触发。按钮只在运行且有
 // 代理时可点;请求发出后先把状态显示成"测量中",结果回来由 onProbe 收尾。
-let probeNowTimer = null;
 el.probeNowBtn.addEventListener('click', async () => {
   if (!state.running) { renderProbeWhen(); return; }
   el.probeNowBtn.disabled = true;
@@ -784,6 +782,7 @@ el.probeNowBtn.addEventListener('click', async () => {
     // 避免按钮永久转圈。结果到达时 onProbe 会清掉这个计时器。
     clearTimeout(probeNowTimer);
     probeNowTimer = setTimeout(() => {
+      probeNowTimer = null;
       state.probeRunning = false;
       renderProbeWhen();
     }, 8000);
@@ -794,6 +793,7 @@ el.probeNowBtn.addEventListener('click', async () => {
 
 window.fcp.onProbe((p) => {
   clearTimeout(probeNowTimer);
+  probeNowTimer = null;
   state.probes.unshift(p);
   while (state.probes.length > PROBE_HISTORY) state.probes.pop();
   state.probeRunning = false;

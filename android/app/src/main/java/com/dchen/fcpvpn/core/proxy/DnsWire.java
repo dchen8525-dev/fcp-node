@@ -3,6 +3,7 @@ package com.dchen.fcpvpn.core.proxy;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -20,6 +21,25 @@ public final class DnsWire {
     public static final int TYPE_A = 1;
     public static final int TYPE_CNAME = 5;
     public static final int TYPE_AAAA = 28;
+
+    /**
+     * 是否是"只要 IPv6 地址"的查询（AAAA）。
+     *
+     * <p>本客户端只提供 IPv4 隧道：把 AAAA 交给应用，应用就会优先走 IPv6，
+     * 而 Android 的 per-UID VPN 规则只把 IPv4 收进 TUN —— 那部分流量从物理
+     * 网卡直出、绕过隧道。真机上的表现就是"选了应用但流量没走代理"。</p>
+     */
+    public static boolean isIpv6Query(Query q) {
+        return q != null && q.qtype == TYPE_AAAA;
+    }
+
+    /**
+     * 空应答（NOERROR + 0 条记录）：语义是"该类型没有记录"。
+     * 用于 AAAA 过滤——应用收到空应答后会立刻改用 A，而不是等 IPv6 超时。
+     */
+    public static byte[] buildNoData(Query q) {
+        return buildResponse(q, new ArrayList<byte[]>(), 0);
+    }
 
     /** 解析出的查询。 */
     public static final class Query {
@@ -75,6 +95,37 @@ public final class DnsWire {
         if (qclass != 1) return null;                 // 只处理 IN 类
         byte[] question = java.util.Arrays.copyOfRange(packet, 12, off);
         return new Query(id, name.toString(), qtype, question);
+    }
+
+    /**
+     * 应答是否属于本次查询：校验 QR、事务 ID、qdcount 和完整 question 区。
+     * 仅匹配的应答才允许写 TUN 或进入缓存。
+     */
+    public static boolean responseMatchesQuery(byte[] response, byte[] query) {
+        if (response == null || query == null) {
+            return false;
+        }
+        Query parsedQuery = parseQuery(query);
+        if (parsedQuery == null || response.length < 12) {
+            return false;
+        }
+        if ((response[2] & 0x80) == 0) {
+            return false;
+        }
+        if (!Arrays.equals(parsedQuery.id, Arrays.copyOfRange(response, 0, 2))) {
+            return false;
+        }
+        int qdcount = ((response[4] & 0xff) << 8) | (response[5] & 0xff);
+        if (qdcount != 1) {
+            return false;
+        }
+        int questionEnd = skipName(response, 12, response.length);
+        if (questionEnd < 0 || questionEnd + 4 > response.length) {
+            return false;
+        }
+        questionEnd += 4;
+        return Arrays.equals(parsedQuery.questionSection,
+                Arrays.copyOfRange(response, 12, questionEnd));
     }
 
     /**

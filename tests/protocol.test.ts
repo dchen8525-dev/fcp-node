@@ -18,6 +18,7 @@ import {
 } from '../src/constants.ts';
 import { deriveSessionKeyV7 } from '../src/crypto/keys.ts';
 import { computeMtuLimits, FrameTx, FrameRx, packTxFrame, type TxSymbol } from '../src/fec/frame.ts';
+import { packTypeK } from '../src/fec/hdr.ts';
 import { Stream } from '../src/stream/stream.ts';
 import { parseSegment, encodeAckV2, encodeAck } from '../src/stream/segment.ts';
 import { Session, type SessionConfig } from '../src/session/session.ts';
@@ -663,17 +664,23 @@ test('FrameRx: evicting an accounted set retires its id (no late re-settle)', ()
   // evicted accounted id into retired_ here.
   const delivered: Buffer[] = [];
   const rx = new FrameRx({ d: 10, p: 3, deliver: (b) => delivered.push(b), oob: () => {} });
-  const dataFrame = (setId: number): Buffer => packTxFrame({
-    setId, index: 0, d: 10, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
-  });
-  // Fill the set map to capacity with data symbols.
-  for (let id = 0; id < 256; ++id) rx.onDatagram(dataFrame(id), 0);
+  // A realistic set: one data symbol (k=3) plus one parity symbol declaring
+  // n = index - j = 1. Data-only sets are "tail drops" at settle now, so a
+  // k=0 degenerate header would be the only way to reach accounting — the
+  // fixture must exercise the shape real senders produce instead.
+  const framesFor = (setId: number): Buffer[] => [
+    packTxFrame({ setId, index: 0, d: 10, typeK: packTypeK(3, 0, SymbolType.Data), symbol: Buffer.from([3, 0, 0xab]) }),
+    packTxFrame({ setId, index: 1, d: 10, typeK: packTypeK(3, 0, SymbolType.Parity), symbol: Buffer.from([3, 0, 0xab]) }),
+  ];
+  const dataFrame = (setId: number): Buffer => framesFor(setId)[0];
+  // Fill the set map to capacity with complete (accounted) sets.
+  for (let id = 0; id < 256; ++id) for (const f of framesFor(id)) rx.onDatagram(f, 0);
   rx.onTick(1000); // every set becomes accounted (1 s gate), none yet retired (2 s)
   const before = rx.counters.setsExpected;
   assert.equal(before, 256);
 
   // A new set id forces eviction of the first (accounted) set, id 0.
-  rx.onDatagram(dataFrame(256), 1000);
+  for (const f of framesFor(256)) rx.onDatagram(f, 1000);
   assert.equal(rx.view(0), undefined, 'set 0 was evicted');
 
   // A late symbol for the evicted, accounted set must be rejected by the
@@ -756,14 +763,34 @@ test('FrameRx: set-id gap placeholders count as setsKUnknown, not tailDropped', 
   // setsTailDropped instead, and setsKUnknown was never incremented at all —
   // FECSTAT reported the wrong field and mis-set FLG_TAIL_DROPPED.
   const rx = new FrameRx({ d: 10, p: 3, deliver: () => {}, oob: () => {} });
-  const dataFrame = (setId: number): Buffer => packTxFrame({
-    setId, index: 0, d: 10, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
-  });
-  rx.onDatagram(dataFrame(0), 0);
-  rx.onDatagram(dataFrame(5), 0); // jump 0 -> 5 creates placeholders 1..4
+  // Complete sets (data + parity declaring n), so nothing here is a tail drop:
+  // the assertion isolates the placeholder rule.
+  const send = (setId: number): void => {
+    rx.onDatagram(packTxFrame({
+      setId, index: 0, d: 10, typeK: packTypeK(3, 0, SymbolType.Data), symbol: Buffer.from([3, 0, 0xab]),
+    }), 0);
+    rx.onDatagram(packTxFrame({
+      setId, index: 1, d: 10, typeK: packTypeK(3, 0, SymbolType.Parity), symbol: Buffer.from([3, 0, 0xab]),
+    }), 0);
+  };
+  send(0);
+  send(5); // jump 0 -> 5 creates placeholders 1..4
   rx.onTick(1000);
   assert.equal(rx.counters.setsKUnknown, 4, 'four gap placeholders counted as kUnknown');
-  assert.equal(rx.counters.setsTailDropped, 0, 'gap placeholders are not tail drops');
+  assert.equal(rx.counters.setsTailDropped, 0, 'complete sets and placeholders are not tail drops');
+  assert.equal(rx.counters.setsExpected, 2, 'both complete sets still settle normally');
+});
+
+test('FrameRx: a data-only set with expected parity settles as a tail drop', () => {
+  const rx = new FrameRx({ d: 10, p: 3, deliver: () => {}, oob: () => {} });
+  rx.onDatagram(packTxFrame({
+    setId: 4, index: 0, d: 10, typeK: 0x60, symbol: Buffer.from([3, 0, 0xab]),
+  }), 0);
+  rx.onTick(1000);
+  assert.equal(rx.counters.setsTailDropped, 1);
+  assert.equal(rx.counters.setsExpected, 0);
+  assert.equal(rx.counters.dataExpected, 0);
+  assert.equal(rx.accountedThroughSetId(), 4);
 });
 
 test('FrameRx: a late in-bound original counts as dataLateRx, not lateDup', () => {
@@ -1079,6 +1106,13 @@ test('HANDSHAKE: a short local nonce is refused at construction, not at key deri
   });
   assert.equal(h.failed, true, 'the short nonce must be refused');
   assert.equal(h.error, HandshakeError.BadNonce);
+  const long = new Handshake({
+    localD: 10, localP: 6, role: HandshakeRole.Client,
+    localNonce: Buffer.alloc(17, 3),
+    send: () => {},
+  });
+  assert.equal(long.failed, true, 'a nonce longer than 16 bytes must also be refused');
+  assert.equal(long.error, HandshakeError.BadNonce);
   // A full-length nonce is still fine.
   const ok = new Handshake({
     localD: 10, localP: 6, role: HandshakeRole.Client,

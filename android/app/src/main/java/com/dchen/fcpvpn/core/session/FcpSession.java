@@ -36,6 +36,11 @@ public final class FcpSession {
     // ---- 会话级常量（constants.ts 摘录）----
     public static final int NAT_KEEPALIVE_MS = 45000;
     public static final long PEER_ALIVE_GRACE_MS = 3L * 45000;
+    /**
+     * 换路径后等待对端回音的窗口。正常切换（两端跟随地址漂移）一两秒内就有回音；
+     * 等不到说明这条路径黑掉了，尽快关会话让引擎重连，不要干等 135 秒的静默判死。
+     */
+    public static final long PATH_VERIFY_MS = 10000;
     public static final int HANDSHAKE_SEND_BUDGET = 1 << 16;
     public static final int BOOTSTRAP_PROBES_PER_SECOND = 64;
     public static final int DATA_WIRE_OVERHEAD = 37;
@@ -63,6 +68,10 @@ public final class FcpSession {
     private static final byte[] PMTU_MAGIC = "FCP_PMTU".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
     private static final byte[] KEEPALIVE_MAGIC = "FCPKAL1\0".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
     private static final int KEEPALIVE_LEN = 8;
+    /** 对端会应答的最小 PMTU 探测尺寸（session.ts pmtuHandle 的 PROBE 下界）。 */
+    private static final int PMTU_MIN_PROBE_MTU = 576;
+    /** 窗口内重发回音探针的间隔：探测本身丢了不能被当成"路径不通"。 */
+    private static final long PATH_PROBE_RETRY_MS = 1000;
 
     // ---- 协议内 DNS（oob FCP_DNS1）----
     // 与 fcp-node constants.ts 逐字节对齐：magic8 | type1 | token4 LE | dns payload。
@@ -175,6 +184,12 @@ public final class FcpSession {
     private int pmtuStartMtu;
     private int pmtuCeiling = 0;
     private final List<Integer> pmtuPending = new ArrayList<>();
+    /** 换路径后的回音窗口：路径一变上膛，换网后发出的探测被应答才解除，超时判死。 */
+    private final PathVerifyWindow pathVerify = new PathVerifyWindow(PATH_VERIFY_MS);
+    /** 最近一次回音探针的发出时刻（窗口内每秒重发一枚）。 */
+    private long pathProbeLastMs = 0;
+    /** 本次会话累计发出的回音探针数（诊断/测试观察）。 */
+    private int pathProbeSent = 0;
     private int rxSymbolMax = 65535;
     private boolean closeNotified = false;
     private boolean mux = false;
@@ -285,7 +300,12 @@ public final class FcpSession {
     }
 
     public boolean isClosed() { return closeNotified; }
-    public boolean isEstablished() { return hs.isEstablished(); }
+    /**
+     * 已关闭的会话不算"已建立"。握手对象在关闭后仍停留在 established 状态，
+     * 只看 hs 会让引擎在会话刚死掉的那一 tick 又把它记回"已建立"，把死亡计数
+     * 抵消掉——池里 4 条全灭时引擎就永远判不出断链，重连也就不会发生。
+     */
+    public boolean isEstablished() { return hs.isEstablished() && !closeNotified; }
     public boolean isMuxActive() { return mux; }
     public int currentK() { return strategy.currentK(); }
     public int getGroupD() { return groupD; }
@@ -307,6 +327,70 @@ public final class FcpSession {
      */
     public void closeNow(String reason) {
         notifyClosed(reason);
+    }
+
+    /**
+     * 底层网络路径变了（宿主在 ConnectivityManager 回调里触发，必须在引擎线程上调用）。
+     *
+     * <p>客户端 socket 不重连，所以这里要主动做两件事：</p>
+     * <ol>
+     *   <li>立刻发一次认证保活：让服务端把回程地址改到新源地址（它只跟随认证报文），
+     *       不必等最多 45 秒的空闲保活；</li>
+     *   <li>路径确实换了（{@code reset}）时把 PMTU 打回起点重测，并上膛回音窗口：
+     *       新路径的 MTU 可能更小，沿用旧值会整段黑洞；窗口则用"换网后发出的
+     *       PMTU 探测有没有被应答"判断这条路径通不通。</li>
+     * </ol>
+     *
+     * @param reset true = 网络上下线（Wi-Fi↔蜂窝），需要重测 MTU；false = 只是能力
+     *              变化（带宽提示之类），做一次轻量探测即可。
+     */
+    public void onPathChanged(long nowMs, boolean reset) {
+        if (closeNotified || resetByPeer || !hs.isEstablished()) return;
+        boolean probing = reset && cfg.pmtud && pmtuStartMtu >= PMTU_MIN_PROBE_MTU;
+        if (probing) {
+            // 顺序不能变：重置（同时轮换 token）→ 上膛 → 发探测。宿主 sendWire 可能
+            // 同步重入 onWire，应答必须落在已经上膛的窗口里；而 token 必须在发出
+            // 探测之前轮换，换网前发出的探测的 ACK 才不会被当成新路径的回音。
+            pmtuResetForNewPath();
+            pathVerify.arm(nowMs);
+            sendPathProbe(nowMs);
+        }
+        sendOob(KEEPALIVE_MAGIC);
+        if (!reset) return;
+        // 没有 PMTUD（或起点低于对端会应答的最小探测尺寸）就没有可靠的路径回音：
+        // 保活是单向的、对端不回，此时退回 135 秒的静默判死，别拿一个等不到的回音
+        // 把好会话误杀。日志只看"有没有探测"——宿主可能同步回了音，窗口此刻已经
+        // 解除，用 armed() 判断会打出相反的话。
+        if (probing) {
+            cb.log("FCP path changed: PMTU reset to " + pmtuStartMtu + "B, probing new path");
+        } else {
+            cb.log("FCP path changed: no path echo available, relying on the idle timeout");
+        }
+    }
+
+    /** 当前发送侧 MTU（换路径后会回到起点重测）；供日志与测试观察。 */
+    public int currentMtu() {
+        return pmtuMtu;
+    }
+
+    /** 是否仍在等待新路径的回音；引擎在窗口期间冻结未验证的对端地址。 */
+    boolean isPathVerifyArmed() {
+        return pathVerify.armed();
+    }
+
+    /** 回音前后都冻结未验证地址，直到本次换路径窗口结束。 */
+    boolean isPathAddressFrozen(long nowMs) {
+        return pathVerify.addressFrozen(nowMs);
+    }
+
+    /** 当前回音探测的 token（换网时轮换）；供引擎日志与测试观察。 */
+    int pathProbeToken() {
+        return pmtuToken;
+    }
+
+    /** 换路径后已发出的回音探针数（窗口内每秒补一枚）。 */
+    int pathProbesSent() {
+        return pathProbeSent;
     }
 
     /** 发起握手（返回 false = 配置非法）。 */
@@ -335,7 +419,12 @@ public final class FcpSession {
         return true;
     }
 
-    /** 喂一个 UDP 数据报。返回 false = 认证失败。 */
+    /**
+     * 喂一个 UDP 数据报。返回 false = 认证失败。
+     *
+     * <p>换路径的回音判定不依赖来源地址：它由 {@link #sendPathProbe} 发出探测、
+     * 在 PMTU ACK 分支里凭换网时轮换的 token 识别（见 {@link #pmtuHandle}）。</p>
+     */
     public boolean onWire(byte[] wire, long nowMs) {
         this.nowMs = nowMs;
         if (closeNotified) return false;
@@ -594,6 +683,14 @@ public final class FcpSession {
         int token = Wire.getLe32(payload, 10);
         int mtu = Wire.getLe16(payload, 14);
         if (type == PMTU_TYPE_ACK) {
+            // 换路径的回音判定：token 在换网时轮换过（pmtuResetForNewPath），所以
+            // 带着当前 token 回来的 ACK 只可能是对"换网后我们发出的探测"的应答
+            // ——它证明新路径的上行与下行都通了。普通数据/保活做不到这一点：
+            // 它们可能只是换网前就在途的旧路径报文。
+            if (token == pmtuToken && pathVerify.armed()) {
+                pathVerify.noteInbound();
+                cb.log("FCP path verified: peer answered the post-change probe (" + mtu + "B)");
+            }
             // ACK 命名超过自身上限的尺寸必须钳位：否则恶意对端能把发送预算
             // 吹到 65KB 数据报 → 每次 send EMSGSIZE，探测步进永久卡死。
             if (token == pmtuToken && mtu > pmtuAckedMtu && mtu <= pmtuMaxMtu) {
@@ -637,6 +734,56 @@ public final class FcpSession {
         if (mux) {
             for (Stream st : streams.values()) st.setMaxSegment(l.payloadMax - 1);
         }
+    }
+
+    /**
+     * 换路径后把 PMTU 打回起点重新爬。旧上限是按旧路径测出来的，新路径更小时
+     * 沿用它等于整段黑洞；而 pmtuCeiling 一旦"到顶"就不再探测，所以必须清零。
+     * 与新建会话的初始状态一致，另外两处是换路径专有的：
+     * <ul>
+     *   <li>pmtuLastProbeMs 归零，让下一 tick 立刻发出第一枚探测；</li>
+     *   <li>token 轮换，使换网前发出的探测的 ACK 无法冒充新路径的回音。</li>
+     * </ul>
+     */
+    private void pmtuResetForNewPath() {
+        if (!cfg.pmtud) return;
+        pmtuMtu = pmtuStartMtu;
+        pmtuAckedMtu = pmtuStartMtu;
+        pmtuCeiling = 0;
+        pmtuCeilingLogged = false;
+        pmtuProbesSent = 0;
+        pmtuProbesLost = 0;
+        pmtuBackoffMs = 0;
+        pmtuPending.clear();
+        pmtuLastProbeMs = 0;
+        pmtuToken = random.nextInt();
+        applyPmtuMtu(pmtuStartMtu);
+    }
+
+    /**
+     * 换路径后的回音探针：用换网时刚轮换的 token 发一枚 PMTU PROBE。
+     *
+     * <p>对端对任何合法探测都无条件应答（session.ts pmtuHandle 的 PROBE 分支只校验
+     * 尺寸，不校验 token），所以收到同 token 的 ACK 就证明"我们换网后发出的报文走到了
+     * 对端并原路返回"。这是普通数据报文给不了的证据——它们可能只是换网前就在途的
+     * 旧路径报文，先到的那一枚会把窗口误判成通。</p>
+     *
+     * <p>窗口内由 {@code onTick} 每秒重发一枚：探测或 ACK 本身丢了，不应该被当成
+     * "路径不通"。</p>
+     */
+    private void sendPathProbe(long nowMs) {
+        int target = pmtuStartMtu;
+        int len = FrameTx.pmtuProbeLen(target, cfg.ipHdrLen);
+        if (len < PMTU_HEADER_LEN) return;
+        byte[] msg = new byte[len];
+        System.arraycopy(PMTU_MAGIC, 0, msg, 0, PMTU_MAGIC.length);
+        msg[8] = PMTU_TYPE_PROBE;
+        msg[9] = 0;
+        Wire.putLe32(pmtuToken, msg, 10);
+        Wire.putLe16(target, msg, 14);
+        pathProbeLastMs = nowMs;
+        ++pathProbeSent;
+        sendOob(msg);
     }
 
     private void sendPmtuProbe(long nowMs) {
@@ -1027,10 +1174,22 @@ public final class FcpSession {
                 sendOob(report);
             }
             sendPmtuProbe(nowMs);
+            // 回音窗口内持续重发探针：单枚探测或它的 ACK 丢了，不能算路径不通。
+            if (pathVerify.armed() && nowMs - pathProbeLastMs >= PATH_PROBE_RETRY_MS) {
+                sendPathProbe(nowMs);
+            }
         }
         if (lastWireOutMs == 0) lastWireOutMs = nowMs;
         if (nowMs - lastWireOutMs >= NAT_KEEPALIVE_MS) {
             sendOob(KEEPALIVE_MAGIC);
+        }
+        // 换路径后的回音窗口先判：它比 135 秒的静默判死短得多，且只在刚换过路径
+        // 时上膛。窗口内连一枚 PMTU ACK 都没等到，说明新路径根本不通。
+        if (pathVerify.expired(nowMs) && !resetByPeer) {
+            resetByPeer = true;
+            cb.log("FCP path lost: no reply within " + PATH_VERIFY_MS + "ms of network change");
+            notifyClosed("path_lost");
+            return;
         }
         if (lastPeerInMs != 0 && nowMs - lastPeerInMs >= PEER_ALIVE_GRACE_MS && !resetByPeer) {
             resetByPeer = true;

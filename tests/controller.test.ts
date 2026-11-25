@@ -118,18 +118,48 @@ test('FecstatReporter: fields are interval DELTAS, not cumulative totals', () =>
   r.onTick(T0, counters(), 0); // prime
   const c1 = counters({ setsExpected: 10, dataExpected: 100, dataRxOrig: 90 });
   r.onTick(T0 + FECSTAT_INTERVAL_MS, c1, 7);
-  const p1 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS * 2, c1, 7)!);
+  const p1 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS * 2, c1, 9)!);
   // Counters did not advance in the last interval → every delta is zero.
   assert.equal(p1.setsExpected, 0);
   assert.equal(p1.dataExpected, 0);
   assert.equal(p1.dataRxOrig, 0);
 
   const c2 = counters({ setsExpected: 12, dataExpected: 120, dataRxOrig: 105 });
-  const p2 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS * 3, c2, 9)!);
+  const p2 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS * 3, c2, 11)!);
   assert.equal(p2.setsExpected, 2);
   assert.equal(p2.dataExpected, 20);
   assert.equal(p2.dataRxOrig, 15);
-  assert.equal(p2.accountedThroughSetId, 9);
+  assert.equal(p2.accountedThroughSetId, 11);
+});
+
+test('FecstatReporter: repeated settlement keys are held and merged until the key advances', () => {
+  const r = new FecstatReporter(SALT, Direction.C2S);
+  r.onTick(T0, counters(), 0);
+  r.addDataBytes(10);
+  r.noteAuthFail();
+  r.recordRepairLatency(10);
+  const c1 = counters({ setsExpected: 1, dataExpected: 10 });
+  const p1 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, c1, 5)!);
+  assert.equal(p1.dataBytesRx, 10);
+  assert.equal(p1.authFail, 1);
+
+  r.addDataBytes(20);
+  r.noteAuthFail(); r.noteAuthFail();
+  r.recordRepairLatency(20); r.recordRepairLatency(30);
+  const c2 = counters({ setsExpected: 3, dataExpected: 30 });
+  assert.equal(r.onTick(T0 + FECSTAT_INTERVAL_MS * 2, c2, 5), null);
+  assert.equal(r.onTick(T0 + FECSTAT_INTERVAL_MS * 3, c2, 5), null);
+
+  const c3 = counters({ setsExpected: 5, dataExpected: 50 });
+  const p2 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS * 4, c3, 6)!);
+  assert.equal(p2.accountedThroughSetId, 6);
+  assert.equal(p2.intervalMs, 3000);
+  assert.equal(p2.setsExpected, 4, 'delta spans all held intervals');
+  assert.equal(p2.dataExpected, 40);
+  assert.equal(p2.dataBytesRx, 20);
+  assert.equal(p2.authFail, 2);
+  assert.equal(p2.repairLatP50Ms, 20);
+  assert.equal(p2.repairLatP95Ms, 30);
 });
 
 test('FecstatReporter: byte counters and failure counters reset each interval', () => {
@@ -139,14 +169,14 @@ test('FecstatReporter: byte counters and failure counters reset each interval', 
   r.addParityBytes(200);
   r.noteAuthFail();
   r.noteStructFail();
-  const p1 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, counters(), 0)!);
+  const p1 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, counters(), 7)!);
   assert.equal(p1.dataBytesRx, 1000);
   assert.equal(p1.parityBytesRx, 200);
   assert.equal(p1.authFail, 1);
   assert.equal(p1.structFail, 1);
 
   // Nothing added in the second interval → local counters are zero, not sticky.
-  const p2 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS * 2, counters(), 0)!);
+  const p2 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS * 2, counters(), 9)!);
   assert.equal(p2.dataBytesRx, 0);
   assert.equal(p2.parityBytesRx, 0);
   assert.equal(p2.authFail, 0);
@@ -158,7 +188,7 @@ test('FecstatReporter: repair latency uses nearest-rank percentiles and masks to
   r.onTick(T0, counters(), 0);
   // 5 samples: 10, 20, 30, 40, 70001 (masked to 4465 by & 0xffff).
   for (const ms of [10, 20, 30, 40, 70001]) r.recordRepairLatency(ms);
-  const p = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, counters(), 0)!);
+  const p = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, counters(), 7)!);
   // Sorted: 10,20,30,40,4465. Nearest-rank P50 = ceil(0.5*5)=3 → 30.
   assert.equal(p.repairLatP50Ms, 30);
   // P95 = ceil(0.95*5)=5 → 4465, and the field is 16-bit clean.
@@ -169,9 +199,7 @@ test('FecstatReporter: repair latency uses nearest-rank percentiles and masks to
 test('FecstatReporter: flag bits come from late recovery and tail-dropped sets', () => {
   const r = new FecstatReporter(SALT, Direction.C2S);
   r.onTick(T0, counters(), 0);
-  const p = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, counters({
-    recoveredLate: 2, setsTailDropped: 1,
-  }), 0)!);
+  const p = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, counters({ recoveredLate: 2, setsTailDropped: 1 }), 7)!);
   assert.equal(p.flg & FLG_DIRECTION, FLG_DIRECTION);
   assert.equal(p.flg & FLG_LATE_RECOVERY, FLG_LATE_RECOVERY);
   assert.equal(p.flg & FLG_TAIL_DROPPED, FLG_TAIL_DROPPED);
@@ -183,7 +211,7 @@ test('FecstatReporter: ledger fields only appear with a settled group, ppm cappe
   r.onTick(T0, counters(), 0);
   const p = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, counters({
     ledgerGroups: 4, ledgerFailed: 1, ledgerKHist: [0, 1, 0, 3, 0, 0, 0, 0],
-  }), 0)!);
+  }), 7)!);
   assert.equal(p.flg & FLG_LEDGER, FLG_LEDGER);
   assert.equal(p.ledgerGroups, 4);
   assert.equal(p.ledgerFailPpm, 250000);
@@ -194,14 +222,14 @@ test('FecstatReporter: ledger fields only appear with a settled group, ppm cappe
   r2.onTick(T0, counters(), 0);
   const p2 = decode(r2.onTick(T0 + FECSTAT_INTERVAL_MS, counters({
     ledgerGroups: 1, ledgerFailed: 5,
-  }), 0)!);
+  }), 9)!);
   assert.equal(p2.ledgerFailPpm, 1000000);
 });
 
 test('FecstatReporter: interval is clamped and matching salt is required', () => {
   const r = new FecstatReporter(SALT, Direction.C2S);
   r.onTick(T0, counters(), 0);
-  const buf = r.onTick(T0 + FECSTAT_INTERVAL_MS * 100, counters(), 0)!;
+  const buf = r.onTick(T0 + FECSTAT_INTERVAL_MS * 100, counters(), 7)!;
   assert.equal(decode(buf).intervalMs, 60000);
   assert.equal(decodeFecstat(buf, Buffer.from('ffffffffffffffff', 'latin1')).status, FecstatStatus.BadSalt);
 });
@@ -214,12 +242,12 @@ test('FecstatReporter: dataLateRx is independent of lateDup on the wire', () => 
   const r = new FecstatReporter(SALT, Direction.C2S);
   r.onTick(T0, counters(), 0); // prime
   const dupOnly = counters({ lateDup: 3, dataLateRx: 0 });
-  const p1 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, dupOnly, 0)!);
+  const p1 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS, dupOnly, 7)!);
   assert.equal(p1.lateDup, 3);
   assert.equal(p1.dataLateRx, 0, 'duplicates must not appear as late originals');
 
   const both = counters({ lateDup: 5, dataLateRx: 2 });
-  const p2 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS * 2, both, 0)!);
+  const p2 = decode(r.onTick(T0 + FECSTAT_INTERVAL_MS * 2, both, 9)!);
   assert.equal(p2.lateDup, 2, 'delta from 3 -> 5');
   assert.equal(p2.dataLateRx, 2, 'delta from 0 -> 2, independent of lateDup');
 });

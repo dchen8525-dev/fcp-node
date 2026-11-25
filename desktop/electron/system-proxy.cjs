@@ -43,6 +43,15 @@ $t = Add-Type -MemberDefinition $sig -Name FcpWinInet -Namespace Fcp -PassThru
 [void]$t::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)
 `;
 
+function psQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function matchesApplied(cur, saved) {
+  return !!cur && !!saved && Number(cur.enable) === 1 && cur.server === saved.server &&
+    cur.override === '<local>' && !cur.pac;
+}
+
 /** 读当前系统代理状态：{enable, server, override, pac}；读取失败返回 null。 */
 function readState() {
   if (!IS_WIN) return null;
@@ -81,14 +90,28 @@ function apply(userDataDir, host, port) {
 
   // 已经指向我们：只刷新一次，不覆盖备份（否则会把我们自己的值当成"原值"）
   const cur = readState();
-  if (cur && cur.enable === 1 && cur.server === server) {
+  if (!cur) return { ok: false, reason: '无法读取当前系统代理设置' };
+  if (cur.enable === 1 && cur.server === server) {
     ps(REFRESH_SNIPPET);
     return { ok: true, alreadyApplied: true };
   }
 
   const backup = backupPath(userDataDir);
-  if (!fs.existsSync(backup)) {
-    if (!cur) return { ok: false, reason: '无法读取当前系统代理设置' };
+  let saved;
+  if (fs.existsSync(backup)) {
+    try {
+      saved = JSON.parse(fs.readFileSync(backup, 'utf8'));
+    } catch {
+      return { ok: false, reason: '备份文件损坏，未改动系统代理' };
+    }
+    if (!saved || typeof saved.original !== 'object' || saved.original === null ||
+        typeof saved.server !== 'string') {
+      return { ok: false, reason: '备份文件损坏，未改动系统代理' };
+    }
+  }
+  // 陈旧备份可能来自上次恢复失败。若当前值已不是我们接管的值，说明用户
+  // 在此期间改过代理；以当前值为新的原始值，不能恢复旧备份覆盖它。
+  if (!saved || !matchesApplied(cur, saved)) {
     try {
       fs.writeFileSync(backup, JSON.stringify({
         appliedAt: Date.now(),
@@ -103,7 +126,7 @@ function apply(userDataDir, host, port) {
   const out = ps(`
 $k = '${REG_PATH}'
 Set-ItemProperty -Path $k -Name ProxyEnable   -Value 1 -Type DWord
-Set-ItemProperty -Path $k -Name ProxyServer   -Value '${server}' -Type String
+Set-ItemProperty -Path $k -Name ProxyServer   -Value ${psQuote(server)} -Type String
 Set-ItemProperty -Path $k -Name ProxyOverride -Value '<local>' -Type String
 # PAC 优先级高于 ProxyServer，留着它我们就不会生效；原值已在备份里
 Remove-ItemProperty -Path $k -Name AutoConfigURL -ErrorAction SilentlyContinue
@@ -132,27 +155,36 @@ function restore(userDataDir, opts = {}) {
     return { ok: false, reason: '备份文件损坏，未改动系统代理' };
   }
 
-  const cur = readState();
-  if (opts.onlyIfOurs && cur && !(cur.enable === 1 && cur.server === saved.server)) {
-    // 用户后来自己改过代理：删掉陈旧备份，别再碰
-    try { fs.unlinkSync(backup); } catch { /* ignore */ }
-    return { ok: true, skipped: true };
+  if (!saved || typeof saved.original !== 'object' || saved.original === null ||
+      typeof saved.server !== 'string') {
+    return { ok: false, reason: '备份文件损坏，未改动系统代理' };
   }
 
-  const o = saved.original || {};
+  const cur = readState();
+  if (opts.onlyIfOurs) {
+    // 读不到当前值时不能盲写注册表；保留备份，下次启动再试。
+    if (!cur) return { ok: false, reason: '无法读取当前系统代理设置' };
+    if (!matchesApplied(cur, saved)) {
+      // 用户后来自己改过代理（包括只改 bypass/PAC）：删掉陈旧备份，别再碰。
+      try { fs.unlinkSync(backup); } catch { /* ignore */ }
+      return { ok: true, skipped: true };
+    }
+  }
+
+  const o = saved.original;
   const setEnable = Number(o.enable) === 1 ? 1 : 0;
-  const setServer = (o.server || '').replace(/'/g, "''");
-  const setOverride = (o.override || '').replace(/'/g, "''");
-  const pac = (o.pac || '').replace(/'/g, "''");
-  const pacLine = pac
-    ? `Set-ItemProperty -Path $k -Name AutoConfigURL -Value '${pac}' -Type String`
+  const setServer = psQuote(o.server || '');
+  const setOverride = psQuote(o.override || '');
+  const pac = psQuote(o.pac || '');
+  const pacLine = o.pac
+    ? `Set-ItemProperty -Path $k -Name AutoConfigURL -Value ${pac} -Type String`
     : `Remove-ItemProperty -Path $k -Name AutoConfigURL -ErrorAction SilentlyContinue`;
 
   const out = ps(`
 $k = '${REG_PATH}'
 Set-ItemProperty -Path $k -Name ProxyEnable   -Value ${setEnable} -Type DWord
-Set-ItemProperty -Path $k -Name ProxyServer   -Value '${setServer}' -Type String
-Set-ItemProperty -Path $k -Name ProxyOverride -Value '${setOverride}' -Type String
+Set-ItemProperty -Path $k -Name ProxyServer   -Value ${setServer} -Type String
+Set-ItemProperty -Path $k -Name ProxyOverride -Value ${setOverride} -Type String
 ${pacLine}
 ${REFRESH_SNIPPET}
 Write-Output OK

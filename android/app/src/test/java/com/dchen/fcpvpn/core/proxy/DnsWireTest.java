@@ -8,8 +8,10 @@ import java.util.List;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 /** DnsWire：查询解析 + 应答 TTL 解析 + 缓存适配（换 ID、递减 TTL）。 */
 public class DnsWireTest {
@@ -124,5 +126,55 @@ public class DnsWireTest {
         resp[secondTtl] = 0; resp[secondTtl + 1] = 0;
         resp[secondTtl + 2] = 0; resp[secondTtl + 3] = 12;
         assertEquals(12, DnsWire.minTtl(resp, resp.length));
+    }
+
+    // ---- AAAA 过滤（只提供 IPv4 隧道时，应用不能拿到 IPv6 地址）----
+
+    @Test
+    public void detectsIpv6Query() {
+        DnsWire.Query aaaa = DnsWire.parseQuery(buildQuery(0x2222, "v6.example.com", DnsWire.TYPE_AAAA));
+        assertNotNull(aaaa);
+        assertTrue(DnsWire.isIpv6Query(aaaa));
+
+        DnsWire.Query a = DnsWire.parseQuery(buildQuery(0x2223, "v4.example.com", DnsWire.TYPE_A));
+        assertNotNull(a);
+        assertFalse(DnsWire.isIpv6Query(a));
+
+        // null（畸形包/应答）不能当成 AAAA
+        assertFalse(DnsWire.isIpv6Query(null));
+    }
+
+    @Test
+    public void buildNoDataIsNoerrorWithZeroAnswers() {
+        byte[] q = buildQuery(0x3333, "v6.example.com", DnsWire.TYPE_AAAA);
+        DnsWire.Query query = DnsWire.parseQuery(q);
+        byte[] resp = DnsWire.buildNoData(query);
+
+        // QR=1（应答）、rcode=0（NOERROR）
+        assertEquals(0x81, resp[2] & 0xff);
+        assertEquals(0x80, resp[3] & 0xff);
+        // qdcount=1，ancount=0（"该类型没有记录"）
+        assertEquals(1, ((resp[4] & 0xff) << 8) | (resp[5] & 0xff));
+        assertEquals(0, ((resp[6] & 0xff) << 8) | (resp[7] & 0xff));
+        // nscount / arcount 都是 0
+        assertEquals(0, ((resp[8] & 0xff) << 8) | (resp[9] & 0xff));
+        assertEquals(0, ((resp[10] & 0xff) << 8) | (resp[11] & 0xff));
+        // 没有答案记录 → 负应答的 TTL 语义
+        assertEquals(0, DnsWire.minTtl(resp, resp.length));
+        // 事务 ID 原样回填
+        assertEquals(0x33, resp[0] & 0xff);
+        assertEquals(0x33, resp[1] & 0xff);
+    }
+
+    @Test
+    public void buildNoDataEchoesQuestionSection() {
+        byte[] q = buildQuery(0x4444, "v6.example.com", DnsWire.TYPE_AAAA);
+        DnsWire.Query query = DnsWire.parseQuery(q);
+        byte[] resp = DnsWire.buildNoData(query);
+
+        // 长度 = 头部 + 原样的 question 区
+        assertEquals(12 + query.questionSection.length, resp.length);
+        byte[] echoed = Arrays.copyOfRange(resp, 12, resp.length);
+        assertArrayEquals(query.questionSection, echoed);
     }
 }

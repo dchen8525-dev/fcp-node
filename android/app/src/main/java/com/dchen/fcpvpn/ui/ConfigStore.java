@@ -132,7 +132,7 @@ public final class ConfigStore {
         if (psk.isEmpty()) {
             return null;
         }
-        return new EngineConfig(
+        EngineConfig cfg = new EngineConfig(
                 getHost(context).trim(),
                 getPort(context),
                 psk,
@@ -141,6 +141,10 @@ public final class ConfigStore {
                 getMtuMin(context),
                 getProbeIntervalSec(context),
                 BuildConfig.DEFAULT_LOG_LEVEL.toLowerCase(Locale.US));
+        // 代理端口必须显式带过去：EngineConfig 的默认值是 1080，不设置的话
+        // 用户在设置里改的端口只会在 VPN 模式生效，代理服务模式永远监听 1080。
+        cfg.proxyPort = getProxyPort(context);
+        return cfg;
     }
 
     // ------------------------------------------------------------ 保存

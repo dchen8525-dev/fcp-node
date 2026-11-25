@@ -16,8 +16,6 @@ contextBridge.exposeInMainWorld('fcp', {
   saveSettings: (patch) => ipcRenderer.invoke('fcp:settings:save', patch),
   probeNow: () => ipcRenderer.invoke('fcp:probe:now'),
   sysProxyStatus: () => ipcRenderer.invoke('fcp:sysproxy:status'),
-  sysProxyApply: () => ipcRenderer.invoke('fcp:sysproxy:apply'),
-  sysProxyRestore: () => ipcRenderer.invoke('fcp:sysproxy:restore'),
   onSysProxy: (fn) => ipcRenderer.on('fcp:sysproxy', (_e, p) => fn(p)),
   openLogDir: () => ipcRenderer.invoke('fcp:open-log-dir'),
   onStats: (fn) => ipcRenderer.on('fcp:stats', (_e, p) => fn(p)),

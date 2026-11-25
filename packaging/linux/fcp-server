@@ -18,6 +18,13 @@ if [ -n "${FCP_FEC:-}" ]; then
   exit 1
 fi
 
+# 安装包默认拒绝访问服务器自身内网；个人自用可在配置里显式改为 0。
+case "${FCP_DENY_PRIVATE:-1}" in
+  1) set -- "$@" --deny-private ;;
+  0) ;;
+  *) echo "fcp-server: FCP_DENY_PRIVATE must be 0 or 1" >&2; exit 1 ;;
+esac
+
 # Protocol-internal DNS (oob FCP_DNS1) resolvers. Empty = this host's own
 # resolver list, which is exactly what OPEN(domain) uses.
 [ -n "${FCP_DNS_UPSTREAM:-}" ] && set -- "$@" --dns-upstream="${FCP_DNS_UPSTREAM}"

@@ -26,6 +26,22 @@ public class FrameRxTest {
         return FrameTx.packTxFrame(setId, index, d, 0x60, new byte[]{3, 0, (byte) 0xab});
     }
 
+    /** 声明 n = index − j 的 parity 符号（packTypeK(3, 0, TYPE_PARITY)）。 */
+    private static byte[] parityFrame(int setId, int index, int d, int k, int j) {
+        return FrameTx.packTxFrame(setId, index, d,
+                FecHeader.packTypeK(k, j, FecHeader.TYPE_PARITY), new byte[]{3, 0, (byte) 0xab});
+    }
+
+    /** 一个完整集合：data#0 + parity#1（n=1），结算时正常计入 setsExpected。 */
+    private static void sendCompleteSet(FrameRx rx, int setId, long nowMs) {
+        rx.onDatagram(dataFrame(setId, 0, 10), nowMs);
+        rx.onDatagram(parityFrame(setId, 1, 10, 3, 0), nowMs);
+    }
+
+    private static void sendCompleteSet(FrameRx rx, int setId) {
+        sendCompleteSet(rx, setId, 0);
+    }
+
     private static final FrameTx.MtuLimits LIMITS = FrameTx.computeMtuLimits(1400, 20);
 
     // ------------------------------------------------------------------
@@ -141,12 +157,14 @@ public class FrameRxTest {
     @Test
     public void evictingAccountedSetRetiresItsId() {
         FrameRx rx = FrameTxTest.makeRx(10, 3, 65535, new ArrayList<>());
-        for (int id = 0; id < 256; ++id) rx.onDatagram(dataFrame(id, 0, 10), 0);
+        // 真实形状：data + 声明 n 的 parity。只有 data 的集合现在结算为 tail drop，
+        // 不会进入 setsExpected，测不到"已记账集合被驱逐后不得二次结算"。
+        for (int id = 0; id < 256; ++id) sendCompleteSet(rx, id);
         rx.onTick(1000); // 全部记账（1s 门），尚未退役（2s）
         int before = rx.counters.setsExpected;
         assertEquals(256, before);
 
-        rx.onDatagram(dataFrame(256, 0, 10), 1000); // 逼出对 set 0 的驱逐
+        sendCompleteSet(rx, 256, 1000); // 逼出对 set 0 的驱逐（256 自身也是完整集合）
         assertNull("set 0 被驱逐", rx.view(0));
 
         rx.onDatagram(dataFrame(0, 0, 10), 1001); // 迟到符号不得重建已记账集合
@@ -188,11 +206,27 @@ public class FrameRxTest {
     @Test
     public void gapPlaceholdersCountAsKUnknown() {
         FrameRx rx = FrameTxTest.makeRx(10, 3, 65535, new ArrayList<>());
-        rx.onDatagram(dataFrame(0, 0, 10), 0);
-        rx.onDatagram(dataFrame(5, 0, 10), 0); // 跳变 0→5 创建占位 1..4
+        // 两个完整集合（data + parity 声明 n），断言只针对占位规则
+        sendCompleteSet(rx, 0);
+        sendCompleteSet(rx, 5); // 跳变 0→5 创建占位 1..4
         rx.onTick(1000);
         assertEquals(4, rx.counters.setsKUnknown);
-        assertEquals(0, rx.counters.setsTailDropped);
+        assertEquals("完整集合与占位都不是 tail drop", 0, rx.counters.setsTailDropped);
+        assertEquals(2, rx.counters.setsExpected);
+    }
+
+    @Test
+    public void dataOnlySetSettlesAsTailDrop() {
+        // 只有 data、始终没有 parity 声明的集合在结算钟响时是尾巴：没有 n 只能按
+        // maxDataIndex+1 猜码长，计入分母会把控制器的期望值撑大
+        // （protocol.test.ts "a data-only set with expected parity settles as a tail drop"）。
+        FrameRx rx = FrameTxTest.makeRx(10, 3, 65535, new ArrayList<>());
+        rx.onDatagram(dataFrame(4, 0, 10), 0);
+        rx.onTick(1000);
+        assertEquals(1, rx.counters.setsTailDropped);
+        assertEquals(0, rx.counters.setsExpected);
+        assertEquals(0, rx.counters.dataExpected);
+        assertEquals("尾巴丢弃也必须推进结算键", 4, rx.accountedThroughSetId());
     }
 
     // ------------------------------------------------------------------

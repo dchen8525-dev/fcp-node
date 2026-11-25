@@ -44,7 +44,9 @@ Server:
 Client:
   --peer=IP[:P]         FCP server to connect to (required; port defaults to 4460)
   -b, --bind=IP[:P]     local proxy listen address (default 127.0.0.1:1080)
-                        one port speaks SOCKS5, HTTP CONNECT and absolute-form HTTP
+                        loopback only: SOCKS5/HTTP have no authentication, so a
+                        non-loopback bind is rejected to avoid an open proxy.
+                        The port speaks SOCKS5, HTTP CONNECT and absolute-form HTTP.
 
   (-p/--port was removed: the address already carries its port, so the flag only
   offered a second, conflicting way to say the same thing. Write :P instead.)
@@ -393,55 +395,74 @@ function pinnedKFromEnv(log: (line: string) => void): number {
 async function speedtest(base: TunnelOptions, seconds: number): Promise<void> {
   // In-process loopback: a real FCP tunnel (handshake + envelope + FEC +
   // FCP-STREAM) carrying a local TCP echo, measured over the proxy port.
-  const echo = createServer((s) => s.pipe(s));
-  await new Promise<void>((r) => echo.listen(0, '127.0.0.1', r));
-  const echoPort = (echo.address() as { port: number }).port;
-  const udpPort = 40000 + Math.floor(Math.random() * 10000);
-  const proxyPort = 30000 + Math.floor(Math.random() * 10000);
-  const server = new TunnelServer({ ...base, port: udpPort, log: () => {} });
-  const client = new TunnelClient({ ...base, host: '127.0.0.1', port: udpPort, listenPort: proxyPort, log: () => {} });
-  await server.start();
-  await client.start();
-
-  const greeting = Buffer.from([0x05, 0x01, 0x00]);
-  const req = Buffer.concat([
-    Buffer.from([0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1]),
-    Buffer.from([(echoPort >>> 8) & 0xff, echoPort & 0xff]),
-  ]);
-  const sock = connect(proxyPort, '127.0.0.1');
-  let phase: 'greeting' | 'reply' | 'data' = 'greeting';
-  let sent = 0, received = 0;
-  const chunk = randomBytes(1024);
-  const start = Date.now();
-  const endAt = start + seconds * 1000;
-  let resolveDone: () => void = () => {};
-  const done = new Promise<void>((r) => { resolveDone = r; });
-  sock.on('connect', () => sock.write(greeting));
-  sock.on('data', (b: Buffer) => {
-    if (phase === 'greeting') { phase = 'reply'; sock.write(req); return; }
-    if (phase === 'reply') {
-      if (b.length < 10 || b[1] !== 0) { sock.destroy(); resolveDone(); return; }
-      phase = 'data';
-      for (let i = 0; i < 16; ++i) { sock.write(chunk); sent += chunk.length; }
-      return;
-    }
-    received += b.length;
-    if (Date.now() < endAt) { sock.write(chunk); sent += chunk.length; }
-    else { sock.destroy(); resolveDone(); }
+  const echoSockets = new Set<ReturnType<typeof connect>>();
+  const echo = createServer((s) => {
+    echoSockets.add(s);
+    s.once('close', () => echoSockets.delete(s));
+    s.pipe(s);
   });
-  sock.on('error', () => resolveDone());
-  sock.on('close', () => resolveDone());
-  await Promise.race([done, new Promise<void>((r) => setTimeout(r, (seconds + 5) * 1000))]);
-  // The timeout branch used to leave this socket open, which kept the event
-  // loop alive after the report and made `speedtest` hang until killed.
-  sock.destroy();
-  const elapsed = Math.max(1, Date.now() - start) / 1000;
-  process.stdout.write(
-    `FCP speedtest (in-process loopback, ${seconds}s):\n` +
-    `  tx ${sent} B  rx ${received} B  ${(received * 8 / elapsed / 1e6).toFixed(2)} Mbit/s rx\n` +
-    `  sessions: client=${client.sessionCount} server=${server.sessionCount}\n`,
-  );
-  client.stop(); server.stop(); echo.close();
+  let server: TunnelServer | undefined;
+  let client: TunnelClient | undefined;
+  let sock: TcpSocket | undefined;
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await new Promise<void>((r) => echo.listen(0, '127.0.0.1', r));
+    const echoPort = (echo.address() as { port: number }).port;
+    const udpPort = 40000 + Math.floor(Math.random() * 10000);
+    const proxyPort = 30000 + Math.floor(Math.random() * 10000);
+    server = new TunnelServer({ ...base, port: udpPort, log: () => {} });
+    client = new TunnelClient({ ...base, host: '127.0.0.1', port: udpPort, listenPort: proxyPort, log: () => {} });
+    await server.start();
+    await client.start();
+
+    const greeting = Buffer.from([0x05, 0x01, 0x00]);
+    const req = Buffer.concat([
+      Buffer.from([0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1]),
+      Buffer.from([(echoPort >>> 8) & 0xff, echoPort & 0xff]),
+    ]);
+    sock = connect(proxyPort, '127.0.0.1');
+    let phase: 'greeting' | 'reply' | 'data' = 'greeting';
+    let sent = 0, received = 0;
+    const chunk = randomBytes(1024);
+    const start = Date.now();
+    const endAt = start + seconds * 1000;
+    let resolveDone: () => void = () => {};
+    const done = new Promise<void>((r) => { resolveDone = r; });
+    sock.on('connect', () => sock!.write(greeting));
+    sock.on('data', (b: Buffer) => {
+      if (phase === 'greeting') { phase = 'reply'; sock!.write(req); return; }
+      if (phase === 'reply') {
+        if (b.length < 10 || b[1] !== 0) { sock!.destroy(); resolveDone(); return; }
+        phase = 'data';
+        for (let i = 0; i < 16; ++i) { sock!.write(chunk); sent += chunk.length; }
+        return;
+      }
+      received += b.length;
+      if (Date.now() < endAt) { sock!.write(chunk); sent += chunk.length; }
+      else { sock!.destroy(); resolveDone(); }
+    });
+    sock.on('error', () => resolveDone());
+    sock.on('close', () => resolveDone());
+    timeout = setTimeout(resolveDone, (seconds + 5) * 1000);
+    await done;
+    if (timeout) clearTimeout(timeout);
+    timeout = undefined;
+    sock.destroy();
+    const elapsed = Math.max(1, Date.now() - start) / 1000;
+    process.stdout.write(
+      `FCP speedtest (in-process loopback, ${seconds}s):\n` +
+      `  tx ${sent} B  rx ${received} B  ${(received * 8 / elapsed / 1e6).toFixed(2)} Mbit/s rx\n` +
+      `  sessions: client=${client.sessionCount} server=${server.sessionCount}\n`,
+    );
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    sock?.destroy();
+    client?.stop();
+    server?.stop();
+    echo.close();
+    for (const s of echoSockets) s.destroy();
+    echoSockets.clear();
+  }
 }
 
 async function metricsReport(prefix: string): Promise<void> {

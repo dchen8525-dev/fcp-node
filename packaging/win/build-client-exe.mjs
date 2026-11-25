@@ -28,6 +28,12 @@ function run(cmd, args, opts = {}) {
   return r;
 }
 
+function runNpx(args) {
+  const npmCli = process.env.npm_execpath;
+  if (!npmCli) throw new Error('run this build through npm so the npx fallback can execute without a shell');
+  run(process.execPath, [npmCli, 'exec', '--yes', ...args]);
+}
+
 function sha256(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
@@ -44,8 +50,7 @@ const esbuildArgs = [join(here, 'client-entry.ts'), '--bundle', '--platform=node
 if (existsSync(esbuildJs)) {
   run(process.execPath, [esbuildJs, ...esbuildArgs]);
 } else {
-  const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-  run(npx, ['--yes', 'esbuild@0.28.2', ...esbuildArgs], { shell: true });
+  runNpx(['--package=esbuild@0.28.2', '--', 'esbuild', ...esbuildArgs]);
 }
 
 // 2. Emit the SEA preparation blob with the locally installed node.exe.
@@ -61,11 +66,9 @@ run(process.execPath, ['--experimental-sea-config', seaConfig]);
 
 // 3. Copy node.exe and inject the blob.
 copyFileSync(process.execPath, outExe);
-const postject = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-run(postject, ['--yes', `postject@${POSTJECT_VERSION}`, outExe, 'NODE_SEA_BLOB',
+runNpx([`--package=postject@${POSTJECT_VERSION}`, '--', 'postject', outExe, 'NODE_SEA_BLOB',
   join(stage, 'sea-prep.blob'),
-  '--sentinel-fuse', 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2'],
-{ shell: true });
+  '--sentinel-fuse', 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2']);
 
 // 4. Smoke test: the exe must print the CLI usage with the right version.
 const smoke = spawnSync(outExe, ['-h'], { encoding: 'utf8' });

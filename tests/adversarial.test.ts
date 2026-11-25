@@ -20,7 +20,7 @@ import { ipv4Denied, ipv6Denied, ipDenied, MAX_PREAUTH_PER_IP } from '../src/app
 import { TunnelServer, TunnelClient } from '../src/app/tunnel.ts';
 import {
   HandshakeRole, TLV_TYPE_ACK_V2, TLV_TYPE_KEY_UPDATE, TLV_TYPE_MULTIPLEX,
-  SymbolType, MAX_RX_SYMBOL_BYTES, PROBE_BUDGET_BYTES, SESSION_STREAM_BUDGET_BYTES,
+  SymbolType, MAX_ACTIVE_SETS, MAX_RX_SYMBOL_BYTES, PROBE_BUDGET_BYTES, SESSION_STREAM_BUDGET_BYTES,
   PROBE_TYPE_DOWN, PROBE_FLAG_DOWN, PROBE_HDR_LEN, DEFAULT_MTU_MIN, LOCAL_FLAGS_M1,
 } from '../src/constants.ts';
 import { FrameRx, FrameTx, computeMtuLimits } from '../src/fec/frame.ts';
@@ -175,6 +175,41 @@ test('FEC: a reconstructed symbol is counted in the session byte budget', () => 
   assert.equal(rx.symbolBytes, 0,
     `retirement left the counter at ${rx.symbolBytes}; a negative value disables MAX_RX_SYMBOL_BYTES`);
   assert.ok(rx.symbolBytes <= MAX_RX_SYMBOL_BYTES);
+});
+
+test('FEC: synchronous reentry cannot evict the set being decoded', () => {
+  let reentered = false;
+  let rx: FrameRx & { symbolBytes: number; sets: Map<number, unknown> };
+  rx = new FrameRx({
+    d: 10, p: 2,
+    deliver: (_b, info) => {
+      if (info.recovered && !reentered) {
+        reentered = true;
+        rx.onDatagram(dataSymbol(256, 0, 0, Buffer.from([3, 0, 0xaa]), 10), 0);
+      }
+    },
+    oob: () => {},
+  }) as FrameRx & { symbolBytes: number; sets: Map<number, unknown> };
+  for (let id = 0; id < MAX_ACTIVE_SETS - 1; ++id) {
+    rx.onDatagram(dataSymbol(id, 0, 0, Buffer.from([3, 0, id & 0xff]), 10), 0);
+  }
+  const size = 16;
+  const syms = Array.from({ length: 10 }, (_, i) => {
+    const b = Buffer.alloc(size); putLe16(size, b, 0); b[2] = i; return b;
+  });
+  const parity = rsEncode(syms, 10, 2, size)!;
+  for (let i = 0; i < 8; ++i) rx.onDatagram(dataSymbol(255, i, 2, syms[i]!, 10), 0);
+  rx.onDatagram(paritySymbol(255, 10, 0, 2, parity[0]!, 10), 0);
+  rx.onDatagram(paritySymbol(255, 11, 1, 2, parity[1]!, 10), 0);
+  assert.equal(reentered, true);
+  assert.ok(rx.view(255), 'the decoding set must survive callback reentry');
+  const held = [...rx.sets.values()].reduce((acc: number, st) => {
+    const set = st as { data: Map<number, Buffer> };
+    return acc + [...set.data.values()].reduce((x, b) => x + b.length, 0);
+  }, 0);
+  assert.equal(rx.symbolBytes, held, 'recovered rows must stay inside the held-byte budget');
+  rx.onTick(3000);
+  assert.equal(rx.symbolBytes, 0);
 });
 
 // ---------------------------------------------------------------------------

@@ -28,7 +28,7 @@ let failed = 0;
 // 1. Every library module must be importable under strip-only type erasure.
 const imports = libs.map((p) => `  await import(${JSON.stringify(pathToFileURL(p).href)});`).join('\n');
 const imp = spawnSync(process.execPath, ['--input-type=module', '-e', imports], {
-  cwd: root, encoding: 'utf8',
+  cwd: root, encoding: 'utf8', timeout: 30000,
 });
 const importOk = imp.status === 0;
 results.push(['module imports', importOk ? 'PASS' : 'FAIL', `${libs.length} modules`]);
@@ -71,13 +71,17 @@ if (!selfOk) { console.error((self.stderr ?? '') + (self.stdout ?? '')); ++faile
 // 4. CLI smoke: -h must work with no PSK and carry the version on its first
 //    line (that is what --version used to do), and the removed --version must
 //    be rejected instead of quietly printing the usage.
-const helpRun = spawnSync(process.execPath, ['src/app/cli.ts', '--help'], { cwd: root, encoding: 'utf8' });
+const helpRun = spawnSync(process.execPath, ['src/app/cli.ts', '--help'], {
+  cwd: root, encoding: 'utf8', timeout: 15000,
+});
 const helpFirst = (helpRun.stdout ?? '').split('\n')[0];
 const helpOk = helpRun.status === 0 && /^FCP \d+\.\d+\.\d+/.test(helpFirst);
 results.push(['cli --help', helpOk ? 'PASS' : 'FAIL', helpFirst]);
 if (!helpOk) { console.error(helpRun.stderr); ++failed; }
 
-const verRun = spawnSync(process.execPath, ['src/app/cli.ts', '--version'], { cwd: root, encoding: 'utf8' });
+const verRun = spawnSync(process.execPath, ['src/app/cli.ts', '--version'], {
+  cwd: root, encoding: 'utf8', timeout: 15000,
+});
 const verOk = verRun.status !== 0 && /--version is no longer accepted/.test(verRun.stderr ?? '');
 results.push(['--version gone', verOk ? 'PASS' : 'FAIL',
   verOk ? 'rejected (points at -h)' : `status=${verRun.status}`]);
@@ -92,7 +96,8 @@ writeFileSync(join(traceDir, 'run-client-aa.jsonl'), '{"t":"bbr"}\n');
 writeFileSync(join(traceDir, 'run-server-aa.jsonl'), '{"t":"bbr"}\n{"t":"fec_k"}\n');
 writeFileSync(join(traceDir, 'cache.jsonl'), '{"t":"bbr"}\n');
 const replayRun = spawnSync(process.execPath,
-  ['src/app/metrics-report.ts', `--metrics=${join(traceDir, 'run')}`], { cwd: root, encoding: 'utf8' });
+  ['src/app/metrics-report.ts', `--metrics=${join(traceDir, 'run')}`],
+  { cwd: root, encoding: 'utf8', timeout: 15000 });
 const replayOut = (replayRun.stdout ?? '').trim();
 const traceOk = replayRun.status === 0 && /2 file\(s\), 3 events/.test(replayOut) && !/cache/.test(replayOut);
 results.push(['metrics report', traceOk ? 'PASS' : 'FAIL',

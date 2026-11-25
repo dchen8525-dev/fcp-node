@@ -12,21 +12,24 @@ import android.text.TextWatcher;
 import android.view.LayoutInflater;
 import android.view.ViewGroup;
 
+import androidx.activity.OnBackPressedCallback;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.dchen.fcpvpn.R;
+import com.dchen.fcpvpn.core.session.EngineConfig;
 import com.dchen.fcpvpn.databinding.ActivityAppPickerBinding;
 import com.dchen.fcpvpn.databinding.ItemAppBinding;
 import com.dchen.fcpvpn.log.LogConfig;
 import com.dchen.fcpvpn.log.Logger;
+import com.dchen.fcpvpn.util.ServiceUtil;
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import com.google.android.material.snackbar.Snackbar;
 
 import java.text.Collator;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -38,10 +41,16 @@ import java.util.concurrent.Executors;
 /**
  * 分应用代理：勾选哪些应用走 VPN。
  *
- * 语义（与 VpnService.Builder 一致）：勾选集合为空时不做白名单，全部应用走 VPN；
- * 非空时只有这些应用走 VPN，其余直连。改动在重新连接 VPN 后生效。
+ * <p>语义（与 VpnService.Builder 一致）：勾选集合为空时不做白名单，全部应用走 VPN；
+ * 非空时只有这些应用走 VPN，其余直连。</p>
+ *
+ * <p>白名单只在建立 TUN（{@code VpnService.Builder.establish()}）时生效，所以
+ * 改完必须重建隧道：这里在保存时若发现 VPN 正在运行，就重新下发一次启动命令，
+ * 由 {@code FcpVpnService} 拆旧建新（等价于"断开再连接"，但不用用户手动做）。</p>
  */
 public class AppPickerActivity extends AppCompatActivity {
+
+    private static final String STATE_SELECTED = "selected_pkgs";
 
     /** 一行可选应用。 */
     private static final class AppRow {
@@ -69,8 +78,23 @@ public class AppPickerActivity extends AppCompatActivity {
         binding = ActivityAppPickerBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
 
-        selected.addAll(ConfigStore.getVpnApps(this));
-        binding.pickerToolbar.setNavigationOnClickListener(v -> finish());
+        // 屏幕旋转会重建 Activity：勾选状态必须跟着走，否则用户转个屏就没了。
+        if (savedInstanceState != null) {
+            ArrayList<String> saved = savedInstanceState.getStringArrayList(STATE_SELECTED);
+            if (saved != null) {
+                selected.addAll(saved);
+            }
+        } else {
+            selected.addAll(ConfigStore.getVpnApps(this));
+        }
+
+        binding.pickerToolbar.setNavigationOnClickListener(v -> confirmExit());
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                confirmExit();
+            }
+        });
 
         adapter = new AppAdapter();
         binding.pickerList.setLayoutManager(new LinearLayoutManager(this));
@@ -99,10 +123,39 @@ public class AppPickerActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putStringArrayList(STATE_SELECTED, new ArrayList<>(selected));
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
         loader.shutdownNow();
         binding = null;
+    }
+
+    /**
+     * 返回/左上角箭头：改动没保存时先问一句。旧实现直接 finish()，用户的勾选
+     * 被无声丢弃——这是"选了应用却没生效"的一个来源。
+     */
+    private void confirmExit() {
+        if (!isDirty()) {
+            finish();
+            return;
+        }
+        new MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.fcp_apps_discard_title)
+                .setMessage(R.string.fcp_apps_discard_message)
+                .setPositiveButton(R.string.fcp_apps_save, (d, w) -> save())
+                .setNegativeButton(R.string.fcp_apps_discard, (d, w) -> finish())
+                .setNeutralButton(R.string.fcp_apps_cancel, null)
+                .show();
+    }
+
+    /** 当前勾选是否与已保存的白名单不同。 */
+    private boolean isDirty() {
+        return !selected.equals(ConfigStore.getVpnApps(this));
     }
 
     /**
@@ -186,12 +239,90 @@ public class AppPickerActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * 保存白名单。
+     *
+     * <p>三件事：① 丢掉已卸载/已禁用的包名；② 但绝不能让清理把白名单变成空集合
+     * ——空集合的语义是"全部应用走 VPN"，那和用户"只代理这几个应用"的意图正好
+     * 相反，所以这种情况要用户确认；③ 白名单真的变了、且 VPN 正在运行时重建隧道。</p>
+     */
     private void save() {
-        ConfigStore.setVpnApps(this, new LinkedHashSet<>(selected));
-        Logger.info(LogConfig.MODULE_UI, "分应用代理保存 apps=" + selected.size()
-                + (selected.isEmpty() ? " (全部应用)" : ""));
-        Snackbar.make(binding.getRoot(), R.string.fcp_apps_saved, Snackbar.LENGTH_SHORT).show();
+        Set<String> effective = purgeMissing(selected);
+        if (effective.isEmpty() && !selected.isEmpty()) {
+            confirmWidenToAllApps();
+            return;
+        }
+        persist(effective);
+    }
+
+    /** 清理会把白名单清空：明确问一次，别把"只代理银行 App"悄悄变成"全代理"。 */
+    private void confirmWidenToAllApps() {
+        new MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.fcp_apps_none_usable_title)
+                .setMessage(getString(R.string.fcp_apps_none_usable_message, selected.size()))
+                .setPositiveButton(R.string.fcp_apps_all, (d, w) -> {
+                    selected.clear();
+                    adapter.notifyDataSetChanged();
+                    updateCount();
+                    persist(new LinkedHashSet<String>());
+                })
+                .setNegativeButton(R.string.fcp_apps_cancel, null)
+                .show();
+    }
+
+    /** 落盘；只有白名单真的变了才重建隧道（无改动的保存不该掐断现有连接）。 */
+    private void persist(Set<String> effective) {
+        int dropped = selected.size() - effective.size();
+        boolean changed = !purgeMissing(ConfigStore.getVpnApps(this)).equals(effective);
+        ConfigStore.setVpnApps(this, new LinkedHashSet<>(effective));
+        Logger.info(LogConfig.MODULE_UI, "分应用代理保存 apps=" + effective.size()
+                + (effective.isEmpty() ? " (全部应用)" : "")
+                + (dropped > 0 ? " dropped=" + dropped : "")
+                + (changed ? "" : " unchanged"));
+
+        boolean applied = changed && rebuildTunnelIfRunning();
+        Snackbar.make(binding.getRoot(),
+                applied ? R.string.fcp_apps_saved_applied : R.string.fcp_apps_saved,
+                Snackbar.LENGTH_SHORT).show();
         binding.getRoot().postDelayed(this::finish, 600);
+    }
+
+    /** 清掉已卸载/已禁用的包名。 */
+    private Set<String> purgeMissing(Set<String> pkgs) {
+        Set<String> out = new LinkedHashSet<>();
+        PackageManager pm = getPackageManager();
+        for (String pkg : pkgs) {
+            try {
+                if (pm.getApplicationInfo(pkg, 0).enabled) {
+                    out.add(pkg);
+                }
+            } catch (PackageManager.NameNotFoundException e) {
+                // 已卸载：直接丢掉
+            }
+        }
+        return out;
+    }
+
+    /**
+     * VPN 正在运行时，按新白名单重建隧道：重新下发一次启动命令，服务会拆旧建新
+     * （见 {@code FcpVpnService.restartVpn}）。返回是否成功触发。
+     */
+    private boolean rebuildTunnelIfRunning() {
+        if (!ConfigStore.RUN_MODE_VPN.equals(ConfigStore.getRunMode(this))) {
+            return false;   // 代理服务模式下白名单不适用
+        }
+        if (!ServiceUtil.isVpnServiceRunning(this)) {
+            return false;   // 没在跑，下次连接时自然生效
+        }
+        if (ServiceUtil.checkVpnAuthorization(this) != null) {
+            return false;   // 授权已被撤销：让用户自己重新连
+        }
+        EngineConfig cfg = ConfigStore.buildEngineConfig(this);
+        if (cfg == null) {
+            return false;   // PSK 没记住：重建不了，让用户手动重连
+        }
+        ServiceUtil.startVpnService(this, cfg, ConfigStore.getProxyPort(this));
+        return true;
     }
 
     /** 列表适配器：整行可点，勾选框只反映状态。 */

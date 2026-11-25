@@ -85,6 +85,13 @@ test('CLI: client without --peer fails instead of starting with an empty remote'
   expectReject(['client', `--key=${KEY}`], /client requires --peer/);
 });
 
+test('CLI: client rejects non-loopback proxy binds instead of exposing an open proxy', () => {
+  for (const host of ['0.0.0.0', '192.0.2.1', '[::]']) {
+    expectReject(['client', `--key=${KEY}`, '--peer=127.0.0.1:4460', `--bind=${host}:1080`],
+      /client proxy --bind must be loopback/);
+  }
+});
+
 // --- numeric options ------------------------------------------------------
 
 test('CLI: integer options reject out-of-range and non-integer values', () => {
@@ -164,6 +171,17 @@ test('CLI: replay mode is rejected with its metrics-report replacement', () => {
 
 test('CLI: an unknown mode fails with the allowed list', () => {
   expectReject(['frobnicate', `--key=${KEY}`], /unknown mode "frobnicate"; use server \| client \| speedtest \| metrics-report/);
+});
+
+test('CLI: speedtest clears its watchdog and exits promptly after the run', () => {
+  const started = Date.now();
+  const r = spawnSync(process.execPath, [CLI, 'speedtest', `--key=${KEY}`, '--seconds=3'],
+    { encoding: 'utf8', timeout: 12000 });
+  const elapsed = Date.now() - started;
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout ?? '', /FCP speedtest \(in-process loopback, 3s\)/);
+  assert.match(r.stdout ?? '', /tx [1-9]\d* B  rx [1-9]\d* B/);
+  assert.ok(elapsed < 7500, `speedtest kept a timer alive for ${elapsed} ms`);
 });
 
 // --- help/version shortcuts ----------------------------------------------

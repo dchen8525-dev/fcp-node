@@ -29,6 +29,12 @@ function run(cmd, args, opts = {}) {
   if (r.status !== 0) throw new Error(`${cmd} exited with ${r.status}`);
 }
 
+function runNpx(args) {
+  const npmCli = process.env.npm_execpath;
+  if (!npmCli) throw new Error('run this build through npm so the npx fallback can execute without a shell');
+  run(process.execPath, [npmCli, 'exec', '--yes', ...args]);
+}
+
 async function download(url, dest) {
   if (existsSync(dest)) return dest;
   process.stdout.write(`downloading ${url}\n`);
@@ -115,8 +121,7 @@ const esbuildArgs = [serverEntry, '--bundle', '--platform=node', '--format=esm',
 if (existsSync(esbuildJs)) {
   run(process.execPath, [esbuildJs, ...esbuildArgs]);
 } else {
-  const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-  run(npx, ['--yes', 'esbuild@0.28.2', ...esbuildArgs], { shell: true });
+  runNpx(['--package=esbuild@0.28.2', '--', 'esbuild', ...esbuildArgs]);
 }
 
 // ---------------------------------------------------------------- package

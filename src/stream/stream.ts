@@ -932,6 +932,10 @@ export class Stream {
       this.resolveFastRound(cum);
     }
     if (this.finSent && seqAtOrAfter(cum, (this.finOffset + 1) >>> 0) && this.eofDelivered) {
+      // The peer's FIN may already have been delivered, with its ACK still in
+      // the delay bucket. Closing now would discard that ACK and leave the peer
+      // waiting for the idle timeout even though both FINs crossed.
+      if (this.ackPending) this.emitAck(nowMs);
       this.finish('local_eof');
       return;
     }

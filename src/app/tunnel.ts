@@ -8,7 +8,7 @@ import { lookup as dnsLookup, getServers } from 'node:dns';
 import { randomBytes } from 'node:crypto';
 import {
   SALT_LEN, Direction, HandshakeRole, DEFAULT_MTU_MIN, DEFAULT_D, DEFAULT_P,
-  OPEN_MAX_BYTES, ATYP_DOMAIN, ATYP_IPV4, DATA_WIRE_OVERHEAD, NONCE_LIMIT,
+  OPEN_MAX_BYTES, ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, DATA_WIRE_OVERHEAD, NONCE_LIMIT,
   MUX_MAX_STREAMS, MUX_SESSION_POOL,
   PROBE_INTERVAL_MS, PROBE_IDLE_MS, PROBE_QUIET_BYTES, PROBE_BUDGET_BYTES, PROBE_RETRY_MS,
   DNS_UPSTREAM_TIMEOUT_MS,
@@ -340,9 +340,17 @@ export function ipDenied(family: number, addr: string): boolean {
 // Client: local SOCKS5 / HTTP CONNECT / absolute-form HTTP -> FCP UDP tunnel
 // ---------------------------------------------------------------------------
 
+function isLoopbackProxyHost(host: string): boolean {
+  const h = host.toLowerCase();
+  if (h === 'localhost') return true;
+  if (isIP(h) === 4) return h.startsWith('127.');
+  return isIP(h) === 6 && h === '::1';
+}
+
 export class TunnelClient {
   private udp: UdpSocket;
   private tcp: TcpServer;
+  private localSockets = new Set<TcpSocket>();
   private sessions = new Map<string, Binding>();
   /** M1: eligible local connections multiplex onto up to MUX_SESSION_POOL
    *  shared sessions, assigned round-robin — each session is an independent
@@ -416,7 +424,11 @@ export class TunnelClient {
     // app sees EOF at once, closes fully, and the abort path RSTs the tunnel —
     // the response never crosses. The endPending/flushPending machinery below
     // owns the FIN instead: queue the close until the backlog has drained.
-    this.tcp = createServer({ allowHalfOpen: true }, (sock) => this.onLocalConnection(sock));
+    this.tcp = createServer({ allowHalfOpen: true }, (sock) => {
+      this.localSockets.add(sock);
+      sock.once('close', () => this.localSockets.delete(sock));
+      this.onLocalConnection(sock);
+    });
     this.udp.on('message', (msg, rinfo) => this.onUdp(msg, rinfo));
     this.udp.on('error', (e) => this.log(`udp error: ${e.message}`));
     this.tcp.on('error', (e) => this.log(`tcp error: ${e.message}`));
@@ -426,6 +438,13 @@ export class TunnelClient {
     if (this.running) return;
     const port = this.opts.port ?? 4460;
     const host = this.opts.host ?? '127.0.0.1';
+    const listenHost = this.opts.listenHost ?? '127.0.0.1';
+    // SOCKS5 no-auth and HTTP proxy requests have no credentials. Binding them
+    // to a non-loopback address would expose an open proxy to the local network.
+    if (!isLoopbackProxyHost(listenHost)) {
+      throw new Error('client proxy --bind must be loopback (127.0.0.0/8, ::1 or localhost); ' +
+        'unauthenticated proxy access is not allowed on non-loopback addresses');
+    }
     await new Promise<void>((resolve, reject) => {
       const onErr = (e: Error) => reject(e);
       this.udp.once('error', onErr);
@@ -438,7 +457,7 @@ export class TunnelClient {
     await new Promise<void>((resolve, reject) => {
       const onErr = (e: Error) => reject(e);
       this.tcp.once('error', onErr);
-      this.tcp.listen(this.opts.listenPort ?? 1080, this.opts.listenHost ?? '127.0.0.1', () => {
+      this.tcp.listen(this.opts.listenPort ?? 1080, listenHost, () => {
         this.tcp.off('error', onErr); resolve();
       });
     });
@@ -452,7 +471,7 @@ export class TunnelClient {
     if (this.opts.onStats) {
       this.statsTimer = setInterval(() => this.emitStats(), STATS_PERIOD_MS);
     }
-    this.log(`client: proxy 127.0.0.1:${this.opts.listenPort ?? 1080} -> udp ${host}:${port}`);
+    this.log(`client: proxy ${listenHost}:${this.opts.listenPort ?? 1080} -> udp ${host}:${port}`);
   }
 
   stop(): void {
@@ -461,8 +480,13 @@ export class TunnelClient {
     if (this.statsTimer) { clearInterval(this.statsTimer); this.statsTimer = null; }
     for (const b of this.sessions.values()) { b.cleanup(); b.trace?.close(); }
     this.sessions.clear();
-    this.tcp.close();
-    this.udp.close();
+    for (const sock of this.localSockets) sock.destroy();
+    this.localSockets.clear();
+    if (this.tcp.address()) this.tcp.close();
+    try { this.udp.close(); }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ERR_SOCKET_DGRAM_NOT_RUNNING') throw e;
+    }
   }
 
   get sessionCount(): number { return this.sessions.size; }
@@ -861,6 +885,7 @@ export class TunnelClient {
   }
 
   private onLocalConnection(sock: TcpSocket): void {
+    if (!this.running) { sock.destroy(); return; }
     sock.setNoDelay(true);
     this.dbg(`local conn accepted ${sock.remoteAddress ?? '?'}:${sock.remotePort ?? 0}`);
     let entryBuf = Buffer.alloc(0);
@@ -1203,6 +1228,7 @@ interface ServerTunnel {
   sid: number;
   parser: PrefixParser<ProxyTarget>;
   targetSock: TcpSocket | null;
+  closed: boolean;
   openDone: boolean;
   /** The OPEN passed parsing but the target is still being vetted (the
    *  --deny-private DNS lookup). Bytes that arrive in that window belong to the
@@ -1261,10 +1287,11 @@ export class TunnelServer {
 
   async start(): Promise<void> {
     if (this.running) return;
+    const listenHost = this.opts.listenHost ?? '0.0.0.0';
     await new Promise<void>((resolve, reject) => {
       const onErr = (e: Error) => reject(e);
       this.udp.once('error', onErr);
-      this.udp.bind(this.opts.port ?? 4460, this.opts.listenHost ?? '0.0.0.0', () => {
+      this.udp.bind(this.opts.port ?? 4460, listenHost, () => {
         this.udp.off('error', onErr);
         enlargeUdpBuffers(this.udp, this.dbg, this.log);
         resolve();
@@ -1280,7 +1307,10 @@ export class TunnelServer {
     if (this.timer) clearTimeout(this.timer);
     for (const b of this.sessions.values()) { b.cleanup(); b.trace?.close(); }
     this.sessions.clear();
-    this.udp.close();
+    try { this.udp.close(); }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ERR_SOCKET_DGRAM_NOT_RUNNING') throw e;
+    }
   }
 
   get sessionCount(): number { return this.sessions.size; }
@@ -1716,7 +1746,12 @@ export class TunnelServer {
         finish(msg);
       });
       sock.on('error', nextHop);
-      sock.send(query, 53, upstreams[idx]!, (err) => { if (err) nextHop(); });
+      // Connecting a UDP socket filters packets to the selected resolver. An
+      // unconnected socket accepted the first datagram from any source, letting
+      // a spoofed reply poison the tunnel's DNS answer.
+      sock.connect(53, upstreams[idx]!, (err) => {
+        if (err) nextHop(); else sock.send(query, (sendErr) => { if (sendErr) nextHop(); });
+      });
     };
     attempt(0);
   }
@@ -1727,10 +1762,11 @@ export class TunnelServer {
       key, addr, sid,
       stream: null as unknown as Stream, // streamReady assigns it before any byte
       parser: new PrefixParser(openParseRequest),
-      targetSock: null, openDone: false, openOkSent: false, openPending: false,
+      targetSock: null, closed: false, openDone: false, openOkSent: false, openPending: false,
       pendingToTarget: [], pendingToTunnel: [],
       endFromTarget: false, paused: false, pumping: false,
       cleanup: () => {
+        t.closed = true;
         t.pendingToTarget.length = 0;
         t.pendingToTunnel.length = 0;
         if (t.targetSock && !t.targetSock.destroyed) t.targetSock.destroy();
@@ -1786,9 +1822,9 @@ export class TunnelServer {
    *
    * A literal target is judged directly (no DNS in the path). A domain target
    * is resolved first and EVERY answer must pass — one private record in a
-   * round-robin set is a way in. A resolution failure is not a refusal: it
-   * will surface as ENOTFOUND on connect(), which is the honest answer, and
-   * refusing here would hide it behind a misleading "refused".
+   * round-robin set is a way in. Resolution failures and empty answers are
+   * refused: falling through to connect() would resolve again and turn a
+   * transient failure into an unchecked dial (DNS rebinding).
    *
    * The checked address is returned and MUST be the one dialled (see
    * dialTarget). Checking here and letting connect() resolve again is a
@@ -1813,7 +1849,7 @@ export class TunnelServer {
         resolve(addrs as Array<{ address: string; family: number }>);
       });
     });
-    if (answers.length === 0) return { allowed: true }; // let connect() report the real error
+    if (answers.length === 0) return { allowed: false };
     // One private answer in a round-robin set is a way in.
     if (!answers.every((a) => !ipDenied(a.family, a.address))) return { allowed: false };
     // Pin the first vetted answer, so the dial cannot be re-resolved to a
@@ -1901,6 +1937,7 @@ export class TunnelServer {
       let verdict: { allowed: boolean; address?: string } = { allowed: false };
       try { verdict = await this.targetAllowed(target, host); }
       finally { t.openPending = false; }
+      if (t.closed || !this.running) return;
       if (!verdict.allowed) {
         this.log(`target refused (private address space): ${targetText(target)}`);
         t.pendingToTarget.length = 0;

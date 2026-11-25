@@ -43,5 +43,14 @@ public interface TunnelEngine {
         return null;
     }
 
+    /**
+     * 底层网络路径变化（Wi-Fi↔蜂窝、断网重连）。宿主在 ConnectivityManager 回调里
+     * 调用；实现应尽快让会话探测新路径，而不是等 45 秒的空闲保活或 135 秒的静默判死。
+     *
+     * @param reset true = 网络上下线，路径确实换了（需要重测 PMTU）；
+     *              false = 只是网络能力变化（带宽/信号提示），做一次轻量探测即可。
+     */
+    default void onPathChanged(boolean reset) { }
+
     boolean isEstablished();
 }

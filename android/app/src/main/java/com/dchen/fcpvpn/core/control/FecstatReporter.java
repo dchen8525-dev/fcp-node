@@ -2,6 +2,7 @@ package com.dchen.fcpvpn.core.control;
 
 import com.dchen.fcpvpn.core.fec.FecstatBlock;
 import com.dchen.fcpvpn.core.fec.FrameRx;
+import com.dchen.fcpvpn.core.wire.Seq;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -25,6 +26,11 @@ public final class FecstatReporter {
     private final List<Integer> latencies = new ArrayList<>();
     private final int direction;
     private Snapshot prev = null;
+    /** 上次报告里的结算键；对端验证器拒绝重复键，所以键没推进就先攒着。 */
+    private int lastReportedKey = 0;
+    private boolean haveReportedKey = false;
+    /** 攒着没发的区间长度：下次真正发出时一起计入 interval。 */
+    private long pendingIntervalMs = 0;
 
     private static final class Snapshot {
         final int setsExpected;
@@ -105,8 +111,16 @@ public final class FecstatReporter {
             return null;
         }
         if (nowMs - lastMs < ControlConstants.FECSTAT_INTERVAL_MS) return null;
-        long interval = Math.min(ControlConstants.FECSTAT_MAX_INTERVAL_MS, nowMs - lastMs);
+        long elapsed = nowMs - lastMs;
         lastMs = nowMs;
+        pendingIntervalMs = Math.min(ControlConstants.FECSTAT_MAX_INTERVAL_MS,
+                pendingIntervalMs + elapsed);
+        // 对端 FecstatValidator 把重复的结算键判为 Duplicate 并整份丢弃。空载或
+        // 只走 oob 的会话里键不会推进，若照常发包，这一整段增量永远到不了对端；
+        // 所以把计数器留在快照里，等键推进再一次性发出（controller.ts:389-393）。
+        if (haveReportedKey && !Seq.seqAfter(accountedThroughSetId, lastReportedKey)) return null;
+        long interval = pendingIntervalMs;
+        pendingIntervalMs = 0;
         Snapshot cur = new Snapshot(counters);
         Snapshot before = prev != null ? prev : cur;
         prev = cur;
@@ -163,6 +177,9 @@ public final class FecstatReporter {
         dataBytes = 0;
         parityBytes = 0;
         latencies.clear();
+        // 只有真正发出去的报告才推进键：键没推进的周期上面已经整段攒着。
+        lastReportedKey = accountedThroughSetId;
+        haveReportedKey = true;
         return FecstatBlock.encodeFecstat(p);
     }
 

@@ -12,6 +12,7 @@ import {
   type DirectionValue,
 } from '../constants.ts';
 import { encodeFecstat, makeFecstatPacket, type FecstatPacket } from '../fec/fecstat.ts';
+import { seqAfter } from '../wire.ts';
 import type { RxCounters } from '../fec/frame.ts';
 
 export interface ControllerConfig {
@@ -363,6 +364,8 @@ export class FecstatReporter {
    *  the same shard stayed in `data_rx_orig` forever and the peer's
    *  `1 - data_rx_orig/data_expected` converged on the session average. */
   private prev: CounterSnapshot | null = null;
+  private lastReportedKey: number | null = null;
+  private pendingIntervalMs = 0;
 
   constructor(salt: Uint8Array, direction: DirectionValue) {
     this.salt = Buffer.from(salt); this.direction = direction;
@@ -380,8 +383,14 @@ export class FecstatReporter {
       return null;
     }
     if (nowMs - this.lastMs < FECSTAT_INTERVAL_MS) return null;
-    const interval = Math.min(60000, nowMs - this.lastMs);
+    const elapsed = nowMs - this.lastMs;
     this.lastMs = nowMs;
+    this.pendingIntervalMs = Math.min(60000, this.pendingIntervalMs + elapsed);
+    // The validator rejects a repeated settlement key. Hold interval counters
+    // until the key advances instead of sending reports that are always stale.
+    if (this.lastReportedKey !== null && !seqAfter(accountedThroughSetId, this.lastReportedKey)) return null;
+    const interval = this.pendingIntervalMs;
+    this.pendingIntervalMs = 0;
     const cur = snapshotCounters(counters);
     const prev = this.prev ?? cur;
     this.prev = cur;
@@ -436,6 +445,7 @@ export class FecstatReporter {
     }
     this.authFail = 0; this.structFail = 0;
     this.dataBytes = 0; this.parityBytes = 0; this.latencies = [];
+    this.lastReportedKey = accountedThroughSetId >>> 0;
     return encodeFecstat(p);
   }
 }
