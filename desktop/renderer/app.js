@@ -231,6 +231,23 @@ function splitEndpoint(text, defaultPort) {
   return [host, port];
 }
 
+// 本地代理没有认证，0.0.32 起 CLI 只接受回环绑定（非回环等于开放代理）。
+// 老存档里可能是 0.0.0.0（0.0.31 及更早允许），这时隧道会一启动就退出，
+// 界面只看到按钮弹回"未连接"，所以在界面层先拦住并说清楚。
+// 判定与 src/app/tunnel.ts isLoopbackProxyHost 保持一致：localhost、::1、
+// 合法的 127.0.0.0/8 字面量（CLI 会先剥掉 IPv6 的方括号）。
+function isLoopbackHost(host) {
+  let h = String(host || '').trim().toLowerCase();
+  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  if (h === 'localhost' || h === '::1') return true;
+  const parts = h.split('.');
+  if (parts.length !== 4) return false;
+  for (const p of parts) {
+    if (!/^(0|[1-9]\d{0,2})$/.test(p) || Number(p) > 255) return false;
+  }
+  return parts[0] === '127';
+}
+
 function collectSettings() {
   const key = el.key.value.replace(/\s+/g, '').replace(/^0x/i, '');
   const [host, port] = splitEndpoint(el.server.value, 4460);
@@ -288,7 +305,17 @@ function applySettings(s) {
   // 所以升级后密钥/地址不丢。
   if (s.host) el.server.value = `${s.host}:${s.port || 4460}`;
   if (s.listenHost || s.listenPort) {
-    el.proxy.value = `${s.listenHost || '127.0.0.1'}:${s.listenPort || 1080}`;
+    const savedHost = s.listenHost || '127.0.0.1';
+    if (isLoopbackHost(savedHost)) {
+      el.proxy.value = `${savedHost}:${s.listenPort || 1080}`;
+    } else {
+      // 静默退回回环并说明原因：留着 0.0.0.0 只会让每次启动都立刻失败。
+      el.proxy.value = `127.0.0.1:${s.listenPort || 1080}`;
+      // 等 applySettings 把 remember/密钥等字段都放好再落盘（scheduleSave 会
+      // 立刻读 el.remember，此刻它还是 HTML 默认值）。
+      setTimeout(scheduleSave, 0);
+      flashNote(`本地代理地址 ${savedHost} 已改为 127.0.0.1：代理没有认证，不能对外开放`, 'error');
+    }
   }
   set(el.mtu, s.mtu);
   // 旧版存的是字符串 "10:4";这里不迁移,直接忽略(与 CLI 一样不做兼容),
@@ -380,6 +407,9 @@ async function start() {
   }
   if (!Number.isInteger(cfg.listenPort) || !(cfg.listenPort >= 1 && cfg.listenPort <= 65535)) {
     return flashNote('本地代理端口需在 1..65535', 'error');
+  }
+  if (!isLoopbackHost(cfg.listenHost)) {
+    return flashNote('本地代理地址必须是回环（127.0.0.1、::1 或 localhost）：代理没有认证，不能对外开放', 'error');
   }
   if (!(cfg.mtu >= 128 && cfg.mtu <= 9000)) return flashNote('MTU 需在 128..9000', 'error');
   const key = el.key.value.replace(/\s+/g, '').replace(/^0x/i, '');

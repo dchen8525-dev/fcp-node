@@ -227,6 +227,14 @@ function startTunnel(cfg) {
     send('fcp:log', { level: 'error', line: `missing tunnel bundle: ${CLI_PATH}` });
     return { ok: false, error: 'missing tunnel bundle' };
   }
+  // 0.0.32 起隧道只允许回环绑定（代理无认证）。渲染层已经拦过一次，这里是
+  // 兜底：老存档里的 0.0.0.0 绝不能变成"spawn 成功、一秒后退出"的谜题。
+  cfg = { ...cfg, listenHost: cfg.listenHost || '127.0.0.1' };
+  if (!isLoopbackHost(cfg.listenHost)) {
+    const error = `本地代理地址 ${cfg.listenHost} 不是回环地址：代理没有认证，不能对外开放`;
+    send('fcp:log', { level: 'error', line: error });
+    return { ok: false, error };
+  }
   const args = [CLI_PATH, ...statsArgs(cfg)];
   // Keep a local handle: a restarted tunnel's predecessor exits asynchronously,
   // and its handlers must not clear the new process or overwrite its state.
@@ -365,6 +373,20 @@ function stopTunnel() {
 
 // ---------------------------------------------------------------- system proxy
 
+// 与渲染层同一规则：本地代理只监听回环（0.0.32 起 CLI 强制）。系统代理必须
+// 指向一个真的能连上的地址，所以设置里残留 0.0.0.0 时按 127.0.0.1 处理。
+function isLoopbackHost(host) {
+  let h = String(host || '').trim().toLowerCase();
+  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  if (h === 'localhost' || h === '::1') return true;
+  const parts = h.split('.');
+  if (parts.length !== 4) return false;
+  for (const p of parts) {
+    if (!/^(0|[1-9]\d{0,2})$/.test(p) || Number(p) > 255) return false;
+  }
+  return parts[0] === '127';
+}
+
 /** 当前本地代理地址（未连接时用设置里的值，保证"先设系统代理"也能用）。 */
 function currentListen() {
   if (childState.listen && childState.listen !== ':') {
@@ -372,7 +394,10 @@ function currentListen() {
     return { host: childState.listen.slice(0, i) || '127.0.0.1', port: Number(childState.listen.slice(i + 1)) || 1080 };
   }
   const s = readSettings();
-  return { host: s.listenHost || '127.0.0.1', port: s.listenPort || 1080 };
+  return {
+    host: isLoopbackHost(s.listenHost) ? s.listenHost : '127.0.0.1',
+    port: s.listenPort || 1080,
+  };
 }
 
 function sysProxyStatus() {
